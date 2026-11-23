@@ -989,7 +989,7 @@ mod tests {
         assert_eq!(g(wanted, WATCH_GAP), vec![(0x11000, 0xF000), (0x40000, 0x10000)]);
         // ranges 16 MiB apart: one scan at a 16 MiB gap, two at the default 1 MiB
         let wanted = vec![(0x1000_0000, 0x1000_1000), (0x1100_0000, 0x1100_1000), (0x1300_0000, 0x1300_1000)];
-        assert_eq!(g(wanted.clone(), 16 << 20), vec![(0x1000_0000, 0x10_1000), (0x1300_0000, 0x1000)]);
+        assert_eq!(g(wanted.clone(), 16 << 20), vec![(0x1000_0000, 0x100_1000), (0x1300_0000, 0x1000)]);
         assert_eq!(g(wanted, WATCH_GAP), vec![(0x1000_0000, 0x1000), (0x1100_0000, 0x1000), (0x1300_0000, 0x1000)]);
         // a call costs more than the walk over a gap of up to `WATCH_GAP`: 8 MiB merges at 16, 40 MiB not
         let wanted = vec![(0x1000_0000, 0x1000_1000), (0x1080_1000, 0x1080_2000)];
