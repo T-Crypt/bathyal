@@ -13,13 +13,13 @@
 //! commands, xapu commands with their structures and the start of the Opus input, the caller in the
 //! title, the rate per kind of command).
 //!
-//! # The decoder's commands as the title sends them (observed with `XCL_TRACE_APU=1`, retail build)
+//! # The decoder's commands as a retail title sends them (observed with `XCL_TRACE_APU=1`)
 //!
 //! Every command starts with the 24-byte `XApuCommand` (`kind`, `stream`, `sequence`, `options`,
 //! `context` u64); the title builds it on its stack and sets only the fields it uses (`kind` and
 //! `stream`, the others are left as they were – `sequence`, `options`, `context` mean nothing to it),
 //! then calls `XApuEnqueueCommand(handle, &command, &count)` and polls `XApuDequeueResult`.
-//! The title drives stream 0 only (so far) and is on one thread.
+//! That title drives stream 0 only (so far) and is on one thread.
 //!
 //! * kind 1, Activate: `u32 channels` at +24 (1: mono, 2: stereo), the output rate 48000 at +56 (the
 //!   decoder is 48 kHz). Starts a stream.
@@ -782,6 +782,25 @@ fn new_decoder(stream: u32, channels: u32) -> Option<opus::Decoder> {
     }
 }
 
+/// Writes the frames of `pcm` after the first `first_frame` into `out` (float32, `channels`
+/// interleaved), scaled from PCM16, and returns the frames written and how many of their samples
+/// are not 0. Frames `out` has no room for are not written; what the decoder did not produce stays
+/// as `out` was (the caller fills it with silence before).
+fn write_decoded(pcm: &[i16], channels: usize, first_frame: usize, out: &mut [f32]) -> (usize, u64) {
+    let ch = channels.max(1);
+    let frames = pcm.len() / ch;
+    let skip = first_frame.min(frames);
+    let produced = (frames - skip).min(out.len() / ch);
+    let mut nonzero = 0u64;
+    if produced != 0 {
+        for (o, &v) in out.iter_mut().zip(pcm[skip * ch..(skip + produced) * ch].iter()) {
+            *o = v as f32 / 32768.0;
+            nonzero += (v != 0) as u64;
+        }
+    }
+    (produced, nonzero)
+}
+
 /// Decodes a Process command's input (Opus packets) into `out` (float32 samples, `channels` interleaved):
 /// `first_frame` frames of what the decoder produces are skipped, the rest fills `out` (what is not
 /// produced stays silent). Returns the frames written (None: nothing was decoded).
@@ -793,16 +812,9 @@ unsafe fn decode_into(s: &mut XApuStream, stream: u32, p: &XApuProcess, out: &mu
     }
     let packet = std::slice::from_raw_parts(input as *const u8, input_bytes as usize);
     let mut pcm: Vec<i16> = Vec::with_capacity(960 * 2);
-    let ch = s.channels as usize;
     match dec.decode_packet(packet, &mut pcm) {
         Ok(frames) if frames > 0 => {
-            let skip = (first_frame as usize).min(frames);
-            let produced = (frames - skip).min(out.len() / ch);
-            let mut nonzero = 0u64;
-            for (o, &v) in out.iter_mut().zip(pcm[skip * ch..(skip + produced) * ch].iter()) {
-                *o = v as f32 / 32768.0;
-                nonzero += (v != 0) as u64;
-            }
+            let (produced, nonzero) = write_decoded(&pcm, s.channels as usize, first_frame as usize, out);
             xaudio2::note_console_decode(1, 0, produced as u64, nonzero);
             Some(produced)
         }
@@ -1134,6 +1146,75 @@ mod tests {
             assert_eq!(frames, 256, "frames_per_output, stereo floats");
             assert!(buf[..256 * 8].iter().all(|&b| b == 0) && buf[256 * 8] == 0xAA);
             assert_eq!(XApuDequeueResult(h, &mut r), XAPU_NO_RESULTS);
+            assert_eq!(XApuDisconnect(h), S_OK);
+        }
+    }
+
+    #[test]
+    fn decoded_pcm_skips_the_pre_skip_and_scales() {
+        // mono: skip 2 frames (the Opus pre-skip), write the other 2, no more room than that
+        let pcm = [-32768i16, 0, 16384, 32767];
+        let mut out = [1.0f32; 4];
+        assert_eq!(write_decoded(&pcm, 1, 2, &mut out), (2, 2));
+        assert_eq!(out, [0.5, 32767.0 / 32768.0, 1.0, 1.0], "frames not produced stay as they were");
+        // more frames than the output holds: cut at the buffer
+        let mut small = [0.0f32; 3];
+        assert_eq!(write_decoded(&pcm, 1, 0, &mut small).0, 3);
+        assert_eq!(small, [-1.0, 0.0, 0.5]);
+        // stereo stays interleaved, the pre-skip counts frames, not samples
+        let stereo = [1i16, -1, 2, -2, 3, -3];
+        let mut out = [0.0f32; 4];
+        assert_eq!(write_decoded(&stereo, 2, 1, &mut out), (2, 4));
+        assert_eq!(out, [2.0 / 32768.0, -2.0 / 32768.0, 3.0 / 32768.0, -3.0 / 32768.0]);
+        // nothing decoded, nothing written
+        assert_eq!(write_decoded(&[], 2, 0, &mut out), (0, 0));
+    }
+
+    #[test]
+    fn xapu_activate_starts_a_decoder_and_process_keeps_the_output_contract() {
+        unsafe {
+            let input = XApuConnectInput { process: 1, streams: 1, commands_per_stream: 4, data_bytes: 0, frames_per_output: 0, options: 0 };
+            let mut out = XApuConnectOutput { data: std::ptr::null_mut(), ready: std::ptr::null_mut() };
+            let mut h = std::ptr::null_mut();
+            assert_eq!(XApuConnect(&input, &mut out, &mut h), S_OK);
+            let mut n = 0;
+            let a = XApuActivate { id: XApuCommand { kind: XAPU_ACTIVATE, stream: 0, sequence: 0, options: 0, context: std::ptr::null_mut() }, channels: 1 };
+            assert_eq!(XApuEnqueueCommand(h, &a as *const _ as *const XApuCommand, &mut n), S_OK);
+            // Activate queues a result of its own: take it before the Process result is asked for
+            let mut r: XApuResult = std::mem::zeroed();
+            assert_eq!(XApuDequeueResult(h, &mut r), S_OK);
+            {
+                let x = &*(h as *const XApu);
+                let ch = x.channels.lock().unwrap();
+                assert_eq!(ch[0].channels, 1, "Activate's channel count");
+                assert_eq!(ch[0].decoder.is_some(), opus::is_available(), "a decoder where the process has one");
+            }
+            // a packet that is not Opus (or no decoder at all): silence of the length asked, and
+            // the buffer past what the result says was written is untouched
+            let mut packet = [0xFFu8; 2];
+            let mut buf = vec![0xAAu8; 4096];
+            let p = XApuProcess {
+                id: XApuCommand { kind: XAPU_PROCESS, stream: 0, sequence: 1, options: 0, context: std::ptr::null_mut() },
+                ramp: 0.0,
+                pitch: 48_000.0,
+                first_frame: 0,
+                frames: 0,
+                input_bytes: packet.len() as u32,
+                input: packet.as_mut_ptr() as *mut c_void,
+                output_bytes: buf.len() as u32,
+                output: buf.as_mut_ptr() as *mut c_void,
+            };
+            assert_eq!(XApuEnqueueCommand(h, &p as *const _ as *const XApuCommand, &mut n), S_OK);
+            let mut r: XApuResult = std::mem::zeroed();
+            assert_eq!(XApuDequeueResult(h, &mut r), S_OK);
+            let (frames, bytes) = (r.frames, r.output_bytes);
+            assert!(frames <= 960, "never more than the packet can hold");
+            assert_eq!(bytes, frames * 4, "mono float32");
+            assert!(buf[bytes as usize..].iter().all(|&b| b == 0xAA), "the rest of the output is untouched (frames {frames}, bytes {bytes})");
+            // Deactivate drops the stream's decoder
+            let d = XApuCommand { kind: XAPU_DEACTIVATE, stream: 0, sequence: 0, options: 0, context: std::ptr::null_mut() };
+            assert_eq!(XApuEnqueueCommand(h, &d as *const _ as *const XApuCommand, &mut n), S_OK);
+            assert!((*(h as *const XApu)).channels.lock().unwrap()[0].decoder.is_none());
             assert_eq!(XApuDisconnect(h), S_OK);
         }
     }
