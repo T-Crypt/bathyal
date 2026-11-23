@@ -1,23 +1,16 @@
-<!-- What changes and why, in a few sentences. "Fixes #N" / "Part of #N". Stacked: "Stacked on #N". -->
+## What this changes
 
-**What is in it**
--
+<!-- One or two sentences. Link the issue if there is one. -->
 
-**Tested**
-- hardware (GPU + driver, CPU), Rust version, debug / release:
-- `cargo test --workspace -- --test-threads=4`: N passed, N failed, N ignored (SKIPPED GPU tests: …)
+## How it was tested
 
-**Regression run**
-<!-- Required when the PR changes crates/xcl/src outside tests: `scripts/smoke.ps1` on a real title,
-     built from main and from this PR's head commit (no uncommitted changes); paste both blocks.
-     Rerun the PR's after every push. Not needed for docs / tests / scripts only. -->
+- [ ] `scripts/test.ps1` passes locally
+- GPU and driver: <!-- e.g. RTX 4090, 621.14 / RX 9070, 26.11.2 / none -->
+- Title run, if any: <!-- "a newer retail title, reached X"; never attach game files, shaders or logs that quote them -->
 
-main:
+## Checklist
 
-PR:
-
-**Not tested**
--
-
-**AI use**
-- none / tool and model, and what it did
+- [ ] No game material: no executables, archives, shaders in any form, assets, or logs quoting them
+- [ ] No keys, decryption or DRM workarounds
+- [ ] Nothing in the code goes online
+- [ ] AI-assisted: yes / no
