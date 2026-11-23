@@ -4661,7 +4661,7 @@ fn default_rtv(d: &D3D12_RESOURCE_DESC) -> Option<D3D12_RENDER_TARGET_VIEW_DESC>
         return None;
     }
     let f = super::device_x::pc_shader_view_format(rf, 0);
-    if f == rf {
+    if f == rf || f == 0 {
         return None;
     }
     let mut v = D3D12_RENDER_TARGET_VIEW_DESC { Format: DXGI_FORMAT(f as i32), ..Default::default() };
