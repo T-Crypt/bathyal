@@ -179,7 +179,13 @@ XCL is **GPL-2.0-only**.
 
 ## AI-assisted contributions
 
-You can use any AI tool. In return:
+You can use AI tools. In return:
+
+- **Use a frontier model.** XCL is low-level code (a recompiler, a console runtime, D3D12 memory
+  and synchronisation): small and local models get it subtly wrong, and every wrong PR costs a
+  review. PRs written with small or open-weight models – Qwen (27B / 32B class and the like),
+  DeepSeek, Llama, Mistral, Gemma, Phi and their distills – are closed without a review. Name the
+  exact model in **AI use**; the `PR checks` workflow refuses these names there.
 
 - **You are the author and you are responsible.** You have read every line of the diff, you
   understand it, and you can answer questions about it without asking the tool again. "The AI wrote it"
