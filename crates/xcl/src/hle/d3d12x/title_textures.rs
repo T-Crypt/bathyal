@@ -314,16 +314,15 @@ thread_local! {
 /// then).
 static WATCH_COMPUTES: AtomicU64 = AtomicU64::new(0);
 
-/// `XCL_WATCH_TILES=covered`: watch only the tiles a GPU-visible object covers
-/// (`sparse::visible_ranges`: XMem graphics allocations, placed buffers, console and view heaps,
-/// XCL's arenas) instead of every mapped tile. Off by default and not exact for a title that
-/// hands the GPU an address in a raw commit of one of its reservations: on the console a whole
-/// reservation is GPU memory, so tiles committed without an allocation (`VirtualAlloc` with
-/// `MEM_COMMIT` in a window, `kernelx::commit_sparse`) are GPU-readable too. The covered share
-/// is logged either way, so a run shows what the narrowing would save.
-fn watch_covered() -> bool {
-    static C: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *C.get_or_init(|| std::env::var("XCL_WATCH_TILES").is_ok_and(|v| v.trim().eq_ignore_ascii_case("covered")))
+/// `XCL_WATCH_TILES=all`: watch every mapped tile instead of the tiles a GPU-visible object or a
+/// GPU command covers (`sparse::visible_ranges`: XMem graphics allocations, placed buffers,
+/// console and view heaps, XCL's own arenas, and the tiles copies name). The narrow set is the
+/// default: on a retail title every mapped tile was about 3 GB and 23.7 ms a look.
+/// It is not exact for a tile a title commits in a window without an allocation and then hands to
+/// the GPU by raw address, which on the console is GPU memory as a whole.
+fn watch_all_tiles() -> bool {
+    static A: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *A.get_or_init(super::sparse::watch_all_tiles_env)
 }
 
 fn cached_watch_ranges(u: &crate::gpu::uma::Uma) -> Arc<Vec<(usize, usize)>> {
@@ -349,17 +348,18 @@ fn cached_watch_ranges(u: &crate::gpu::uma::Uma) -> Arc<Vec<(usize, usize)>> {
     regions.extend(crate::hle::kernelx::graphics_reservations());
     let mut wanted: Vec<(usize, usize)> = TEXTURES.lock().unwrap().values().map(|e| (e.src & !0xFFF, (e.src + e.tex.size() as usize + 0xFFF) & !0xFFF)).collect();
     let mapped = super::sparse::mapped_ranges();
-    let covered = watch_covered();
-    let tiles = if covered { super::sparse::visible_ranges() } else { mapped.clone() };
+    let all = watch_all_tiles();
+    let tiles = if all { mapped.clone() } else { super::sparse::visible_ranges() };
     let n = WATCH_COMPUTES.fetch_add(1, Ordering::Relaxed) + 1;
-    if covered || n.is_power_of_two() {
+    if n.is_power_of_two() {
         let sum = |rs: &[(usize, usize)]| rs.iter().map(|r| r.1).sum::<usize>() >> 20;
         crate::xlog_info!(
-            "write-watch: {} MB of the {} MB of mapped title tiles are covered by GPU-visible objects ({} of {} tile runs); XCL_WATCH_TILES=covered watches only those",
+            "write-watch: watching {} MB of the {} MB of mapped title tiles ({} of {} tile runs; {}); XCL_WATCH_TILES=all watches them all",
             sum(&tiles),
             sum(&mapped),
             tiles.len(),
-            mapped.len()
+            mapped.len(),
+            if all { "every mapped tile" } else { "the tiles resources, heaps and copies cover" }
         );
     }
     wanted.extend(tiles);
@@ -803,17 +803,18 @@ unsafe fn upload_queue(dev: &ID3D12Device, device: usize) -> Result<ID3D12Comman
 }
 
 /// Ranges closer than this are scanned as one. A gap costs the walk over it, a call costs its
-/// fixed cost, and both were measured on a 2 GiB synthetic reservation: about 6.9 µs a call and
-/// 0.35 µs a MiB walked (squarely kernel-side: the same bytes in one call are 13× cheaper than
-/// in 512 calls). So a gap under about 19 MiB is cheaper to walk as part of a bigger range than
-/// to leave as a call of its own; 16 MiB keeps margin under that break-even.
+/// fixed cost: about 6.9 µs a call and 0.35 µs a MiB walked on a 2 GiB synthetic reservation of
+/// idle memory (the same bytes in one call are 13× cheaper than in 512 calls), but about 7.8 µs
+/// a MiB over the memory a running title has just written, with 13.5 calls a submit – so on a
+/// title's own set the break-even gap is near 1 MiB, not 20.
 ///
 /// `XCL_WATCH_GAP_MB` overrides it (1-1024). Any value is exact – a gap is only walked, never
 /// read for writes it cannot report – so it is a cost knob: on a fragmented set of watched tiles
-/// a smaller gap buys fewer calls, and on a sparse one a larger gap buys fewer calls for a longer
-/// walk. `cargo test -q --lib watch_bench -- --ignored --nocapture` prints both costs, and the
-/// log's "ranges" count in the sparse-window timing line shows what the title's own layout does.
-const WATCH_GAP: usize = 16 << 20;
+/// a smaller gap buys fewer bytes walked, on a sparse one a larger gap buys fewer calls.
+/// `cargo test -q --lib watch_bench -- --ignored --nocapture` prints both costs with the memory
+/// written through, and the log's "ranges" count in the sparse-window timing line shows what the
+/// title's own layout does.
+const WATCH_GAP: usize = 1 << 20;
 
 fn watch_gap() -> usize {
     static G: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
@@ -983,17 +984,21 @@ mod tests {
     #[test]
     fn watch_ranges_clip_and_merge() {
         let regions = [(0x10000, 0x10000), (0x40000, 0x10000), (0x1000_0000, 0x1000_0000)];
-        let g = |wanted| watch_ranges_gap(&regions, wanted, WATCH_GAP);
+        let g = |wanted, gap| watch_ranges_gap(&regions, wanted, gap);
         let wanted = vec![(0x12000, 0x13000), (0x11000, 0x12800), (0x1F000, 0x41000), (0x60000, 0x61000)];
-        assert_eq!(g(wanted), vec![(0x11000, 0xF000), (0x40000, 0x10000)]);
+        assert_eq!(g(wanted, WATCH_GAP), vec![(0x11000, 0xF000), (0x40000, 0x10000)]);
         // ranges a gap of 512 KiB apart: one scan; 47 MiB apart: two
         let wanted = vec![(0x1000_0000, 0x1000_1000), (0x1008_0000, 0x1008_1000), (0x1300_0000, 0x1300_1000)];
-        assert_eq!(g(wanted), vec![(0x1000_0000, 0x8_1000), (0x1300_0000, 0x1000)]);
-        // a call costs more than the walk over a gap of up to `WATCH_GAP`: 8 MiB merges, 40 MiB not
+        assert_eq!(g(wanted.clone(), 16 << 20), vec![(0x1000_0000, 0x8_1000), (0x1300_0000, 0x1000)]);
+        // the default gap (a MiB, the measured break-even over a title's written memory) leaves
+        // an 8 MiB gap as a call of its own
+        assert_eq!(g(wanted, WATCH_GAP), vec![(0x1000_0000, 0x1000), (0x1008_0000, 0x1000), (0x1300_0000, 0x1000)]);
+        // a call costs more than the walk over a gap of up to `WATCH_GAP`: 8 MiB merges at 16, 40 MiB not
         let wanted = vec![(0x1000_0000, 0x1000_1000), (0x1080_1000, 0x1080_2000)];
-        assert_eq!(g(wanted), vec![(0x1000_0000, 0x80_2000)]);
+        assert_eq!(g(wanted.clone(), 16 << 20), vec![(0x1000_0000, 0x80_2000)]);
+        assert_eq!(g(wanted, 1 << 20), vec![(0x1000_0000, 0x1000), (0x1080_1000, 0x1000)]);
         let wanted = vec![(0x1000_0000, 0x1000_1000), (0x1280_0000, 0x1280_1000)];
-        assert_eq!(g(wanted), vec![(0x1000_0000, 0x1000), (0x1280_0000, 0x1000)]);
+        assert_eq!(g(wanted, 16 << 20), vec![(0x1000_0000, 0x1000), (0x1280_0000, 0x1000)]);
     }
 
     /// Whatever the gap, the same wanted bytes are watched: a gap is only walked, never a place a
@@ -1182,21 +1187,27 @@ mod watch_bench {
         }
     }
 
-    /// What the narrowed watch set saves: the same synthetic window (64 KiB tiles, every other
-    /// tile mapped, 1 in `XCL_BENCH_WATCH_COVERED` of them covered by a GPU-visible object) read
-    /// as every mapped tile against as the covered ones only, with the same pages dirty.
+    /// What a look costs with memory in use, and what narrowing the set saves: the same
+    /// synthetic window (64 KiB tiles, every other tile mapped, 1 in `XCL_BENCH_WATCH_COVERED` of
+    /// them covered by a GPU-visible object) written through before every look, so the kernel's
+    /// dirty list is as busy as a running title's, read as every mapped tile against as the
+    /// covered ones only, at several gap sizes.
     ///
     /// `XCL_BENCH_WATCH_MB` (default 512) is the window, `XCL_BENCH_WATCH_COVERED` (default 8)
-    /// the share of the mapped tiles that stays watched.
+    /// the share of the mapped tiles that stays watched, `XCL_BENCH_WATCH_LOOKS` (default 16) the
+    /// looks each configuration is timed over, `XCL_BENCH_WATCH_DIRTY` (default 716, the retail
+    /// title's pages a look) the pages written before each look.
     #[test]
-    #[ignore = "bench: covered tiles against every mapped tile in one synthetic window"]
+    #[ignore = "bench: covered tiles against every mapped tile, written through, at several gaps"]
     fn covered_tiles_cost_less_than_every_mapped_tile() {
         const TILE: usize = 0x1_0000;
         let w = Watched::new(mb() << 20);
         let base = w.0 as usize;
-        let every = std::env::var("XCL_BENCH_WATCH_COVERED").ok().and_then(|v| v.parse().ok()).unwrap_or(8usize).clamp(1, 64);
-        // a title's streaming pattern: every other 64 KiB tile has video memory (a 64 KiB gap
-        // under each run of `WATCH_GAP` is merged into one call anyway)
+        let num = |k: &str, d: usize| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
+        let every = num("XCL_BENCH_WATCH_COVERED", 8).clamp(1, 64);
+        let looks = num("XCL_BENCH_WATCH_LOOKS", 16).max(1);
+        let dirty_per_look = num("XCL_BENCH_WATCH_DIRTY", 716).max(1);
+        // a title's streaming pattern: every other 64 KiB tile has video memory
         let runs = |covered_only: bool| -> Vec<(usize, usize)> {
             let mut out: Vec<(usize, usize)> = Vec::new();
             for k in (0..w.1 / TILE).step_by(2) {
@@ -1211,25 +1222,39 @@ mod watch_bench {
             }
             out
         };
-        w.touch(64);
+        // the pages a look finds written: spread over the window, as a title's frame leaves them
+        let stride = (w.1 / dirty_per_look & !0xFFF).max(0x1000);
         for (what, ranges) in [("every mapped tile", runs(false)), ("covered only", runs(true))] {
-            for gap_mb in [64usize, 16, 4, 1] {
+            for gap_mb in [16usize, 4, 1, 0] {
                 let spans: Vec<(usize, usize)> = ranges.iter().map(|&(a, n)| (a, a + n)).collect();
                 let calls = super::watch_ranges_gap(&[(base, w.1)], spans, gap_mb << 20);
                 let walked: usize = calls.iter().map(|c| c.1).sum();
                 let mut buf: Vec<*mut c_void> = Vec::new();
                 let mut dirty: Vec<usize> = Vec::new();
                 let mut page = 0u32;
-                let t = std::time::Instant::now();
-                unsafe { super::watch_into(&calls, &mut buf, &mut dirty, &mut page) };
-                let ms = t.elapsed().as_secs_f64() * 1e3;
+                let mut spent = 0f64;
+                let mut found = 0usize;
+                for k in 0..looks {
+                    // write this look's pages (the same bytes every look: the dirty list stays busy)
+                    for p in 0..dirty_per_look {
+                        unsafe { std::ptr::write_volatile((base + ((p * stride + k) % w.1 & !0xFFF)) as *mut u8, 1) };
+                    }
+                    dirty.clear();
+                    let t = std::time::Instant::now();
+                    unsafe { super::watch_into(&calls, &mut buf, &mut dirty, &mut page) };
+                    spent += t.elapsed().as_secs_f64();
+                    found += dirty.len();
+                }
+                let per = spent / looks as f64 * 1e3;
+                let mib = (walked >> 20).max(1) as f64;
                 println!(
-                    "{what} ({} MiB of tiles in {} runs): gap {gap_mb} MiB -> {} calls, {} MiB walked, {ms:.2} ms, {} dirty pages",
+                    "{what}: {} MiB of tiles in {} runs, gap {gap_mb} MiB -> {} calls, {} MiB walked: {per:.2} ms a look, {:.2} µs a MB, {} dirty pages a look",
                     ranges.iter().map(|r| r.1).sum::<usize>() >> 20,
                     ranges.len(),
                     calls.len(),
                     walked >> 20,
-                    dirty.len()
+                    per * 1e3 / mib,
+                    found / looks
                 );
             }
         }

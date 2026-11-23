@@ -478,6 +478,39 @@ pub fn mapped_gen() -> u64 {
 static VISIBLE: Mutex<BTreeMap<usize, (usize, u32)>> = Mutex::new(BTreeMap::new());
 static VISIBLE_GEN: AtomicU64 = AtomicU64::new(0);
 
+/// Tile bases a GPU command has named in a copy (source or destination, including a DMA copy
+/// into the title's memory): memory the GPU reads or writes, so a CPU write to it must reach
+/// video memory first. Kept until the tile loses its video memory, so the set is bounded by the
+/// mapped tiles.
+static REFERENCED: Mutex<std::collections::BTreeSet<usize>> = Mutex::new(std::collections::BTreeSet::new());
+
+/// The `(base, len)` a copy names covers these tiles (`note_referenced`).
+pub fn note_referenced(va: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
+    let mut r = REFERENCED.lock().unwrap();
+    let end = va.saturating_add(len);
+    let mut t = va & !(TILE - 1);
+    let mut added = false;
+    while t < end {
+        added |= r.insert(t);
+        match t.checked_add(TILE) {
+            Some(next) => t = next,
+            None => break,
+        }
+    }
+    if added {
+        VISIBLE_GEN.fetch_add(1, Ordering::Release);
+    }
+}
+
+/// Whether `XCL_WATCH_TILES=all` asks for every mapped tile (the set before the coverage set).
+pub fn watch_all_tiles_env() -> bool {
+    static A: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *A.get_or_init(|| std::env::var("XCL_WATCH_TILES").is_ok_and(|v| v.trim().eq_ignore_ascii_case("all")))
+}
+
 /// Generation counter of `visible_ranges()`.
 pub fn visible_gen() -> u64 {
     VISIBLE_GEN.load(Ordering::Acquire)
@@ -1426,6 +1459,13 @@ pub unsafe fn decommitted(a: usize, n: usize) {
         let (b, r) = (s.windows[wi].0, s.windows[wi].1.clone());
         s.unmap_tiles(&r, b, &ts);
     }
+    {
+        // a tile without video memory is not worth watching for a copy (nor for anything else)
+        let mut r = REFERENCED.lock().unwrap();
+        for &t in &tiles {
+            r.remove(&t);
+        }
+    }
     MAPPED_GEN.fetch_add(1, Ordering::Release);
     s.signal();
     s.retire_free_pools();
@@ -1478,16 +1518,15 @@ fn clip_to_mapped(spans: &[(usize, usize)], mapped: &[(usize, usize)]) -> Vec<(u
     out
 }
 
-/// The tiles a GPU-visible object covers, as sorted (start, end) runs clipped to the tiles with
-/// video memory: `mapped_ranges` narrowed to what resources actually cover.
+/// The tiles a GPU-visible object covers (or a GPU command named), as sorted (start, end) runs
+/// clipped to the tiles with video memory: `mapped_ranges` narrowed to what resources, heaps and
+/// the GPU's own commands actually cover.
 pub fn visible_ranges() -> Vec<(usize, usize)> {
     let mut spans: Vec<(usize, usize)> = {
         let v = VISIBLE.lock().unwrap();
-        if v.is_empty() {
-            return Vec::new();
-        }
         v.iter().map(|(&a, &(n, _))| (a, n)).collect()
     };
+    spans.extend(REFERENCED.lock().unwrap().iter().map(|&t| (t, TILE)));
     spans.sort_unstable();
     clip_to_mapped(&spans, &mapped_ranges())
 }

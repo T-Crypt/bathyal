@@ -316,7 +316,7 @@ pub fn unregister(obj: usize) {
         heaps.iter().position(|h| h.obj == obj).map(|i| heaps.swap_remove(i))
     };
     if let Some(h) = gone {
-        let bytes = h.n.max(1) as usize * if h.sampler { SAMPLER_SLOT } else { SLOT };
+        let bytes = h.n.max(1) as usize * if h.sampler { SAMPLER_SLOT as usize } else { SLOT as usize };
         super::sparse::note_hidden(h.shadow, bytes);
         for (p, &f) in h.pages.iter().enumerate().filter(|&(_, &f)| f != UNMAPPED) {
             release_global(f, page_descriptors(h.n, p as u32));
