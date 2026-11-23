@@ -1981,6 +1981,31 @@ three `graphics PSO rejected (0x8007000e)` just before are the driver's E_OUTOFM
   are on the adapter's device and the per-draw queues were not given back – the draw-heavy tests ended in
   E_OUTOFMEMORY at CreateCommandQueue with several test threads.
 
+## Console D3D12 command slots used during loading (2026-11-23)
+
+Slots a retail title calls on every load, with the evidence used and what XCL does now:
+
+- **ID3D12CommandAllocator #9 = SetAllocatorCallbackX(callback, context, ...)**. Evidence: the
+  call shape past the 9-slot PC chain and the name in the console UMD's messages (upstream
+  ivall/xcl#7949 and the Scarlett slot tables). XCL's command memory lives in PC allocator
+  objects, so the callback is recorded and the call answers S_OK; it is never invoked.
+- **ID3D12GraphicsCommandList #75 = SetupOrderedAppendCounterX** (index, control, GDS dword,
+  stage, release, reserved). Evidence: the console list slot order recovered from the UMD; this
+  slot agrees with the neighbouring #76 / #77 WriteGDSX / ReadGDSX. XCL does not emulate GDS, so
+  the setup is logged once and ignored, like #76 / #77.
+- **ID3D12GraphicsCommandList #131 / #132 = top / bottom-of-pipe pipeline syncs.** Evidence: the
+  newer list layout shifts the older #129 / #130 syncs by two; the observed four-argument shape
+  agrees. PC list order and the wait after each submission make them no-ops. The stub shape is
+  taken from upstream ivall/xcl#236 (utkarshxdev).
+- **ID3D12CommandQueue #31 on the newer layout = CopyPageMappingsBatchX** (older #29; count,
+  batches, pool, pool pages, flags). Evidence: the recovered queue slot order and the page-pool
+  call shape. It maps pool pages into a placed tiled resource through console GPU page tables.
+  XCL keeps title memory GPU-visible at its own addresses (unified memory, `sparse.rs`), so the
+  call is validated (a non-zero count needs a batch array) and answered S_OK.
+- **ID3D12GraphicsCommandList #142 remains unimplemented.** It is a newer-list method taking one
+  u64, called from a state flush with the result unused; neither the name nor the effect is
+  established. It stays a logged stub so `called_stubs` keeps showing it.
+
 ## Next steps (priority)
 Little is left to do without the exe – the rest needs an actual run of the game.
 1. Once the user has a legal game exe: `xcl inspect`, `xcl run`, analysis of `report.json`

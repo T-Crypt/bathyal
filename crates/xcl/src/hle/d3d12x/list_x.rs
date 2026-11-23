@@ -1392,6 +1392,30 @@ pub(super) unsafe extern "system" fn uav_barrier_x(this: *mut c_void, _n: u32, _
     pc::<unsafe extern "system" fn(*mut c_void, u32, *const D3D12_RESOURCE_BARRIER)>(this, PC_RESOURCE_BARRIER)(this, 1, &b);
 }
 
+/// command list #75 SetupOrderedAppendCounterX(index, control, GDS dword, stage, release,
+/// reserved), from the console list layout (neighbouring slots 76 / 77 are WriteGDSX / ReadGDSX,
+/// which are no-ops here). XCL does not emulate GDS, so the counter configuration has no PC
+/// equivalent; record the first call and keep going.
+pub(super) unsafe extern "system" fn setup_ordered_append_counter_x(this: *mut c_void, index: u32, control: u32, gds_dword: u32, stage: u32, release: u32, reserved: u32) {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        crate::xlog_info!("D3D12.X: command list #75 SetupOrderedAppendCounterX(counter {index}, control {control:#x}, gds {gds_dword:#x}, stage {stage}, release {release:#x}, reserved {reserved:#x}) – GDS is not emulated");
+    });
+}
+
+/// command list #131 / #132 pipeline syncs at the top / bottom of the pipe. On the console the
+/// list records cache flushes; on PC the list's own order and the wait after each submission
+/// make them unnecessary. The four-argument shape is taken from upstream ivall/xcl#236
+/// (utkarshxdev), which added these slots for a retail title's early command-list recording.
+pub(super) unsafe extern "system" fn sync_top_of_pipe_x(_this: *mut c_void, _flags: u32, _control: u32, _address: u64, _size: u64) -> i32 {
+    0
+}
+
+/// command list #132: see `sync_top_of_pipe_x`
+pub(super) unsafe extern "system" fn sync_bottom_of_pipe_x(_this: *mut c_void, _flags: u32, _control: u32, _address: u64, _size: u64) -> i32 {
+    0
+}
+
 /// command list #84 CopyResourceX(destination, source, flags); in place (the console's
 /// compression operations) there is nothing to do on PC
 pub(super) unsafe extern "system" fn copy_resource_flags_x(this: *mut c_void, dst: usize, src: usize, _flags: u32) {
@@ -3874,6 +3898,15 @@ mod tests {
             assert_ne!(*bottom_ts, 0);
 
             on_release(list_ptr as usize);
+        }
+    }
+
+    #[test]
+    fn ordered_append_setup_and_pipe_syncs_are_no_ops() {
+        unsafe {
+            setup_ordered_append_counter_x(std::ptr::null_mut(), 3, 0x11, 0x22, 1, 0x33, 0);
+            assert_eq!(sync_top_of_pipe_x(std::ptr::null_mut(), 1, 2, 0x1000, 0x40), 0);
+            assert_eq!(sync_bottom_of_pipe_x(std::ptr::null_mut(), 4, 8, 0x2000, 0x80), 0);
         }
     }
 }
