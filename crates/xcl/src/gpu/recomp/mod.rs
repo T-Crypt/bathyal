@@ -1354,9 +1354,17 @@ pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
     em.configure_round_modes(&insts, branches == 0);
     em.static_ss = constant_samplers(&insts, &leaders);
     // split wave64: masks only read lane by lane skip the halves' exchange (geometry mode
-    // continues from the ES into the GS through s_setpc: left as it is)
+    // continues from the ES into the GS through s_setpc: left as it is); pixel shaders: they
+    // skip the quad reads that give the helper lanes' bits
     if opt.wave64 && opt.split_wave64 && matches!(opt.mode, Mode::Kernel | Mode::Compute(_) | Mode::Mesh(_)) && std::env::var_os("XCL_X64_ALL_MASKS").is_none() {
-        em.x64_whole_live = x64_masks::by_pc(&insts, matches!(opt.mode, Mode::Kernel));
+        em.mask_whole_live = x64_masks::by_pc(&insts, matches!(opt.mode, Mode::Kernel));
+    } else if matches!(opt.mode, Mode::Pixel(_)) {
+        em.mask_whole_live = x64_masks::by_pc(&insts, false);
+    }
+    // pixel shaders: a mask written in a loop takes its helper lanes' bits from quad reads of
+    // the compare's vector operands (`quad_bits`, #134)
+    if matches!(opt.mode, Mode::Pixel(_)) {
+        em.loops = loop_ranges(&insts);
     }
     // a compute group that is not whole console waves: padded to whole waves where the
     // program can tell the lanes its last wave does not launch
