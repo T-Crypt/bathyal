@@ -27,6 +27,12 @@ struct Pending {
     orphan: std::sync::atomic::AtomicBool,
 }
 
+impl Pending {
+    fn is_active(&self) -> bool {
+        self.sent.load(Ordering::Acquire) && !*self.done.lock().unwrap()
+    }
+}
+
 /// stand-in handed to the title → its real pipeline
 static PENDING: Mutex<Option<HashMap<usize, Arc<Pending>>>> = Mutex::new(None);
 
@@ -156,6 +162,7 @@ pub fn resolve(pso: usize) -> usize {
 pub fn resolve_wait(pso: usize) -> usize {
     let Some(p) = entry(pso) else { return pso };
     let start = Instant::now();
+    p.sent.store(true, Ordering::Release);
     let job = p.job.lock().unwrap().take();
     let here = job.is_some();
     if let Some(job) = job {
@@ -309,6 +316,14 @@ pub fn counts() -> (usize, usize, usize) {
     (BUILT.load(Ordering::Relaxed), FAILED.load(Ordering::Relaxed), pending)
 }
 
+/// Failed builds and builds actually started or sent to workers, excluding dormant lazy pipelines.
+pub fn activity() -> (usize, usize) {
+    let active = PENDING.lock().unwrap().as_ref().map_or(0, |m| {
+        m.values().filter(|p| p.is_active()).count()
+    });
+    (FAILED.load(Ordering::Relaxed), active)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -376,5 +391,20 @@ mod tests {
         assert_eq!(resolve_within(0x7410_0031, Some(Duration::ZERO), 1, &b), 0x7410_0031, "not a stand-in");
         let _ = released(c);
         let _ = released(g);
+    }
+
+    #[test]
+    fn lazy_pipeline_is_active_only_after_its_build_starts() {
+        let standin = usize::MAX - 1000;
+        submit_lazy(standin, true, Box::new(move || {
+            let p = entry(standin).unwrap();
+            assert!(p.is_active());
+            0
+        }));
+        let p = entry(standin).unwrap();
+        assert!(!p.is_active());
+        assert_eq!(resolve_wait(standin), standin);
+        assert!(!p.is_active());
+        assert_eq!(released(standin), 0);
     }
 }
