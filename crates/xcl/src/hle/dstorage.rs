@@ -256,7 +256,8 @@ pub struct BcpackStats {
     pub with_zlib: u64,
     /// bytes the title's destinations were to receive
     pub destination_bytes: u64,
-    /// bytes written by `XCL_DSTORAGE_BCPACK_FILL`
+    /// bytes written to the destinations: by `XCL_DSTORAGE_BCPACK_FILL` for a refusal, and by the
+    /// placeholder block for `bcpack_placeholder`
     pub filled_bytes: u64,
 }
 
