@@ -799,8 +799,16 @@ pub fn counters() -> (u64, u64, u64) {
     (REQUESTS.load(Ordering::Relaxed), BYTES.load(Ordering::Relaxed), FAILED.load(Ordering::Relaxed))
 }
 
+/// Tests: a request with this destination unwinds in `execute`.
+#[cfg(test)]
+static TEST_PANIC_DEST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Run a request; the destination gets the bytes or nothing.
 unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[usize]>, src_pages: Option<&[usize]>) -> Result<(), HRESULT> {
+    #[cfg(test)]
+    if r.destination == TEST_PANIC_DEST.load(Ordering::Relaxed) {
+        panic!("test: a request's execution unwinds");
+    }
     let n = r.destination_size as usize;
     {
         // the first requests: where a title's data goes and how it is packed
@@ -957,6 +965,10 @@ struct QueueInner {
     closed: AtomicBool,
     error_event: usize,
     errors: Mutex<(u32, Option<FirstError>)>,
+    /// the first failure of the requests since the last status entry (the console's record), in
+    /// the queue rather than in one worker: a status entry still reports a failure recorded
+    /// before the worker was replaced. `S_OK` when no request failed.
+    failed_since_status: AtomicI32,
     /// `XCL_DSTORAGE_BCPACK_FILL` when the queue was made
     bcpack_fill: AtomicBool,
 }
@@ -984,33 +996,50 @@ impl QueueInner {
     fn submit(self: &Arc<Self>) {
         // Lock `worker` before `pending` so concurrent `Submit()` calls always enqueue
         // batches to the channel in strict `seq` order.
-        let mut w = self.worker.lock().unwrap();
-        if self.closed.load(Ordering::Acquire) {
-            return;
-        }
-        let batch = std::mem::take(&mut self.pending.lock().unwrap().entries);
-        if batch.is_empty() {
-            return;
-        }
-        if w.is_none() {
-            let (tx, rx) = mpsc::channel::<Vec<Entry>>();
-            let q = Arc::clone(self);
-            *self.worker_active.0.lock().unwrap() = true;
-            let started = std::thread::Builder::new().name("xcl-dstorage".into()).spawn(move || q.run(rx));
-            if started.is_err() {
-                *self.worker_active.0.lock().unwrap() = false;
-                self.worker_active.1.notify_all();
-                // Release `worker` before dropping `batch` so fence `Release` cannot re-enter under lock.
-                drop(w);
-                drop(batch);
+        let orphan = {
+            let mut w = self.worker.lock().unwrap();
+            if self.closed.load(Ordering::Acquire) {
                 return;
             }
-            *w = Some(tx);
+            let batch = std::mem::take(&mut self.pending.lock().unwrap().entries);
+            if batch.is_empty() {
+                return;
+            }
+            self.hand_over(&mut w, batch)
+        };
+        // A batch no worker took runs here, so its status entries and fence signals still
+        // complete instead of staying pending for the rest of the session.
+        if let Some(batch) = orphan {
+            self.run_inline(batch);
         }
-        let sent = w.as_ref().unwrap().send(batch);
-        // Release `worker` before dropping any unsent `batch` returned in `Err`.
-        drop(w);
-        drop(sent);
+    }
+
+    /// Hands `batch` to the queue's worker, starting one when there is none or when the last
+    /// one's thread is gone. Returns the batch when no worker could be started.
+    fn hand_over(self: &Arc<Self>, w: &mut Option<mpsc::Sender<Vec<Entry>>>, batch: Vec<Entry>) -> Option<Vec<Entry>> {
+        let mut batch = batch;
+        for _ in 0..2 {
+            if w.is_none() {
+                let (tx, rx) = mpsc::channel::<Vec<Entry>>();
+                let q = Arc::clone(self);
+                *self.worker_active.0.lock().unwrap() = true;
+                if std::thread::Builder::new().name("xcl-dstorage".into()).spawn(move || q.run(rx)).is_err() {
+                    *self.worker_active.0.lock().unwrap() = false;
+                    self.worker_active.1.notify_all();
+                    return Some(batch);
+                }
+                *w = Some(tx);
+            }
+            match w.as_ref().unwrap().send(batch) {
+                Ok(()) => return None,
+                // the worker's thread has gone: a new one takes this batch
+                Err(mpsc::SendError(unsent)) => {
+                    *w = None;
+                    batch = unsent;
+                }
+            }
+        }
+        Some(batch)
     }
 
     fn run(&self, rx: mpsc::Receiver<Vec<Entry>>) {
@@ -1022,57 +1051,81 @@ impl QueueInner {
             }
         }
         let _active = ActiveGuard(self);
-        // the first failure of the requests since the last status entry
-        let mut since_status = S_OK;
         for batch in rx {
-            for e in batch {
-                if self.closed.load(Ordering::Acquire) {
-                    if let Entry::Status(s, i) = e {
-                        if let Some(slot) = s.slots.get(i as usize) {
-                            slot.store(E_QUEUE_CLOSED, Ordering::Release);
-                        }
+            self.run_batch(batch);
+        }
+    }
+
+    /// Runs a batch on the calling thread. `Close` waits for it like for the worker's batches.
+    fn run_inline(self: &Arc<Self>, batch: Vec<Entry>) {
+        *self.worker_active.0.lock().unwrap() = true;
+        self.run_batch(batch);
+        *self.worker_active.0.lock().unwrap() = false;
+        self.worker_active.1.notify_all();
+    }
+
+    fn run_batch(&self, batch: Vec<Entry>) {
+        for e in batch {
+            if self.closed.load(Ordering::Acquire) {
+                if let Entry::Status(s, i) = e {
+                    if let Some(slot) = s.slots.get(i as usize) {
+                        slot.store(E_QUEUE_CLOSED, Ordering::Release);
                     }
-                    continue;
                 }
-                match e {
-                    Entry::Request { seq, req, file, dest_pages, src_pages } => {
-                        if self.is_cancelled(seq, req.tag) {
-                            // Cancelled requests are skipped without affecting status or error record.
-                            continue;
-                        }
-                        if let Err(hr) = unsafe { execute(&req, file.as_deref(), dest_pages.as_deref(), src_pages.as_deref()) } {
-                            self.fail(hr, req, file.as_deref());
-                            if since_status >= 0 {
-                                since_status = hr;
-                            }
-                        }
+                continue;
+            }
+            match e {
+                Entry::Request { seq, req, file, dest_pages, src_pages } => {
+                    if self.is_cancelled(seq, req.tag) {
+                        // Cancelled requests are skipped without affecting status or error record.
+                        continue;
                     }
-                    Entry::Refused { hr, req, file, fill } => {
-                        if let Some(t) = &fill {
-                            // the destination gets solid blocks; the request still fails
-                            unsafe { bcpack_fill(&req, t) };
-                        }
+                    let run = || unsafe { execute(&req, file.as_deref(), dest_pages.as_deref(), src_pages.as_deref()) };
+                    // A request that unwinds fails like one that returns an error: the failure
+                    // reaches the queue's error record and status entries, and the requests
+                    // queued behind it still run.
+                    let hr = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(run)) {
+                        Ok(Ok(())) => None,
+                        Ok(Err(hr)) => Some(hr),
+                        Err(_) => Some(E_ABORT),
+                    };
+                    if let Some(hr) = hr {
                         self.fail(hr, req, file.as_deref());
-                        if since_status >= 0 {
-                            since_status = hr;
-                        }
+                        self.note_failure(hr);
                     }
-                    Entry::Status(s, i) => {
-                        if let Some(slot) = s.slots.get(i as usize) {
-                            slot.store(since_status, Ordering::Release);
-                        }
-                        since_status = S_OK;
+                }
+                Entry::Refused { hr, req, file, fill } => {
+                    if let Some(t) = &fill {
+                        // the destination gets solid blocks; the request still fails
+                        unsafe { bcpack_fill(&req, t) };
                     }
-                    Entry::Signal(fence, value) => unsafe {
-                        fence.signal(value);
-                    },
-                    #[cfg(test)]
-                    Entry::Gate(b) => {
-                        b.wait();
+                    self.fail(hr, req, file.as_deref());
+                    self.note_failure(hr);
+                }
+                Entry::Status(s, i) => {
+                    if let Some(slot) = s.slots.get(i as usize) {
+                        slot.store(self.take_failure(), Ordering::Release);
                     }
+                }
+                Entry::Signal(fence, value) => unsafe {
+                    fence.signal(value);
+                },
+                #[cfg(test)]
+                Entry::Gate(b) => {
+                    b.wait();
                 }
             }
         }
+    }
+
+    /// Remembers the first failure of the requests since the last status entry.
+    fn note_failure(&self, hr: HRESULT) {
+        let _ = self.failed_since_status.compare_exchange(S_OK, hr, Ordering::AcqRel, Ordering::Relaxed);
+    }
+
+    /// The first failure since the last status entry, clearing it.
+    fn take_failure(&self) -> HRESULT {
+        self.failed_since_status.swap(S_OK, Ordering::AcqRel)
     }
 
     fn enqueue(self: &Arc<Self>, e: Entry) {
@@ -1178,6 +1231,7 @@ unsafe extern "system" fn factory_create_queue(_p: *mut c_void, desc: *const u8,
         closed: AtomicBool::new(false),
         error_event: ev as usize,
         errors: Mutex::new((0, None)),
+        failed_since_status: AtomicI32::new(S_OK),
         bcpack_fill: AtomicBool::new(bcpack_fill_from_env()),
     });
     let o = new_object(queue_vtbl(), inner);
@@ -1904,6 +1958,101 @@ mod tests {
             assert!(queue(q).pending.lock().unwrap().entries.is_empty());
             assert!(queue(q).worker.lock().unwrap().is_none());
 
+            queue_release(q);
+            status_release(s);
+        }
+    }
+
+    /// A request whose execution unwinds fails like one that returns an error: its status entry
+    /// reports the failure and the requests queued behind it still run.
+    #[test]
+    fn a_request_that_unwinds_still_completes_its_status() {
+        unsafe {
+            let mut f = std::ptr::null_mut();
+            assert_eq!(DStorageGetFactory(&IID_FACTORY, &mut f), S_OK);
+            let vt = *(f as *const *const usize);
+            let create_queue: unsafe extern "system" fn(*mut c_void, *const u8, *const GUID, *mut *mut c_void) -> HRESULT = std::mem::transmute(*vt.add(3));
+            let create_status: unsafe extern "system" fn(*mut c_void, u32, *const u8, *const GUID, *mut *mut c_void) -> HRESULT = std::mem::transmute(*vt.add(5));
+            let mut desc = [0u8; 0x18];
+            desc[0..4].copy_from_slice(&1u32.to_le_bytes());
+            desc[8..10].copy_from_slice(&8u16.to_le_bytes());
+            desc[10] = 2;
+            let mut q = std::ptr::null_mut();
+            assert_eq!(create_queue(f, desc.as_ptr(), &IID_QUEUE, &mut q), S_OK);
+            let mut s = std::ptr::null_mut();
+            assert_eq!(create_status(f, 2, std::ptr::null(), &IID_STATUS_ARRAY, &mut s), S_OK);
+
+            let data = [7u8; 8];
+            let mut dst = [0u8; 8];
+            TEST_PANIC_DEST.store(u64::MAX, Ordering::Relaxed);
+            queue_enqueue_request(q, request(SOURCE_MEMORY_BIT, u64::MAX, 8, data.as_ptr() as u64, 0, 8).as_ptr());
+            queue_enqueue_status(q, s, 0);
+            queue_enqueue_request(q, request(SOURCE_MEMORY_BIT, dst.as_mut_ptr() as u64, 8, data.as_ptr() as u64, 0, 8).as_ptr());
+            queue_enqueue_status(q, s, 1);
+            queue_submit(q);
+            let start = std::time::Instant::now();
+            while !status_is_complete(s, 1) && start.elapsed().as_secs() < 5 {
+                std::thread::yield_now();
+            }
+            TEST_PANIC_DEST.store(0, Ordering::Relaxed);
+            assert_eq!(status_get_hresult(s, 0), E_ABORT, "a request that unwinds fails");
+            assert_eq!(status_get_hresult(s, 1), S_OK, "the requests behind it still run");
+            assert_eq!(dst, [7u8; 8]);
+            queue_close(q);
+            queue_release(q);
+            status_release(s);
+        }
+    }
+
+    /// A batch handed to a worker whose thread is gone is not dropped: a new worker takes it, so
+    /// the status entry completes and the request's bytes land.
+    #[test]
+    fn a_batch_for_a_gone_worker_is_still_run() {
+        unsafe {
+            let mut f = std::ptr::null_mut();
+            assert_eq!(DStorageGetFactory(&IID_FACTORY, &mut f), S_OK);
+            let vt = *(f as *const *const usize);
+            let create_queue: unsafe extern "system" fn(*mut c_void, *const u8, *const GUID, *mut *mut c_void) -> HRESULT = std::mem::transmute(*vt.add(3));
+            let create_status: unsafe extern "system" fn(*mut c_void, u32, *const u8, *const GUID, *mut *mut c_void) -> HRESULT = std::mem::transmute(*vt.add(5));
+            let mut desc = [0u8; 0x18];
+            desc[0..4].copy_from_slice(&1u32.to_le_bytes());
+            desc[8..10].copy_from_slice(&8u16.to_le_bytes());
+            desc[10] = 2;
+            let mut q = std::ptr::null_mut();
+            assert_eq!(create_queue(f, desc.as_ptr(), &IID_QUEUE, &mut q), S_OK);
+            let mut s = std::ptr::null_mut();
+            assert_eq!(create_status(f, 2, std::ptr::null(), &IID_STATUS_ARRAY, &mut s), S_OK);
+
+            // the first batch starts the worker
+            queue_enqueue_status(q, s, 0);
+            queue_submit(q);
+            let start = std::time::Instant::now();
+            while !status_is_complete(s, 0) && start.elapsed().as_secs() < 5 {
+                std::thread::yield_now();
+            }
+            assert_eq!(status_get_hresult(s, 0), S_OK);
+
+            // the worker's channel and thread are gone (as after its thread ended)
+            {
+                let mut w = queue(q).worker.lock().unwrap();
+                let (tx, rx) = mpsc::channel::<Vec<Entry>>();
+                drop(rx);
+                *w = Some(tx);
+            }
+
+            let data = [3u8; 8];
+            let mut dst = [0u8; 8];
+            queue_enqueue_request(q, request(SOURCE_MEMORY_BIT, dst.as_mut_ptr() as u64, 8, data.as_ptr() as u64, 0, 8).as_ptr());
+            queue_enqueue_status(q, s, 1);
+            queue_submit(q);
+            let start = std::time::Instant::now();
+            while !status_is_complete(s, 1) && start.elapsed().as_secs() < 5 {
+                std::thread::yield_now();
+            }
+            assert!(status_is_complete(s, 1), "a batch for a gone worker must not stay pending");
+            assert_eq!(status_get_hresult(s, 1), S_OK);
+            assert_eq!(dst, [3u8; 8]);
+            queue_close(q);
             queue_release(q);
             status_release(s);
         }
