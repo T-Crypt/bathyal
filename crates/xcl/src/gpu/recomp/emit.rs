@@ -2179,11 +2179,33 @@ impl Em {
             let sampler = self.sampler_ref(d.pc, has_c, &s3);
             self.line(&format!("{samp} {t}_S = {sampler};"));
             if let Some(o) = &offset {
-                let level = match (&lod, has_lz || base.starts_with("gather4"), ps && grads.is_none() && !has_c) {
-                    (_, true, _) => "0u".to_string(),
-                    (Some(l), _, _) => format!("(uint)max(round({l}), 0.0f)"),
-                    (None, _, true) => format!("(uint)max(round({t}_T.CalculateLevelOfDetail({t}_S, {coord0})), 0.0f)"),
-                    _ => "0u".to_string(),
+                // the mip the console reads: the given LOD, else that of the given gradients or the
+                // pixel's own (none outside PS), plus the bias
+                let level = if has_lz || base.starts_with("gather4") {
+                    "0u".to_string()
+                } else if let Some(l) = &lod {
+                    format!("(uint)max(round({l}), 0.0f)")
+                } else if grads.is_none() && bias.is_none() && !(ps && has_c) {
+                    if ps { format!("(uint)max(round({t}_T.CalculateLevelOfDetail({t}_S, {coord0})), 0.0f)") } else { "0u".to_string() }
+                } else {
+                    // mip 0's size for the gradients' LOD, and the view's levels: a bias can pass the last
+                    self.texel_offset(&t, dim, o, "0u", "0");
+                    let size = [format!("{t}_w0"), format!("{t}_h0"), format!("{t}_d0")];
+                    let len = |x: &[String]| format!("length(float{}({}))", x.len(), x.iter().zip(&size).map(|(a, w)| format!("{a} * (float){w}")).collect::<Vec<_>>().join(", "));
+                    let grad_lod = |dx: &[String], dy: &[String]| format!("log2(max(max({}, {}), 1e-8f))", len(dx), len(dy));
+                    // CalculateLevelOfDetail takes no comparison sampler: the screen derivatives
+                    let screen = |op: &str| (0..[1, 2, 3, 3, 1, 2][dim as usize]).map(|k| format!("{op}({})", coords_unmoved[k])).collect::<Vec<_>>();
+                    let l = match &grads {
+                        Some((dx, dy)) => grad_lod(dx, dy),
+                        None if ps && has_c => grad_lod(&screen("ddx"), &screen("ddy")),
+                        None if ps => format!("{t}_T.CalculateLevelOfDetail({t}_S, {coord0})"),
+                        None => "0.0f".to_string(),
+                    };
+                    let l = match &bias {
+                        Some(b) => format!("{l} + {b}"),
+                        None => l,
+                    };
+                    format!("min((uint)max(round({l}), 0.0f), max({t}_n0, 1u) - 1u)")
                 };
                 self.texel_offset(&t, dim, o, &level, "");
             }

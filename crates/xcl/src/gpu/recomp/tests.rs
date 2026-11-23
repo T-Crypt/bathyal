@@ -1953,6 +1953,156 @@ fn gpu_ps_image_sample_offset_implicit_lod_between_mips() {
     }
 }
 
+/// A 2-level texture (8², 4²; level k texel x holds 100·k + x); `r32`: one channel, else four.
+fn two_mip_texture(r32: bool) -> runner::ViewTexture {
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R32G32B32A32_FLOAT, DXGI_FORMAT_R32_FLOAT, DXGI_SAMPLE_DESC};
+    let format = if r32 { DXGI_FORMAT_R32_FLOAT } else { DXGI_FORMAT_R32G32B32A32_FLOAT };
+    let mut data = Vec::new();
+    for k in 0..2u32 {
+        let n = 8 >> k;
+        for _y in 0..n {
+            for x in 0..n {
+                let v = (100 * k + x) as f32;
+                data.extend_from_slice(&if r32 { v.to_le_bytes().to_vec() } else { [v; 4].map(f32::to_le_bytes).concat() });
+            }
+        }
+    }
+    let res = D3D12_RESOURCE_DESC {
+        Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+        Width: 8,
+        Height: 8,
+        DepthOrArraySize: 1,
+        MipLevels: 2,
+        Format: format,
+        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        ..Default::default()
+    };
+    let mut srv = D3D12_SHADER_RESOURCE_VIEW_DESC {
+        Format: format,
+        ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+        Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+        ..Default::default()
+    };
+    srv.Anonymous.Texture2D = D3D12_TEX2D_SRV { MipLevels: 2, ..Default::default() };
+    runner::ViewTexture { res, srv, data, row_bytes: 8 * if r32 { 4 } else { 16 } }
+}
+
+/// Draws `ps` (its sample's VDATA in v20) with `two_mip_texture`, point min / mag / mip, clamp
+/// (`cmp`: one channel and a LESS_EQUAL comparison sampler); every pixel's red is `want(u)`,
+/// u = v = pixel centre · `scale`.
+fn assert_two_mip_sample(name: &str, ps: &[u8], cmp: bool, scale: f32, want: &dyn Fn(f32) -> f32) {
+    // S#: clamp u / v / w, point min / mag (0), MIP_FILTER point (1), DEPTH_COMPARE LESS_EQUAL (3 + 1)
+    let s_sharp = [2 | 2 << 3 | 2 << 6 | if cmp { 3 << 12 } else { 0 }, 0xFFF << 12, 1 << 26, 0];
+    let mut sgprs = vec![0u32; 32];
+    sgprs[16..24].copy_from_slice(&tsharp(0, 77, 9));
+    sgprs[24..28].copy_from_slice(&s_sharp);
+    let px = draw_console_views(None, Some(ps), &[[0.0, 0.0], [0.0, 32.0], [32.0, 0.0]], &sgprs, &[two_mip_texture(cmp)], &[crate::gpu::desc::sampler_d3d12(&s_sharp, cmp)]);
+    for y in 0..16 {
+        for x in 0..16 {
+            let u = (x as f32 + 0.5) * scale;
+            let (got, w) = (px[y * 16 + x][0], want(u));
+            assert!((got - w).abs() < 0.02, "{name}: pixel ({x},{y}) = {got}, expected {w}");
+        }
+    }
+}
+
+/// The texel of mip `k` (point filter) at u, moved by one of that mip's texels (offset +1, clamp).
+fn texel_moved(k: u32, u: f32) -> f32 {
+    let size = (8 >> k) as f32;
+    100.0 * k as f32 + ((u * size).floor() + 1.0).clamp(0.0, size - 1.0)
+}
+
+const EXP_V20: (&str, &str, &[(&str, u64)], Option<u32>) =
+    ("EXP", "ENC_EXP", &[("TGT", 0), ("EN", 0xF), ("VSRC0", 20), ("VSRC1", 20), ("VSRC2", 20), ("VSRC3", 20), ("DONE", 1), ("VM", 1)], None);
+
+/// Control for the tests below: `image_sample_o` at implicit LOD 0.75 with a point mip filter
+/// reads mip 1 alone, moved by one of its texels (right on main since #229).
+#[test]
+fn gpu_ps_image_sample_offset_point_mip() {
+    if !gpu_ready() {
+        return;
+    }
+    let s = 2f32.powf(0.75) / 8.0;
+    let ps = prog(&[
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 4), ("SRC0", 129)], None), // offset x +1, y 0
+        ("V_MUL_F32", "ENC_VOP2", &[("VDST", 5), ("SRC0", 255), ("VSRC1", 2)], Some(s.to_bits())),
+        ("V_MUL_F32", "ENC_VOP2", &[("VDST", 6), ("SRC0", 255), ("VSRC1", 3)], Some(s.to_bits())),
+        ("IMAGE_SAMPLE_O", "ENC_MIMG", &[("VDATA", 20), ("VADDR", 4), ("SRSRC", 4), ("SSAMP", 6), ("DMASK", 0x1), ("DIM", 1)], None),
+        EXP_V20,
+    ]);
+    assert_two_mip_sample("sample_o", &ps, false, s, &|u| texel_moved(1, u));
+}
+
+/// `image_sample_b_o`: implicit LOD 0 + bias 1 reads mip 1, so the offset is one of mip 1's texels.
+#[test]
+fn gpu_ps_image_sample_offset_bias_lod() {
+    if !gpu_ready() {
+        return;
+    }
+    let s = 1f32 / 8.0;
+    let ps = prog(&[
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 4), ("SRC0", 129)], None), // offset x +1, y 0
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 5), ("SRC0", 242)], None), // bias 1.0
+        ("V_MUL_F32", "ENC_VOP2", &[("VDST", 6), ("SRC0", 255), ("VSRC1", 2)], Some(s.to_bits())),
+        ("V_MUL_F32", "ENC_VOP2", &[("VDST", 7), ("SRC0", 255), ("VSRC1", 3)], Some(s.to_bits())),
+        ("IMAGE_SAMPLE_B_O", "ENC_MIMG", &[("VDATA", 20), ("VADDR", 4), ("SRSRC", 4), ("SSAMP", 6), ("DMASK", 0x1), ("DIM", 1)], None),
+        EXP_V20,
+    ]);
+    assert_two_mip_sample("sample_b_o", &ps, false, s, &|u| texel_moved(1, u));
+}
+
+/// `image_sample_d_o` / `image_sample_cd_o`: gradients of 2 mip-0 texels per pixel (LOD 1) read
+/// mip 1, so the offset is one of mip 1's texels.
+#[test]
+fn gpu_ps_image_sample_offset_gradient_lod() {
+    if !gpu_ready() {
+        return;
+    }
+    let (s, g) = (1f32 / 8.0, 2f32 / 8.0);
+    for op in ["IMAGE_SAMPLE_D_O", "IMAGE_SAMPLE_CD_O"] {
+        let ps = prog(&[
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 4), ("SRC0", 129)], None), // offset x +1, y 0
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 5), ("SRC0", 255)], Some(g.to_bits())), // du/dx
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 6), ("SRC0", 128)], None),
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 7), ("SRC0", 128)], None),
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 8), ("SRC0", 255)], Some(g.to_bits())), // dv/dy
+            ("V_MUL_F32", "ENC_VOP2", &[("VDST", 9), ("SRC0", 255), ("VSRC1", 2)], Some(s.to_bits())),
+            ("V_MUL_F32", "ENC_VOP2", &[("VDST", 10), ("SRC0", 255), ("VSRC1", 3)], Some(s.to_bits())),
+            (op, "ENC_MIMG", &[("VDATA", 20), ("VADDR", 4), ("SRSRC", 4), ("SSAMP", 6), ("DMASK", 0x1), ("DIM", 1)], None),
+            EXP_V20,
+        ]);
+        assert_two_mip_sample(op, &ps, false, s, &|u| texel_moved(1, u));
+    }
+}
+
+/// `image_sample_c_o` at implicit LOD 1, LESS_EQUAL: z is the moved mip-1 texel - 0.5, so each
+/// pixel passes (1) only if the offset was one of mip 1's texels; u = v = pixel centre / 4 - 1/16
+/// puts mip 0's single texel (half of mip 1's) short of the next mip-1 texel.
+#[test]
+fn gpu_ps_image_sample_offset_compare_lod() {
+    if !gpu_ready() {
+        return;
+    }
+    let s = 2f32 / 8.0;
+    let ps = prog(&[
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 4), ("SRC0", 129)], None), // offset x +1, y 0
+        ("V_MUL_F32", "ENC_VOP2", &[("VDST", 6), ("SRC0", 255), ("VSRC1", 2)], Some(s.to_bits())),
+        ("V_MUL_F32", "ENC_VOP2", &[("VDST", 7), ("SRC0", 255), ("VSRC1", 3)], Some(s.to_bits())),
+        ("V_ADD_F32", "ENC_VOP2", &[("VDST", 6), ("SRC0", 255), ("VSRC1", 6)], Some((-1f32 / 16.0).to_bits())),
+        ("V_ADD_F32", "ENC_VOP2", &[("VDST", 7), ("SRC0", 255), ("VSRC1", 7)], Some((-1f32 / 16.0).to_bits())),
+        // z = 100 + min(floor(4u) + 1, 3) - 0.5
+        ("V_MUL_F32", "ENC_VOP2", &[("VDST", 5), ("SRC0", 246), ("VSRC1", 6)], None),
+        ("V_FLOOR_F32", "ENC_VOP1", &[("VDST", 5), ("SRC0", V + 5)], None),
+        ("V_ADD_F32", "ENC_VOP2", &[("VDST", 5), ("SRC0", 242), ("VSRC1", 5)], None),
+        ("V_MIN_F32", "ENC_VOP2", &[("VDST", 5), ("SRC0", 255), ("VSRC1", 5)], Some(3f32.to_bits())),
+        ("V_ADD_F32", "ENC_VOP2", &[("VDST", 5), ("SRC0", 255), ("VSRC1", 5)], Some(99.5f32.to_bits())),
+        ("IMAGE_SAMPLE_C_O", "ENC_MIMG", &[("VDATA", 20), ("VADDR", 4), ("SRSRC", 4), ("SSAMP", 6), ("DMASK", 0x1), ("DIM", 1)], None),
+        EXP_V20,
+    ]);
+    assert_two_mip_sample("sample_c_o", &ps, true, s, &|_| 1.0);
+}
+
 /// 48 SGPR spill slots in lanes 0..47 of v30 (`v_writelane` / `v_readlane`, as 287 retail
 /// pixel shaders do – 11 up to lane 47): slot k = `slot(k)`, then s44 = the sum of slots
 /// 0..31, s45 = the sum of slots 32..47.
