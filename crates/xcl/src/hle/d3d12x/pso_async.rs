@@ -1,10 +1,10 @@
-//! Non-blocking pipeline creation. Translating a console shader takes milliseconds; compiling
-//! the HLSL with DXC takes 0.2 s to seconds, and a title creates thousands of pipelines while
-//! it loads. When a pipeline's DXIL is not in the disk cache yet, the title gets a stand-in
-//! pipeline (shaders that draw nothing) at once and the real one is built on a worker; binding
-//! (`SetPipelineState`, console list replay, the two-pass lookups) uses the real one as soon
-//! as it is there. A graphics pipeline draws nothing until then; a compute pipeline is waited
-//! for at its first bind (a skipped dispatch would corrupt what it computes).
+//! Non-blocking pipeline creation. A title creates thousands of pipelines while it loads.
+//! Translating a console shader is milliseconds from the cache and a long DXC compile when it
+//! is not; the driver's compile of that DXIL is the slow part either way. The title gets a
+//! stand-in pipeline (shaders that draw nothing) at once and the real one is built on a
+//! worker; binding (`SetPipelineState`, console list replay, the two-pass lookups) uses the
+//! real one as soon as it is there. A graphics pipeline draws nothing until then; a compute
+//! pipeline is waited for at its first bind (a skipped dispatch would corrupt what it computes).
 //! `XCL_ASYNC_PSO=0` builds every pipeline in the call, as before.
 
 use std::collections::HashMap;
@@ -123,7 +123,7 @@ fn submit_as(standin: usize, compute: bool, job: Job, send: bool) {
     PENDING.lock().unwrap().get_or_insert_with(HashMap::new).insert(standin, p.clone());
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
-        crate::xlog_info!("D3D12.X: pipelines whose shaders are not compiled yet get a stand-in and are built in the background");
+        crate::xlog_info!("D3D12.X: pipeline creation returns at once; shader and driver compiles run in the background");
     });
     if send {
         let _ = queue().lock().unwrap().send(p);
@@ -194,6 +194,82 @@ pub fn released(pso: usize) -> usize {
 /// `pso` is a stand-in whose real pipeline is still being built.
 pub fn is_pending(pso: usize) -> bool {
     entry(pso).is_some_and(|p| !*p.done.lock().unwrap())
+}
+
+/// How many uncached driver compiles may run at once. Each one fans out across the GPU
+/// driver's own compiler, so a few of them already fill the machine; more of them fight
+/// over the same cores and the load takes longer. `XCL_PSO_COMPILES` overrides it.
+fn driver_compile_limit() -> usize {
+    static N: OnceLock<usize> = OnceLock::new();
+    *N.get_or_init(|| {
+        let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
+        std::env::var("XCL_PSO_COMPILES").ok().and_then(|v| v.parse().ok()).unwrap_or((cores / 4).clamp(2, 4))
+    })
+}
+
+struct DriverGate {
+    /// compiles in the driver, and whether a resource create wants the driver to itself
+    running: Mutex<(usize, bool)>,
+    cv: Condvar,
+}
+
+fn driver_gate() -> &'static DriverGate {
+    static G: OnceLock<DriverGate> = OnceLock::new();
+    G.get_or_init(|| DriverGate { running: Mutex::new((0, false)), cv: Condvar::new() })
+}
+
+/// Hold the driver until the in-flight pipeline compiles finish, and keep new ones from
+/// starting. A resource create overlapping a pipeline compile removes the device on this GPU.
+pub struct DriverQuiet;
+
+impl Drop for DriverQuiet {
+    fn drop(&mut self) {
+        let g = driver_gate();
+        let mut n = g.running.lock().unwrap();
+        n.1 = false;
+        g.cv.notify_all();
+    }
+}
+
+pub fn quiet_driver() -> DriverQuiet {
+    let g = driver_gate();
+    let mut n = g.running.lock().unwrap();
+    n.1 = true;
+    if n.0 > 0 {
+        crate::xlog_info!("D3D12.X: waiting for {} pipeline compile(s) before creating a resource", n.0);
+    }
+    while n.0 > 0 {
+        n = g.cv.wait(n).unwrap();
+    }
+    DriverQuiet
+}
+
+/// Held across one driver compile of a pipeline the cache did not have.
+pub struct DriverGuard;
+
+impl Drop for DriverGuard {
+    fn drop(&mut self) {
+        let g = driver_gate();
+        let mut n = g.running.lock().unwrap();
+        n.0 = n.0.saturating_sub(1);
+        g.cv.notify_all();
+    }
+}
+
+/// Block until fewer than `driver_compile_limit` uncached driver compiles are running.
+pub fn uncached_compile() -> DriverGuard {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        crate::xlog_info!("D3D12.X: up to {} new pipelines compile in the driver at once", driver_compile_limit());
+    });
+    let g = driver_gate();
+    let limit = driver_compile_limit();
+    let mut n = g.running.lock().unwrap();
+    while n.1 || n.0 >= limit {
+        n = g.cv.wait(n).unwrap();
+    }
+    n.0 += 1;
+    DriverGuard
 }
 
 /// (built in the background, failed, still building)
