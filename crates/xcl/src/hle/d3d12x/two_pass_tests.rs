@@ -39,6 +39,12 @@ fn ready() -> Option<ID3D12Device> {
         println!("no real D3D12 device – skipping");
         return None;
     }
+    if real::software_adapter() {
+        // WARP / the Basic Render Driver report mesh shaders but reject the translated pipelines
+        println!("software adapter (no GPU) – skipping");
+        crate::gpu::recomp::runner::skip_test("no GPU");
+        return None;
+    }
     if real::uma_window_vas().is_empty() {
         println!("unified memory is not open on the GPU – skipping");
         return None;
