@@ -645,6 +645,25 @@ pub(super) unsafe extern "system" fn create_sampler_x(this: *mut c_void, x: *con
     real::dev_create_sampler_x(this, &d, dest);
 }
 
+/// Xbox colour formats a PC driver rejects.
+pub fn pc_color_format(format: u32) -> u32 {
+    match format {
+        116 | 117 => 10, // R10G10B10_*E*_A2_FLOAT → R16G16B16A16_FLOAT
+        // A8_UNORM is not a render-target format on this GPU. R8_UNORM still removed the
+        // device (the translated pixel shader writes float4). R8G8B8A8_UNORM matches that.
+        65 => 28,
+        other => other,
+    }
+}
+
+/// Xbox depth formats. 118 is `D16_UNORM_S8_UINT`; the PC depth format with stencil is D24.
+pub fn pc_dsv_format(format: u32) -> u32 {
+    match format {
+        118 | 119 => 45, // D16_UNORM_S8_UINT / its depth read → D24_UNORM_S8_UINT
+        other => other,
+    }
+}
+
 /// the console resource desc (0x38 bytes, D3D12_RESOURCE_DESC) as a PC one: its tile layouts
 /// and console flag bits mean nothing to a PC driver
 pub fn pc_resource_desc(x: &[u8; 0x38]) -> [u8; 0x38] {
@@ -899,11 +918,32 @@ pub(super) unsafe extern "system" fn create_placed_resource_x(this: *mut c_void,
             return hr;
         }
     }
+    // a texture the CPU fills: on the title's pages of such textures (`vram`), shared with the
+    // ones placed there before as on the console, else a committed texture of its own
+    let mut kept = if buffer { Err(String::new()) } else { super::title_textures::layout(&x) };
+    let on_pages = kept.as_ref().ok().map(|t| t.size()).filter(|_| !super::vram::gpu_owned(flags));
+    if let Some(console_bytes) = on_pages {
+        let pc = std::ptr::read_unaligned(d.as_ptr() as *const D3D12_RESOURCE_DESC);
+        if let Some(hr) = super::vram::place_title_texture(this, va as usize, &pc, state, console_bytes, riid, ppv) {
+            let res = *ppv;
+            let tex = std::mem::replace(&mut kept, Err(String::new()));
+            if tex.and_then(|t| super::title_textures::register(this, res, va as usize, t, D3D12_RESOURCE_STATES(state as i32))).is_ok() {
+                real::note_title_address(res as usize, va as usize);
+                return hr;
+            }
+            // (not kept in step: the pages are not its own – a resource of its own instead)
+            if !res.is_null() {
+                drop(windows::core::IUnknown::from_raw(res));
+            }
+            *ppv = std::ptr::null_mut();
+            kept = super::title_textures::layout(&x);
+        }
+    }
     let heap = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() };
     let hr = real::dev_create_committed_resource(this, &heap as *const _ as usize, 0, d.as_ptr() as usize, state as usize, clear as usize, riid, ppv);
     if hr >= 0 && !buffer && !(*ppv).is_null() {
         static M: AtomicU64 = AtomicU64::new(0);
-        match super::title_textures::register(this, *ppv, va as usize, &x, D3D12_RESOURCE_STATES(state as i32)) {
+        match kept.and_then(|tex| super::title_textures::register(this, *ppv, va as usize, tex, D3D12_RESOURCE_STATES(state as i32))) {
             Ok(()) => {
                 real::note_title_address(*ppv as usize, va as usize);
                 return hr;

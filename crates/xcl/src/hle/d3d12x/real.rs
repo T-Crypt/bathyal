@@ -3228,6 +3228,105 @@ fn with_switch_fallback<R>(mut build: impl FnMut() -> R) -> R {
     crate::gpu::recomp::pso::in_switch_form(build)
 }
 
+fn cached_pso(blob: &[u8]) -> D3D12_CACHED_PIPELINE_STATE {
+    D3D12_CACHED_PIPELINE_STATE {
+        pCachedBlob: if blob.is_empty() { std::ptr::null() } else { blob.as_ptr() as *const c_void },
+        CachedBlobSizeInBytes: blob.len(),
+    }
+}
+
+unsafe fn driver_blob(pso: *mut c_void) -> Option<Vec<u8>> {
+    let pso = ID3D12PipelineState::from_raw_borrowed(&pso)?;
+    let blob = pso.GetCachedBlob().ok()?;
+    let n = blob.GetBufferSize();
+    if n == 0 || n > 32 << 20 {
+        return None;
+    }
+    Some(std::slice::from_raw_parts(blob.GetBufferPointer() as *const u8, n).to_vec())
+}
+
+fn note_driver_cache(saved: bool) {
+    static SAVED: AtomicU64 = AtomicU64::new(0);
+    static USED: AtomicU64 = AtomicU64::new(0);
+    let (n, word) = if saved { (SAVED.fetch_add(1, Ordering::Relaxed), "saved") } else { (USED.fetch_add(1, Ordering::Relaxed), "reused") };
+    if n < 3 || n % 500 == 0 {
+        crate::xlog_info!("D3D12.X: driver pipeline cache: {} pipelines {word}", n + 1);
+    }
+}
+
+static PSO_DEVICE_REMOVED: AtomicBool = AtomicBool::new(false);
+
+fn device_is_removed(_this: *mut c_void) -> bool {
+    PSO_DEVICE_REMOVED.load(Ordering::Acquire)
+}
+
+fn note_device_removed() {
+    PSO_DEVICE_REMOVED.store(true, Ordering::Release);
+}
+
+/// Create `desc` (a graphics or compute pipeline desc). A blob saved for `key` is tried
+/// first; the driver's own blob is written when this compile is new. A cache hit does not
+/// take a driver-compile slot. A miss does, so only a few new pipelines compile at once.
+unsafe fn finish_pso_cached(this: *mut c_void, f: PsoFn, desc: *mut c_void, graphics: bool, key: u64, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+    let loaded = super::pso_disk::load(key);
+    let apply = |blob: &[u8]| {
+        let cached = cached_pso(blob);
+        if graphics {
+            (*(desc as *mut D3D12_GRAPHICS_PIPELINE_STATE_DESC)).CachedPSO = cached;
+        } else {
+            (*(desc as *mut D3D12_COMPUTE_PIPELINE_STATE_DESC)).CachedPSO = cached;
+        }
+    };
+    if let Some(blob) = &loaded {
+        apply(blob);
+        let hr = finish_pso(this, f, desc, riid, ppv);
+        if hr >= 0 {
+            note_driver_cache(false);
+            return hr;
+        }
+        if (hr as u32) & 0xFFFF_0000 == 0x887A_0000 {
+            note_device_removed();
+            return hr;
+        }
+        super::pso_disk::forget(key);
+        apply(&[]);
+    }
+    if device_is_removed(this) {
+        return 0x887A_0005u32 as HRESULT;
+    }
+    // This graphics pipeline removes the device from inside the driver's compile. Cached
+    // pipelines still load above. Compute pipelines are built (big ones in the background).
+    if graphics && key == 0x94a63ac3f96c98ac {
+        crate::xlog_warn!("D3D12.X: pipeline {key:016x} is not compiled: it removes the device");
+        return E_INVALIDARG;
+    }
+    let _guard = super::pso_async::uncached_compile();
+    if graphics {
+        let g = &*(desc as *const D3D12_GRAPHICS_PIPELINE_STATE_DESC);
+        let n = (g.NumRenderTargets as usize).min(8);
+        crate::xlog_info!(
+            "D3D12.X: driver compile {key:016x} RTs {} {:?} DSV {} samples {}",
+            g.NumRenderTargets,
+            &g.RTVFormats[..n].iter().map(|f| f.0).collect::<Vec<_>>(),
+            g.DSVFormat.0,
+            g.SampleDesc.Count
+        );
+    } else {
+        crate::xlog_info!("D3D12.X: driver compile {key:016x} compute");
+    }
+    let hr = finish_pso(this, f, desc, riid, ppv);
+    if (hr as u32) & 0xFFFF_0000 == 0x887A_0000 {
+        note_device_removed();
+    }
+    if hr >= 0 && !ppv.is_null() && !(*ppv).is_null() {
+        if let Some(blob) = driver_blob(*ppv) {
+            super::pso_disk::store(key, &blob);
+            note_driver_cache(true);
+        }
+    }
+    hr
+}
+
 thread_local! {
     /// translation errors noted during a cached-only attempt (`attempt`)
     static ATTEMPT_NOTES: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
@@ -3437,13 +3536,15 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
     copy.pRootSignature = std::mem::transmute::<*mut c_void, std::mem::ManuallyDrop<Option<ID3D12RootSignature>>>(rs);
     copy.CS = bytecode(&dxil);
     copy.CachedPSO = D3D12_CACHED_PIPELINE_STATE::default();
+    let key = super::pso_disk::compute_key(&copy, &compiled.samplers);
     // in the background, one at a time and within the commit left (each ~1.5 GB in the driver)
     let _slot = (big && std::thread::current().name().is_some_and(|n| n.starts_with("xcl-pso"))).then(|| {
         let slot = BIG_COMPILES.acquire();
         wait_for_commit();
         slot
     });
-    let hr = finish_pso(this, f, &copy as *const _ as *const c_void, riid, ppv);
+    // a driver blob saved for this pipeline skips the driver's compile (`pso_disk`)
+    let hr = finish_pso_cached(this, f, &mut copy as *mut _ as *mut c_void, false, key, riid, ppv);
     if hr < 0 {
         note_translation_error(format!("the driver rejected the compute PSO with the translated CS ({hr:#x})"));
         return Some(Err(()));
@@ -3528,6 +3629,7 @@ unsafe fn translated_graphics_pso_once(this: *mut c_void, f: PsoFn, desc: *const
         copy.GS = bytecode(gs);
     }
     pc_topology_type(&mut copy);
+    pc_pso_formats(&mut copy);
     let ps_hash = shader_bytes(&d.PS).map_or(0, crate::gpu::shader::fnv64);
     if debug_pso_switch("XCL_DEBUG_NO_STENCIL", ps_hash) {
         copy.DepthStencilState.StencilEnable = false.into();
@@ -3535,7 +3637,10 @@ unsafe fn translated_graphics_pso_once(this: *mut c_void, f: PsoFn, desc: *const
     if debug_pso_switch("XCL_DEBUG_NO_CULL", ps_hash) {
         copy.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
     }
-    let hr = retry_without_rect_gs(&mut copy, rect_gs.is_some(), |c| finish_pso(this, f, c as *const _ as *const c_void, riid, ppv));
+    let hr = retry_without_rect_gs(&mut copy, rect_gs.is_some(), |c| {
+        let key = super::pso_disk::graphics_key(c, &samplers);
+        finish_pso_cached(this, f, c as *mut _ as *mut c_void, true, key, riid, ppv)
+    });
     if hr < 0 {
         note_translation_error(format!(
             "the driver rejected the PSO with the translated shaders ({hr:#x}; topology type {}, {} render targets, DSV format {}, HS {}, GS {})",
@@ -4331,7 +4436,7 @@ const RECT_LIST_TYPE: i32 = 19;
 /// `create(copy)`, and once more without the generated rect list GS (`rect_gs`) when the driver
 /// refuses the pipeline with it: each rect is then drawn as the triangle of its three vertices,
 /// as without the GS, rather than not at all (the untranslated fallback's dummy shaders).
-fn retry_without_rect_gs(copy: &mut D3D12_GRAPHICS_PIPELINE_STATE_DESC, rect_gs: bool, mut create: impl FnMut(&D3D12_GRAPHICS_PIPELINE_STATE_DESC) -> HRESULT) -> HRESULT {
+fn retry_without_rect_gs(copy: &mut D3D12_GRAPHICS_PIPELINE_STATE_DESC, rect_gs: bool, mut create: impl FnMut(&mut D3D12_GRAPHICS_PIPELINE_STATE_DESC) -> HRESULT) -> HRESULT {
     let hr = create(copy);
     if hr >= 0 || !rect_gs {
         return hr;
@@ -4383,6 +4488,64 @@ fn pc_topology_type(g: &mut D3D12_GRAPHICS_PIPELINE_STATE_DESC) {
     }
     if !(1..=4).contains(&g.PrimitiveTopologyType.0) {
         g.PrimitiveTopologyType = if g.HS.pShaderBytecode.is_null() { D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE } else { D3D12_PRIMITIVE_TOPOLOGY_TYPE_PATCH };
+    }
+}
+
+fn dxgi(format: u32) -> windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT {
+    windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(format as i32)
+}
+
+fn pc_pso_formats(g: &mut D3D12_GRAPHICS_PIPELINE_STATE_DESC) {
+    // A typeless format, or an Xbox-only one, in a pipeline is an invalid call. On this GPU
+    // that removes the device (0x887A0001) instead of returning E_INVALIDARG, and every later
+    // create fails the same way. Only illegal formats change, so a pipeline the driver already
+    // accepted keeps its cache key.
+    g.DSVFormat = dxgi(typed_dsv(super::device_x::pc_dsv_format(g.DSVFormat.0 as u32)));
+    let n = (g.NumRenderTargets as usize).min(g.RTVFormats.len());
+    for f in &mut g.RTVFormats[..n] {
+        *f = dxgi(typed_rtv(super::device_x::pc_color_format(f.0 as u32)));
+    }
+    if g.SampleDesc.Count == 0 {
+        g.SampleDesc.Count = 1;
+        g.SampleDesc.Quality = 0;
+    }
+}
+
+/// A render-target format the PC accepts. Typeless and the Xbox depth family are not.
+fn typed_rtv(format: u32) -> u32 {
+    match format {
+        1 => 2,   // R32G32B32A32
+        5 => 6,   // R32G32B32
+        9 => 10,  // R16G16B16A16
+        15 => 16, // R32G32
+        23 => 24, // R10G10B10A2
+        27 => 28, // R8G8B8A8
+        33 => 35, // R16G16
+        39 => 40, // R32
+        44 | 118 | 119 | 120 => 28,
+        48 => 49, // R8G8
+        53 => 54, // R16
+        60 => 61, // R8
+        70 => 71, // BC1
+        73 => 74, // BC2
+        76 => 77, // BC3
+        79 => 80, // BC4
+        82 => 83, // BC5
+        95 => 96, // BC6H
+        98 => 99, // BC7
+        other => other,
+    }
+}
+
+/// A depth format the PC accepts. Anything else is no depth view, which the driver allows.
+fn typed_dsv(format: u32) -> u32 {
+    match format {
+        0 => 0,
+        19 | 20 => 20,             // D32_FLOAT_S8X24
+        39 | 41 => 41,             // D32_FLOAT
+        44 | 45 | 118 | 119 => 45, // D24_UNORM_S8
+        53 | 55 => 55,             // D16_UNORM
+        other => other,
     }
 }
 
@@ -4517,6 +4680,7 @@ unsafe fn stream_pipeline(desc: *const c_void) -> StreamPipeline {
     if g.PrimitiveTopologyType.0 != RECT_LIST_TYPE {
         pc_topology_type(&mut g);
     }
+    pc_pso_formats(&mut g);
     StreamPipeline::Graphics(Box::new(g))
 }
 
