@@ -653,7 +653,8 @@ The EXE (+ EOSSDK) imports 31 functions from console libraries: MFPlat `MFResetD
   name @0x40), RetrieveErrorRecord 0x290, Query 0x1C. A worker thread per queue runs the submitted requests in order:
   file reads through the VFS (as the title's own CreateFileW), memory copies, zlib (miniz_oxide); a status entry gets
   the first failure since the previous one, a signal sets the D3D12 fence from the CPU; a half-full queue submits by
-  itself. BCPack (and other console formats) are refused; the unlisted interface slots are logged E_NOTIMPL. The test
+  itself. BCPack is unpacked where `hle/bcpack` rebuilds the mode's blocks: BC1 and BC5 (2026-11-23); BC3,
+  BC4, BC6H and BC7 are refused (see "BCPack blocks" below). The unlisted interface slots are logged E_NOTIMPL. The test
   title reads the start of its own exe through it and waits on the fence. Not yet: cancelling submitted requests,
   multi-stage (intermediate-size) decompression, destinations that are not plain memory.
 - **Texture layout library (`xg_xs.dll`, `hle/xg.rs`)** – Fortnite imports `XGCreateTextureComputer`. XCL's own GFX10
@@ -1923,6 +1924,31 @@ three `graphics PSO rejected (0x8007000e)` just before are the driver's E_OUTOFM
 - Test runner: draws share one queue per device. After a test brings up the D3D12.X backend (`real::init`) its hooks
   are on the adapter's device and the per-draw queues were not given back – the draw-heavy tests ended in
   E_OUTOFMEMORY at CreateCommandQueue with several test threads.
+
+## BCPack blocks: BC1 and BC5 (2026-11-23)
+
+- **What decodes:** `hle/bcpack` has the entropy stage for every mode and block rebuilds for BC1 and
+  BC5. A BC5 stream is two symbols per lane per 16-byte block: lane 0 the distance (BC3's
+  bit-interleaved form), lanes 2/3 the endpoint residues of the two BC4 channels, lanes 4–7 and
+  8–11 the 3-bit index pairs (64 possible pairs). Each channel is a plain BC4 block.
+- **Tables:** neither mode's stream carries its constants. BC5 needs the 64-entry index-pair table
+  and a 255-slot endpoint history; XCL takes the estimates of the clean-room decoder
+  leonida-asset-pipeline (MIT, `bc5_tables.rs`), which fits 214 slots; the 42 it does not fit
+  (and slots 1–2) end a stream with `Error::History` instead of a guess. Only 3 slots (182, 183,
+  222) are reported as confirmed. Its fits agree with SixNG's within a step on the shared slots.
+  So BC5 output is an approximation wherever one of those constants is off, as BC1's is.
+- **BC7 is not done:** its block layout is documented (lanes, mode/partition/rotation/index
+  selection from lane 15, endpoint and index states), but the rebuild needs two 256-slot history
+  tables and 10 of the 285 lane-15 signature ranks that no stream carries. The only sources with
+  fitted values are GPL-3.0 (SixNG, rage-texture), which a GPL-2.0-only crate cannot take; the
+  MIT decoder ships them empty. A BC7 decoder without them would refuse nearly every chunk, so
+  it is left out rather than guessed. Same for BC3, BC4 and BC6H (their fitted selector/history
+  tables have the same problem).
+- **Tests** (synthetic, no game files): `bc5_block_rebuild` (hand-built symbols for an in-stream
+  reference and a history slot), `bc5_blocks_round_trip_through_a_stream` (blocks → symbols →
+  fragment encoder → entropy decoder → blocks, 1–300 blocks), `bc5_fixture_decodes_to_blocks`,
+  `fitted_bc5_tables_are_well_formed` (pair table is a permutation, 214 slots fitted, unknown slot
+  ends the rebuild).
 
 ## Next steps (priority)
 Little is left to do without the exe – the rest needs an actual run of the game.

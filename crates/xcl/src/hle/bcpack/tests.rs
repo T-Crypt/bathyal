@@ -4,7 +4,7 @@
 
 use super::lanes::{self, L};
 use super::rans_tables::FREQ;
-use super::{bc1, decode_lanes, lane_widths, Error};
+use super::{bc1, bc5, decode_lanes, lane_widths, Error};
 
 /// The tables the fixtures' `.bc1` files were made with: history entry `slot` has the
 /// channels `(7 * slot + 13 * k) mod range`, and a quadrant symbol is its own selectors.
@@ -21,6 +21,19 @@ pub(crate) fn tables() -> &'static bc1::Tables {
 
 pub(crate) fn data(name: &str) -> Option<Vec<u8>> {
     std::fs::read(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/data/bcpack").join(name)).ok()
+}
+
+/// The BC5 tables the tests use: the index pairs in an order of their own, and a history whose
+/// slot `s` holds `(5s, 7s, 11s, 13s)` so a test can name the entry it expects.
+pub(crate) fn bc5_tables() -> &'static bc5::Tables {
+    static T: std::sync::OnceLock<bc5::Tables> = std::sync::OnceLock::new();
+    T.get_or_init(|| bc5::Tables {
+        pairs: std::array::from_fn(|s| ((s & 7) as u8, (s >> 3) as u8)),
+        preset: std::array::from_fn(|slot| {
+            let v = slot as u8;
+            Some([v.wrapping_mul(5), v.wrapping_mul(7), v.wrapping_mul(11), v.wrapping_mul(13)])
+        }),
+    })
 }
 
 /// `bc<mode>-<units>-<seed>` → (mode, units)
@@ -96,10 +109,11 @@ fn bc1_fixtures_decode_to_their_blocks() {
         assert_eq!(super::decode(1, &bin, units * 8).as_deref(), Ok(&blocks[..]), "{stem}");
     }
     // the modes without a block rebuild
-    for mode in [0u8, 2, 3, 4, 5, 6, 7, 8, 15] {
+    for mode in [0u8, 2, 3, 4, 6, 7, 8, 15] {
         assert!(!super::can_decode(mode));
         assert_eq!(super::decode(mode, &[], 16), Err(Error::Unsupported));
     }
+    assert!(super::can_decode(5));
 }
 
 /// One BC1 block by hand: every field of the rebuild, without the entropy stage.
@@ -370,4 +384,223 @@ fn fitted_bc1_tables_are_well_formed() {
         s[0] = if d < 128 { 2 * d } else { 2 * (255 - d) + 1 } as u8;
         assert_eq!(bc1::assemble(&s, t), Err(Error::History { block: 0, slot }));
     }
+}
+
+// ---------------------------------------------------------------------------------------
+// BC5
+// ---------------------------------------------------------------------------------------
+
+/// A stream of one flush per lane, carrying `symbols` (unit-major) through the fragment
+/// encoder of this file. The lanes' bytes are put in the order the decoder asks for them.
+fn stream_from_symbols(widths: &[u8], symbols: &[u8]) -> Vec<u8> {
+    let n = widths.len();
+    let units = symbols.len() / n;
+    let mut queues: Vec<std::collections::VecDeque<u8>> = Vec::new();
+    for (l, &w) in widths.iter().enumerate() {
+        let lane: Vec<u8> = (0..units).map(|u| symbols[u * n + l]).collect();
+        queues.push(fragment(&lane, w as usize, 0, 0, true).into());
+    }
+    let mut stream = Vec::new();
+    lanes::run(widths, units, |lane| {
+        let b = queues[lane].pop_front();
+        stream.extend(b);
+        b
+    })
+    .expect("the encoder's own fragments decode");
+    assert!(queues.iter().all(|q| q.is_empty()), "every fragment was read to its end");
+    stream
+}
+
+/// Lane 0's (E, O) symbols for the distance `d`: the inverse of [`bc5::distance`].
+fn bc5_distance_symbols(d: usize) -> (u8, u8) {
+    let (x, low) = if d <= 127 { (d, 0u8) } else { (255 - d, 1u8) };
+    let mut e = low;
+    let mut o = 0u8;
+    for k in 0..4 {
+        o |= (((x >> (2 * k)) & 1) as u8) << k;
+    }
+    for k in 0..3 {
+        e |= (((x >> (2 * k + 1)) & 1) as u8) << (k + 1);
+    }
+    (e, o)
+}
+
+/// The residue symbol for `want` from its prediction `base`, modulo 256.
+fn bc5_residue(want: u8, base: u8) -> u8 {
+    let delta = (want as i32 - base as i32).rem_euclid(256);
+    let delta = if delta > 127 { delta - 256 } else { delta };
+    if delta >= 0 {
+        (2 * delta) as u8
+    } else {
+        (-2 * delta - 1) as u8
+    }
+}
+
+/// One BC5 block by hand: both channels, a reference inside the stream and one before it.
+#[test]
+fn bc5_block_rebuild() {
+    let t = bc5_tables();
+    let mut s = vec![[0u8; 24]; 3];
+    // block 0: no reference, so both channels predict 128; channel 0's endpoints grow by 1
+    // and 2, channel 1's by 0 and 3; every index pair is symbol 0, which the test table maps
+    // to (0, 0)
+    s[0][2] = 2;
+    s[0][3] = 4;
+    s[0][5] = 6;
+    // block 1: one block back, the same endpoints; lane 4's E symbol 58 names (2, 7)
+    let (e1, o1) = bc5_distance_symbols(1);
+    assert_eq!((e1, o1), (0, 1));
+    s[1][0] = e1;
+    s[1][12] = o1;
+    s[1][4] = 58;
+    // block 2: 255 back, before the stream: history slot 256 + 2 - 255 = 3
+    let (e2, o2) = bc5_distance_symbols(255);
+    assert_eq!((e2, o2), (1, 0));
+    s[2][0] = e2;
+    s[2][12] = o2;
+    let out = bc5::assemble(&s.concat(), t).unwrap();
+    assert_eq!(out.len(), 48);
+    assert_eq!(out[..8], [129, 130, 0, 0, 0, 0, 0, 0]);
+    assert_eq!(out[8..16], [128, 131, 0, 0, 0, 0, 0, 0]);
+    assert_eq!(out[16..24], [129, 130, 58, 0, 0, 0, 0, 0]);
+    assert_eq!(out[24..32], [128, 131, 0, 0, 0, 0, 0, 0]);
+    let h = t.preset[3].unwrap();
+    assert_eq!(out[32..34], h[..2]);
+    assert_eq!(out[40..42], h[2..]);
+    assert_eq!(out[34..40], [0; 6]);
+    assert_eq!(out[42..48], [0; 6]);
+
+    // the distance mapping of the format notes, and its inverse over every value
+    assert_eq!(bc5::distance(0, 0), 0);
+    assert_eq!(bc5::distance(0, 1), 1);
+    assert_eq!(bc5::distance(2, 0), 2);
+    assert_eq!(bc5::distance(1, 0), 255);
+    for d in 0..256 {
+        let (e, o) = bc5_distance_symbols(d);
+        assert_eq!(bc5::distance(e, o), d);
+    }
+
+    // an unknown history entry stops the stream instead of guessing
+    let mut holes = bc5::Tables { pairs: t.pairs, preset: t.preset };
+    holes.preset[3] = None;
+    assert_eq!(bc5::assemble(&s.concat(), &holes), Err(Error::History { block: 2, slot: 3 }));
+}
+
+/// Blocks built here, coded into lane symbols, encoded into a stream, decoded and compared.
+#[test]
+fn bc5_blocks_round_trip_through_a_stream() {
+    let t = bc5_tables();
+    let widths = lane_widths(5).unwrap();
+    let inverse: Vec<Option<u8>> = {
+        let mut inv = vec![None; 64];
+        for (sym, &(a, b)) in t.pairs.iter().enumerate() {
+            inv[(a * 8 + b) as usize] = Some(sym as u8);
+        }
+        inv
+    };
+    let mut rng = Rng(0xB0C5);
+    for &blocks in &[1usize, 2, 9, 64, 300] {
+        let mut want = vec![[0u8; 16]; blocks];
+        let mut idx = vec![[0u64; 2]; blocks];
+        for i in 0..blocks {
+            want[i][0] = rng.next() as u8;
+            want[i][1] = rng.next() as u8;
+            want[i][8] = rng.next() as u8;
+            want[i][9] = rng.next() as u8;
+            for ch in 0..2 {
+                let mut w = 0u64;
+                for p in 0..16 {
+                    w |= (rng.below(8) as u64) << (3 * p);
+                }
+                idx[i][ch] = w;
+                want[i][8 * ch + 2..8 * ch + 8].copy_from_slice(&w.to_le_bytes()[..6]);
+            }
+        }
+        let mut symbols = vec![0u8; blocks * 24];
+        for i in 0..blocks {
+            // early blocks read the history, the others a block behind them
+            let d = if i == 0 {
+                0
+            } else if i % 11 == 0 && i < 250 {
+                251 + i % 4
+            } else {
+                1 + (i % 7).min(i - 1)
+            };
+            let base = if d == 0 {
+                [128u8; 4]
+            } else if d <= i {
+                let p = &want[i - d];
+                [p[0], p[1], p[8], p[9]]
+            } else {
+                t.preset[256 + i - d].expect("the test tables fit every slot")
+            };
+            let (e, o) = bc5_distance_symbols(d);
+            symbols[i * 24] = e;
+            symbols[i * 24 + 12] = o;
+            for ch in 0..2 {
+                symbols[i * 24 + 2 + ch] = bc5_residue(want[i][8 * ch], base[2 * ch]);
+                symbols[i * 24 + 12 + 2 + ch] = bc5_residue(want[i][8 * ch + 1], base[2 * ch + 1]);
+                let w = idx[i][ch];
+                let px = |p: usize| ((w >> (3 * p)) & 7) as usize;
+                for r in 0..4 {
+                    symbols[i * 24 + 4 + 4 * ch + r] = inverse[px(4 * r) * 8 + px(4 * r + 1)].unwrap();
+                    symbols[i * 24 + 12 + 4 + 4 * ch + r] = inverse[px(4 * r + 2) * 8 + px(4 * r + 3)].unwrap();
+                }
+            }
+        }
+        assert_eq!(bc5::assemble(&symbols, t).unwrap(), want.concat(), "{blocks} blocks");
+        let stream = stream_from_symbols(widths, &symbols);
+        assert_eq!(super::decode(5, &stream, blocks * 16).as_deref(), Ok(&want.concat()[..]), "{blocks} blocks");
+        // every byte of the stream is needed, and the size must be a whole number of blocks
+        assert!(super::decode(5, &stream[..stream.len() - 1], blocks * 16).is_err(), "{blocks} blocks");
+        assert_eq!(super::decode(5, &stream, blocks * 16 + 1), Err(Error::OutputSize));
+    }
+}
+
+/// The BC5 fixture of `tests/data/bcpack` (an independent encoder) goes through the entropy
+/// stage and the rebuild. Its lane 1 holds noise, which the rebuild ignores.
+#[test]
+fn bc5_fixture_decodes_to_blocks() {
+    let bin = data("bc5-16-1.bin").unwrap();
+    let blocks = super::decode(5, &bin, 8 * 16).expect("the fixture decodes");
+    assert_eq!(blocks.len(), 8 * 16);
+}
+
+/// The BC5 tables XCL ships (`bc5_tables.rs`) are whole and in the layout [`bc5::assemble`]
+/// reads.
+#[test]
+fn fitted_bc5_tables_are_well_formed() {
+    let t = &super::bc5_tables::TABLES;
+    let mut seen = [false; 64];
+    for &(a, b) in &t.pairs {
+        assert!(a < 8 && b < 8);
+        assert!(!std::mem::replace(&mut seen[(a * 8 + b) as usize], true), "pair ({a}, {b}) twice");
+    }
+    // slot 0 is never read; 214 of the 255 readable slots were fitted, the three the source
+    // reports as confirmed among them
+    assert!(t.preset[0].is_none());
+    assert_eq!(t.preset.iter().flatten().count(), 214);
+    for slot in [182, 183, 222] {
+        assert!(t.preset[slot].is_some());
+    }
+
+    // a first block that takes the endpoints of the block 253 before the stream (slot 3) as
+    // they are
+    let mut s = [0u8; 24];
+    let (e, o) = bc5_distance_symbols(253);
+    s[0] = e;
+    s[12] = o;
+    let b = bc5::assemble(&s, t).unwrap();
+    let h = t.preset[3].unwrap();
+    assert_eq!(b[..2], h[..2]);
+    assert_eq!(b[8..10], h[2..]);
+    assert_eq!(b[2..8], [0; 6]);
+    assert_eq!(b[10..16], [0; 6]);
+
+    // an entry the fit does not have ends the rebuild
+    let mut unknown = [0u8; 24];
+    let (e, o) = bc5_distance_symbols(254); // slot 2
+    unknown[0] = e;
+    unknown[12] = o;
+    assert_eq!(bc5::assemble(&unknown, t), Err(Error::History { block: 0, slot: 2 }));
 }
