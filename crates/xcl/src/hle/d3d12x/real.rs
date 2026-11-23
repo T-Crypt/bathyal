@@ -4395,7 +4395,7 @@ unsafe fn payload_shader<'a>(p: &[u8]) -> Option<&'a [u8]> {
 /// 24 (the PC's AS slot) and have no 25. A PC shader in either slot is not one of these.
 fn console_mesh_programs<'a>(subs: &'a [(u32, &'a [u8])]) -> (Option<&'a [u8]>, Option<&'a [u8]>) {
     use crate::gpu::recomp::pso::is_console;
-    let slot = |ty: D3D12_PIPELINE_STATE_SUBOBJECT_TYPE| subs.iter().find(|s| s.0 == ty.0 as u32).and_then(|s| payload_shader(s.1));
+    let slot = |ty: D3D12_PIPELINE_STATE_SUBOBJECT_TYPE| subs.iter().find(|s| s.0 == ty.0 as u32).and_then(|s| unsafe { payload_shader(s.1) });
     let kind = |code: &[u8]| if is_console(code) { crate::gpu::xbox::parse(code).map(|s| s.stage) } else { None };
     // the PC's slot first, so a PC stream keeps its meaning, then the console's
     let pick = |order: [D3D12_PIPELINE_STATE_SUBOBJECT_TYPE; 2], want: &str| order.iter().filter_map(|&t| slot(t)).find(|c| kind(c).as_deref() == Some(want));
