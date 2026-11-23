@@ -662,21 +662,12 @@ impl State {
                 counts.push(run);
                 i += run as usize;
             }
-            // a tile of a pool heap that has been retired is not mapped: the call would hand
-            // the driver no heap at all (it reads the heap at once), or a freed one
-            let Some(heap) = self.pools.get(h as usize).and_then(Option::as_ref) else {
-                static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-                if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
-                    crate::xlog_warn!("sparse windows: tiles of pool heap {h} that is gone not mapped");
-                }
-                continue;
-            };
             self.queue.UpdateTileMappings(
                 res,
                 coords.len() as u32,
                 Some(coords.as_ptr()),
                 Some(regions.as_ptr()),
-                heap,
+                self.pools[h as usize].as_ref().expect("a pool tile of a live pool"),
                 flags.len() as u32,
                 Some(flags.as_ptr()),
                 Some(offsets.as_ptr()),
