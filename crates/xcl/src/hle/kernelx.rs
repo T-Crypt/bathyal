@@ -154,6 +154,56 @@ pub fn in_graphics_reservation(p: usize) -> bool {
     GRAPHICS_RESERVATIONS.lock().unwrap().range(..=p).next_back().is_some_and(|(&b, &s)| p < b + s)
 }
 
+/// The title's plain reservations (`VirtualAlloc`, no commit) and the GPU views of them: on the
+/// console a reservation the title made accessible, followed by one of the same size it made
+/// inaccessible, is one memory – the second is the GPU's view of the first. A retail title's
+/// video planes work that way: its Bink decoder writes the first reservation and its YUV -> RGB
+/// pixel shader samples textures placed in the second, which under XCL held nothing (all four
+/// planes read as zeros: a flat green picture).
+#[derive(Default)]
+struct Reservations {
+    /// (base, size, CPU-readable), in the order the title made them
+    list: Vec<(usize, usize, bool)>,
+    /// GPU view base -> (the memory behind it, its size)
+    mirrors: std::collections::BTreeMap<usize, (usize, usize)>,
+}
+
+impl Reservations {
+    /// A reservation the title made. An inaccessible one of the size of the last accessible one
+    /// is a view of it.
+    fn added(&mut self, base: usize, size: usize, readable: bool) {
+        if !readable {
+            if let Some(src) = self.list.iter().rev().find(|&&(_, s, r)| r && s == size).map(|&(b, _, _)| b) {
+                self.mirrors.insert(base, (src, size));
+                crate::xlog_info!("mem: the reservation at {base:#x} ({size:#x} bytes, no CPU access) is the GPU view of {src:#x}");
+            }
+        }
+        self.list.push((base, size, readable));
+    }
+
+    /// The reservation at `base` went.
+    fn released(&mut self, base: usize) {
+        self.list.retain(|&(b, _, _)| b != base);
+        self.mirrors.remove(&base);
+        // a view whose memory went names nothing
+        self.mirrors.retain(|_, &mut (src, _)| src != base);
+    }
+
+    /// The address whose bytes are those at `va`, when `va` is in a GPU view.
+    fn source(&self, va: usize) -> Option<usize> {
+        let (&base, &(src, size)) = self.mirrors.range(..=va).next_back()?;
+        (va - base < size).then(|| src + (va - base))
+    }
+}
+
+static RESERVATIONS: std::sync::Mutex<Reservations> = std::sync::Mutex::new(Reservations { list: Vec::new(), mirrors: std::collections::BTreeMap::new() });
+
+/// The address whose bytes are at `va` where the title placed a GPU-only view of its own memory
+/// (`d3d12x::title_textures` reads a texture's bytes there); None: `va` is its own memory.
+pub fn mirror_source(va: usize) -> Option<usize> {
+    RESERVATIONS.lock().unwrap().source(va)
+}
+
 const MEM_WRITE_WATCH: u32 = 0x20_0000;
 
 /// Graphics memory (MEM_GRAPHICS, committed, no fixed address) comes from the unified
@@ -250,6 +300,7 @@ pub unsafe extern "system" fn VirtualAlloc(addr: *const c_void, size: usize, t: 
         if !q.is_null() {
             GRAPHICS_RESERVATIONS.lock().unwrap().insert(q as usize, size);
             GRAPHICS_RESERVATIONS_GEN.fetch_add(1, Ordering::Release);
+            RESERVATIONS.lock().unwrap().added(q as usize, size, readable(p));
             return q;
         }
     }
@@ -285,6 +336,7 @@ pub unsafe extern "system" fn VirtualAlloc(addr: *const c_void, size: usize, t: 
         if !q.is_null() {
             GRAPHICS_RESERVATIONS.lock().unwrap().insert(q as usize, size);
             GRAPHICS_RESERVATIONS_GEN.fetch_add(1, Ordering::Release);
+            RESERVATIONS.lock().unwrap().added(q as usize, size, readable(p));
             trace_mem("VirtualAlloc (GPU-visible, write-watched)", addr as usize, size, t as u64, p, q as usize);
             return q;
         }
@@ -301,6 +353,12 @@ pub unsafe extern "system" fn VirtualAlloc(addr: *const c_void, size: usize, t: 
 /// PAGE_GRAPHICS_NOACCESS … PAGE_GRAPHICS_NOCACHE (0x800 – 0x40000): the console's protection of
 /// GPU-visible memory
 const PAGE_GRAPHICS_ANY: u32 = 0x7_F800;
+
+/// Whether the CPU reads memory under protection `p`: a reservation the title made with a no-access
+/// protection (`0x801`, a graphics reservation) belongs to the GPU alone.
+fn readable(p: u32) -> bool {
+    sanitize_protect(p) & 0xFF != mem::PAGE_NOACCESS
+}
 
 /// `XCL_TRACE_MEM=1`: the title's allocations of 64 KiB or more (the first 60; `XCL_TRACE_MEM=n`:
 /// the first n when n > 1)
@@ -386,6 +444,7 @@ pub unsafe extern "system" fn VirtualFree(addr: *mut c_void, size: usize, t: u32
     let ok = mem::VirtualFree(addr, size, t);
     if ok != 0 && t & 0x8000 != 0 && GRAPHICS_RESERVATIONS.lock().unwrap().remove(&(addr as usize)).is_some() {
         GRAPHICS_RESERVATIONS_GEN.fetch_add(1, Ordering::Release);
+        RESERVATIONS.lock().unwrap().released(addr as usize);
     }
     ok
 }
@@ -1745,6 +1804,44 @@ mod tests {
         })
         .join()
         .unwrap();
+    }
+
+    /// The title's GPU view of its own memory: an inaccessible reservation of the size of the
+    /// last accessible one reads the bytes there (a retail title's video planes: the CPU decoder
+    /// writes the first, the shader samples the second). Other sizes, other orders and released
+    /// reservations name nothing.
+    #[test]
+    fn gpu_view_reservations_name_their_cpu_view() {
+        let mut r = Reservations::default();
+        let (cpu, size) = (0x2_0000_0000usize, 0x6000_0000usize);
+        r.added(cpu, size, true);
+        assert_eq!(r.source(cpu), None, "a CPU-readable reservation is its own memory");
+        let view = cpu + 0x6_0000_0000;
+        r.added(view, size, false);
+        assert_eq!(r.source(view), Some(cpu));
+        assert_eq!(r.source(view + 0x1234_5000), Some(cpu + 0x1234_5000), "the same offset");
+        assert_eq!(r.source(view + size), None, "past the end of the view");
+        assert_eq!(r.source(view - 0x1000), None, "below it");
+        // a reservation of another size is no view of it
+        let other = view + 0x1_0000_0000;
+        r.added(other, size - 0x1_0000, false);
+        assert_eq!(r.source(other), None);
+        // an accessible one of the same size is no view either
+        let more = other + 0x1_0000_0000;
+        r.added(more, size, true);
+        assert_eq!(r.source(more), None);
+        // the newest accessible reservation of the same size is the one behind a view
+        let last = more + 0x1_0000_0000;
+        r.added(last, size, false);
+        assert_eq!(r.source(last + 0x10), Some(more + 0x10));
+        // the view released: nothing; the memory behind it released: the view names nothing
+        r.released(last);
+        assert_eq!(r.source(last + 0x10), None);
+        r.released(more);
+        assert_eq!(r.source(more + 0x10), None);
+        assert_eq!(r.source(view + 0x10), Some(cpu + 0x10), "another view keeps its own");
+        r.released(cpu);
+        assert_eq!(r.source(view + 0x10), None);
     }
 
     /// Tracing keeps the last error of the call it traces: a lookup of an unset environment
