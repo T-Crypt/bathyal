@@ -2164,31 +2164,17 @@ fn gpu_graphics_vs_ps_draw() {
     }
 }
 
-/// `emit::rect_list_gs` refuses integer (flat) outputs and declares the VS's output struct.
+/// `emit::rect_list_gs` declares the VS's output struct; the fourth vertex is v[0] with its
+/// float outputs continued from the other three, its integer (flat) ones left as v[0]'s.
 #[test]
 fn rect_list_gs_outputs() {
-    let float = [el("SV_Position", 0, 1, 3, 0, 0xF), el("TEXCOORD", 0, 0, 3, 1, 0xF), el("SV_ClipDistance", 0, 2, 3, 2, 1)];
-    let h = super::emit::rect_list_gs(&float).unwrap();
-    assert!(h.contains("triangle XclOut v[3]") && h.contains("d.p0 = a.p0 + b.p0 - k.p0;") && h.contains("d.p1 = a.p1 + b.p1 - k.p1;"), "{h}");
-    let flat = [el("SV_Position", 0, 1, 3, 0, 0xF), el("TEXCOORD", 0, 0, 1, 1, 0xF)];
-    assert!(super::emit::rect_list_gs(&flat).unwrap_err().contains("TEXCOORD0"));
+    let outputs = [el("SV_Position", 0, 1, 3, 0, 0xF), el("TEXCOORD", 0, 0, 3, 1, 0xF), el("TEXCOORD", 1, 0, 1, 2, 0xF), el("SV_ClipDistance", 0, 2, 3, 3, 1)];
+    let h = super::emit::rect_list_gs(&outputs);
+    assert!(h.contains("triangle XclOut v[3]") && h.contains("XclOut d = v[0];"), "{h}");
+    assert!(h.contains("d.p0 = a.p0 + b.p0 - k.p0;") && h.contains("d.p2 = a.p2 + b.p2 - k.p2;") && !h.contains("d.p1 ="), "{h}");
     if super::dxc::location().is_ok() {
         super::dxc::compile(&h, "main", "gs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{h}"));
     }
-}
-
-/// A PS with `v_interp_mov_f32` reads flat (`pso::reads_flat`): its rect list keeps no GS.
-#[test]
-fn rect_list_ps_reads_flat() {
-    let mov = prog(&[
-        ("V_INTERP_MOV_F32", "ENC_VINTRP", &[("VDST", 4), ("VSRC", 2), ("ATTR", 0), ("ATTRCHAN", 0)], None),
-    ]);
-    let p2 = prog(&[
-        ("V_INTERP_P1_F32", "ENC_VINTRP", &[("VDST", 4), ("VSRC", 0), ("ATTR", 0), ("ATTRCHAN", 0)], None),
-        ("V_INTERP_P2_F32", "ENC_VINTRP", &[("VDST", 4), ("VSRC", 1), ("ATTR", 0), ("ATTRCHAN", 0)], None),
-    ]);
-    assert!(super::pso::reads_flat(&mov).unwrap());
-    assert!(!super::pso::reads_flat(&p2).unwrap());
 }
 
 /// `emit::rect_list_gs` on the full-screen pass a downstream build (theaustinayers/xcl, build 5,
@@ -2210,7 +2196,7 @@ fn gpu_rect_list_fullscreen_order() {
     let ps_hlsl = "float4 main(float4 pos : SV_Position, float4 uv : TEXCOORD0) : SV_Target { return uv; }\n";
     let vs = super::dxc::compile(vs_hlsl, "main", "vs_6_6", &[]).unwrap();
     let ps = super::dxc::compile(ps_hlsl, "main", "ps_6_6", &[]).unwrap();
-    let gs_hlsl = super::emit::rect_list_gs(&outputs).unwrap();
+    let gs_hlsl = super::emit::rect_list_gs(&outputs);
     let gs = super::dxc::compile(&gs_hlsl, "main", "gs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{gs_hlsl}"));
     let layout = [
         runner::VertexElement { semantic: "POSITION", index: 0, format: DXGI_FORMAT_R32G32B32A32_FLOAT, offset: 0 },
@@ -2233,6 +2219,66 @@ fn gpu_rect_list_fullscreen_order() {
         // the negative control: the three vertices alone draw half the rect
         let drawn = run(false).iter().filter(|p| **p != clear).count();
         assert!(drawn > n * n / 3 && drawn < n * n * 2 / 3, "{name}, w {w}: without the GS {drawn} of {} pixels drawn", n * n);
+    }
+}
+
+/// A console rect list with flat outputs – an integer one, and a float one the PS reads
+/// `nointerpolation` (what `v_interp_mov_f32` is translated to) – drawn indexed through
+/// `emit::rect_list_gs`, the corner at v0, v1 or v2: the whole rect is drawn, the smooth output
+/// continues into the implied corner's half, and both flat ones are the rect's first vertex's
+/// in both halves. On the console that is the provoking vertex under D3D's setting
+/// (PA_SU_SC_MODE_CNTL.PROVOKING_VTX_LAST = 0, see `emit::rect_list_gs`). Synthetic: not a
+/// measurement of the hardware. Without the GS part of every rect stays clear.
+#[test]
+fn gpu_rect_list_flat_outputs() {
+    if !gpu_ready() {
+        return;
+    }
+    use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R32G32B32A32_FLOAT, DXGI_FORMAT_R32_UINT};
+    let outputs = [el("SV_Position", 0, 1, 3, 0, 0xF), el("TEXCOORD", 0, 0, 3, 1, 0xF), el("TEXCOORD", 1, 0, 1, 2, 0xF), el("TEXCOORD", 2, 0, 3, 3, 0xF)];
+    let vs_hlsl = "struct V { float4 pos : SV_Position; float4 uv : TEXCOORD0; uint4 id : TEXCOORD1; float4 tint : TEXCOORD2; };\nV main(float4 pos : POSITION, uint id : ID) { V o; o.pos = pos; o.uv = float4(pos.xy, 0.0, 1.0); o.id = uint4(id, 0u, 0u, 0u); o.tint = float4(id * 0.125, 0.0, 0.0, 0.0); return o; }\n";
+    let ps_hlsl = "float4 main(float4 pos : SV_Position, float4 uv : TEXCOORD0, nointerpolation uint4 id : TEXCOORD1, nointerpolation float4 tint : TEXCOORD2) : SV_Target { return float4(uv.xy, id.x, tint.x); }\n";
+    let vs = super::dxc::compile(vs_hlsl, "main", "vs_6_6", &[]).unwrap();
+    let ps = super::dxc::compile(ps_hlsl, "main", "ps_6_6", &[]).unwrap();
+    let gs_hlsl = super::emit::rect_list_gs(&outputs);
+    let gs = super::dxc::compile(&gs_hlsl, "main", "gs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{gs_hlsl}"));
+    let layout = [
+        runner::VertexElement { semantic: "POSITION", index: 0, format: DXGI_FORMAT_R32G32B32A32_FLOAT, offset: 0 },
+        runner::VertexElement { semantic: "ID", index: 0, format: DXGI_FORMAT_R32_UINT, offset: 16 },
+    ];
+    // a 3 × 2 grid: columns x = -0.75, 0, 0.75, rows y = -0.5, 0.5; vertex 2·column + row has id = its number + 1
+    let grid: Vec<f32> = (0..6u32).flat_map(|v| [[-0.75f32, 0.0, 0.75][v as usize / 2], [-0.5f32, 0.5][v as usize % 2], 0.0, 1.0, f32::from_bits(v + 1)]).collect();
+    let (left, right) = ([-0.75f32, 0.0, -0.5, 0.5], [0.0f32, 0.75, -0.5, 0.5]);
+    let (n, clear) = (16usize, [0.0f32, 0.0, 1.0, 0.5]);
+    // (indices, the rects (x1, x2, y1, y2) and their first vertex's id)
+    for (name, indices, rects) in [
+        ("corner v0", vec![0u32, 1, 2], vec![(left, 1.0f32)]),
+        ("corner v1", vec![0, 1, 3], vec![(left, 1.0)]),
+        ("corner v1, the other way round", vec![1, 0, 2], vec![(left, 2.0)]),
+        ("corner v2", vec![1, 2, 0], vec![(left, 2.0)]),
+        ("two rects sharing vertices", vec![0, 1, 2, 5, 3, 2], vec![(left, 1.0), (right, 6.0)]),
+    ] {
+        let run = |with_gs: bool| runner::draw_gs_indexed(&vs, with_gs.then_some(gs.as_slice()), &ps, &layout, &grid, 20, &indices, n as u32, clear).unwrap();
+        let wrong = |px: &[[f32; 4]], report: bool| {
+            let mut wrong = 0;
+            for y in 0..n {
+                for x in 0..n {
+                    let (fx, fy) = ((x as f32 + 0.5) / 8.0 - 1.0, 1.0 - (y as f32 + 0.5) / 8.0);
+                    let rect = rects.iter().find(|&&([x1, x2, y1, y2], _)| fx > x1 && fx < x2 && fy > y1 && fy < y2);
+                    let want = rect.map_or(clear, |&(_, id)| [fx, fy, id, id * 0.125]);
+                    let got = px[y * n + x];
+                    if !got.iter().zip(want).all(|(a, b)| (a - b).abs() < 1e-5) {
+                        assert!(!report, "{name}: pixel ({x},{y}) = {got:?}, expected {want:?}");
+                        wrong += 1;
+                    }
+                }
+            }
+            wrong
+        };
+        wrong(&run(true), true);
+        // the negative control: as a triangle list part of every rect is not drawn
+        let missing = wrong(&run(false), false);
+        assert!(missing >= 12 * rects.len(), "{name}: without the GS {missing} pixels differ");
     }
 }
 
@@ -2283,7 +2329,7 @@ fn gpu_rect_list_corners() {
     assert!(vt.complete() && pt.complete(), "{:?} {:?}", vt.unsupported, pt.unsupported);
     let vs = super::dxc::compile(&vt.hlsl, "main", "vs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", vt.hlsl));
     let ps = super::dxc::compile(&pt.hlsl, "main", "ps_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", pt.hlsl));
-    let gs_hlsl = super::emit::rect_list_gs(&outputs).unwrap();
+    let gs_hlsl = super::emit::rect_list_gs(&outputs);
     let gs = super::dxc::compile(&gs_hlsl, "main", "gs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{gs_hlsl}"));
     let layout = [
         runner::VertexElement { semantic: "POSITION", index: 0, format: DXGI_FORMAT_R32G32B32A32_FLOAT, offset: 0 },
