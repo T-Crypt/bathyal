@@ -1071,20 +1071,6 @@ fn committed_range(a: usize, len: usize) -> bool {
     true
 }
 
-/// Whether all of `[a, a + len)` is committed: one VirtualQuery per run of pages in one state
-/// (page by page each asked walked the rest of the run).
-fn committed_range(a: usize, len: usize) -> bool {
-    let mut p = a;
-    while p < a + len {
-        let mut m: mem::MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
-        if unsafe { mem::VirtualQuery(p as *const c_void, &mut m, std::mem::size_of_val(&m)) } == 0 || m.State != mem::MEM_COMMIT {
-            return false;
-        }
-        p = m.BaseAddress as usize + m.RegionSize;
-    }
-    true
-}
-
 fn committed_page(a: usize) -> bool {
     // A page in the working set is committed: asking for that is one entry, where VirtualQuery
     // walks the page table to the end of the committed range the page is in (gigabytes of
