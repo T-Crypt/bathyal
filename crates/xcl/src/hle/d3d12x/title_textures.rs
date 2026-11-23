@@ -372,10 +372,11 @@ fn watch_parts(ranges: &[(usize, usize)]) -> Vec<Vec<(usize, usize)>> {
     parts
 }
 
-/// `XCL_WATCH_THREADS` (default 8, 1 = the serial loop): threads that read the write-watch.
+/// `XCL_WATCH_THREADS` (default 1 = the serial loop; the kernel serialises the walks, so more threads
+/// measured no faster): threads that read the write-watch.
 fn watch_threads() -> usize {
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *N.get_or_init(|| std::env::var("XCL_WATCH_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(8).clamp(1, 32))
+    *N.get_or_init(|| std::env::var("XCL_WATCH_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(1).clamp(1, 32))
 }
 
 /// GetWriteWatch with reset over `ranges`: every written page's address goes to `dirty`.
@@ -431,6 +432,21 @@ fn watch_pool() -> &'static WatchPool {
     })
 }
 
+/// Whether this submit reads the write-watch. GetWriteWatch walks every watched page (gigabytes
+/// of mapped sparse tiles on a newer retail title: about 15 ms a call) and a title submits several
+/// times a frame, so by default it is read once a frame: at the first submit after a present.
+/// A page written between two submits of one frame then reaches video memory at the next frame's
+/// first submit. `XCL_WATCH_EVERY_SUBMIT=1` reads it before every submit, as before.
+fn scan_this_submit() -> bool {
+    static EVERY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *EVERY.get_or_init(|| std::env::var("XCL_WATCH_EVERY_SUBMIT").is_ok_and(|v| v != "0")) {
+        return true;
+    }
+    static LAST: AtomicU64 = AtomicU64::new(u64::MAX);
+    let now = super::present::presents();
+    LAST.swap(now, Ordering::Relaxed) != now
+}
+
 unsafe fn refresh_once(queue: *mut c_void) {
     let Some(u) = crate::gpu::uma::get() else { return };
     let sparse = u.has_sparse();
@@ -440,9 +456,13 @@ unsafe fn refresh_once(queue: *mut c_void) {
     let watch_t0 = std::time::Instant::now();
     let mut page = 0x1000u32;
     let ranges = cached_watch_ranges(u);
+    let scan = scan_this_submit();
     let dirty_len = DIRTY_BUF.with(|dcell| {
         let mut dirty = dcell.borrow_mut();
         dirty.clear();
+        if !scan {
+            return 0;
+        }
         let parts = watch_parts(&ranges);
         if parts.len() <= 1 {
             WATCH_BUF.with(|wcell| watch_into(&ranges, &mut wcell.borrow_mut(), &mut dirty, &mut page));
