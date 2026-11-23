@@ -309,6 +309,25 @@ unsafe fn code_bytes_at(rip: usize, most: usize) -> usize {
     (in_page + 1..=most).rev().find(|&n| crate::gpu::shader::readable(rip, n)).unwrap_or(in_page)
 }
 
+/// Overwrites the `len` code bytes at `rip` with `head` followed by NOPs, and flushes the
+/// instruction cache; left as it is when the page cannot be made writable.
+unsafe fn patch_code(rip: usize, len: usize, head: &[u8]) {
+    use windows_sys::Win32::System::Diagnostics::Debug::FlushInstructionCache;
+    use windows_sys::Win32::System::Memory::{VirtualProtect, PAGE_EXECUTE_READWRITE};
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    if head.len() > len {
+        return;
+    }
+    let mut old = 0u32;
+    if VirtualProtect(rip as *const std::ffi::c_void, len, PAGE_EXECUTE_READWRITE, &mut old) != 0 {
+        let code = std::slice::from_raw_parts_mut(rip as *mut u8, len);
+        code.fill(0x90);
+        code[..head.len()].copy_from_slice(head);
+        VirtualProtect(rip as *const std::ffi::c_void, len, old, &mut old);
+        FlushInstructionCache(GetCurrentProcess(), rip as *const std::ffi::c_void, len);
+    }
+}
+
 /// A title's STATUS_ILLEGAL_INSTRUCTION: an instruction the console's Zen 2 has and this CPU
 /// lacks (`insn`) is emulated and stepped over (EXCEPTION_CONTINUE_EXECUTION); anything else is
 /// logged with its code bytes and goes on to the title's handlers.
@@ -347,8 +366,13 @@ unsafe fn emulate_console_only(ctx: &mut windows_sys::Win32::System::Diagnostics
                 unsafe { VirtualProtect(rip as *const std::ffi::c_void, len, old, &mut old) };
             }
         }
-        ConsoleOnly::Monitorx => {}
+        // MONITORX / MWAITX sit in the title's spin-waits: emulating them costs an exception per
+        // loop iteration, a core's worth of exception dispatch on a CPU without them (any Intel).
+        // Rewritten in place on first use, as CLWB is: MONITORX becomes NOPs (it only arms the
+        // monitor) and MWAITX becomes PAUSE (F3 90) and NOPs, the spin hint the loop waits with.
+        ConsoleOnly::Monitorx => patch_code(rip, len, &[]),
         ConsoleOnly::Mwaitx => {
+            patch_code(rip, len, &[0xF3, 0x90]);
             std::hint::spin_loop();
         }
         ConsoleOnly::Clzero => {
@@ -1032,6 +1056,47 @@ mod tests {
             }
         }
         modules::unregister_mapped(code);
+    }
+
+    /// MONITORX / MWAITX in a title image: on a CPU without them (any Intel) the first run
+    /// raises STATUS_ILLEGAL_INSTRUCTION, is emulated and rewritten in place (NOPs; PAUSE and a
+    /// NOP), so later runs raise nothing; on an AMD CPU they run natively and stay as they are.
+    #[test]
+    fn monitorx_and_mwaitx_are_rewritten_after_their_first_emulation() {
+        use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_EXECUTE_READWRITE};
+        // f(): xor eax, eax; xor ecx, ecx; xor edx, edx; monitorx; mwaitx; ret
+        let f_code: &[u8] = &[0x31, 0xC0, 0x31, 0xC9, 0x31, 0xD2, 0x0F, 0x01, 0xFA, 0x0F, 0x01, 0xFB, 0xC3];
+        unsafe {
+            let page = VirtualAlloc(std::ptr::null(), 4096, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE) as *mut u8;
+            assert!(!page.is_null());
+            std::ptr::write_bytes(page, 0xCC, 4096);
+            std::ptr::copy_nonoverlapping(f_code.as_ptr(), page, f_code.len());
+            modules::register_mapped(std::sync::Arc::new(modules::MappedModule {
+                name: "mwaitx_test.exe".into(),
+                path: "mwaitx_test.exe".into(),
+                base: page as usize,
+                size: 4096,
+                entry_rva: 0,
+                is_dll: false,
+                exports: Default::default(),
+                tls_callbacks: Default::default(),
+                no_thread_calls: Default::default(),
+                initialized: Default::default(),
+                stack_reserve: 0,
+            }));
+            let veh = windows_sys::Win32::System::Diagnostics::Debug::AddVectoredExceptionHandler(1, Some(cpp_exception_logger));
+            let f: extern "system" fn() = std::mem::transmute(page);
+            f();
+            f();
+            let code = std::slice::from_raw_parts(page.add(6), 6);
+            assert!(
+                code == [0x0F, 0x01, 0xFA, 0x0F, 0x01, 0xFB] || code == [0x90, 0x90, 0x90, 0xF3, 0x90, 0x90],
+                "left as it was (native) or rewritten (emulated): {code:02x?}"
+            );
+            windows_sys::Win32::System::Diagnostics::Debug::RemoveVectoredExceptionHandler(veh);
+            modules::unregister_mapped(page as usize);
+            VirtualFree(page as _, 0, MEM_RELEASE);
+        }
     }
 
     #[test]
