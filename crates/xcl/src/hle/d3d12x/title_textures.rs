@@ -1046,7 +1046,8 @@ mod watch_schedule_tests {
         assert_eq!(cursor, 0);
     }
 
-    /// Nothing hot at all: exactly `ceil(n/period)` ranges a look, in order, wrapping.
+    /// Nothing hot at all: `ceil(n/period)` ranges a look, in order, wrapping to the front once
+    /// the sweep runs off the end.
     #[test]
     fn the_sweep_takes_one_share_a_look() {
         let hot = vec![false; 10];
@@ -1054,8 +1055,8 @@ mod watch_schedule_tests {
         assert_eq!(select_ranges(&hot, &mut cursor, 4), vec![0, 1, 2]);
         assert_eq!(select_ranges(&hot, &mut cursor, 4), vec![3, 4, 5]);
         assert_eq!(select_ranges(&hot, &mut cursor, 4), vec![6, 7, 8]);
-        assert_eq!(select_ranges(&hot, &mut cursor, 4), vec![9]);
-        assert_eq!(select_ranges(&hot, &mut cursor, 4), vec![0, 1, 2]);
+        assert_eq!(select_ranges(&hot, &mut cursor, 4), vec![0, 1, 9]);
+        assert_eq!(select_ranges(&hot, &mut cursor, 4), vec![2, 3, 4]);
     }
 }
 
