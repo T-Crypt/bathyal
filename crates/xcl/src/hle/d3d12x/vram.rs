@@ -197,37 +197,52 @@ struct Page {
 /// D3D12 (a new pool heap is the `grow` callback's).
 struct Book {
     free: Vec<Tile>,
-    /// tiles given back, reusable after `COOL`
-    cooling: std::collections::VecDeque<(Tile, std::time::Instant)>,
+    /// tiles given back: reusable once the mapping queue's fence has reached the value it had
+    /// when the tile was given back (`value`) and `COOL` has passed – the GPU may still read or
+    /// write a tile that released work points at, and so may a queue that has not run yet
+    cooling: std::collections::VecDeque<(Tile, std::time::Instant, u64)>,
     /// (space, title page address) → its video memory
     pages: std::collections::HashMap<(Space, usize), Page>,
     /// resource → (its space, the title pages it uses, tiles of its own past the title's memory)
     users: std::collections::HashMap<usize, (Space, Vec<usize>, Vec<Tile>)>,
+    /// the mapping queue's last signalled fence value: what a tile given back now is stamped with
+    value: u64,
+    /// the value that queue has completed: no tile stamped past it is reused (`Pages` keeps it
+    /// current; a tile given back before any mapping carries 0 and is free at once)
+    done: u64,
 }
 
 impl Book {
     fn new() -> Book {
-        Book { free: Vec::new(), cooling: std::collections::VecDeque::new(), pages: std::collections::HashMap::new(), users: std::collections::HashMap::new() }
+        Book {
+            free: Vec::new(),
+            cooling: std::collections::VecDeque::new(),
+            pages: std::collections::HashMap::new(),
+            users: std::collections::HashMap::new(),
+            value: 0,
+            done: 0,
+        }
     }
 
     /// Pages no resource used for `IDLE` go back to the pools.
     fn sweep(&mut self, now: std::time::Instant) {
         let old: Vec<(Space, usize)> = self.pages.iter().filter(|(_, p)| p.idle_since.is_some_and(|t| now.duration_since(t) >= IDLE)).map(|(&a, _)| a).collect();
+        let value = self.value;
         for a in old {
             if let Some(p) = self.pages.remove(&a) {
-                self.cooling.push_back((p.tile, now));
+                self.cooling.push_back((p.tile, now, value));
             }
         }
     }
 
-    /// A tile: a free one, one cooled down, else the first of a new pool heap (`grow`: its
-    /// index; None: no video memory).
+    /// A tile: a free one, one cooled down and past the queue's fence, else the first of a new
+    /// pool heap (`grow`: its index; None: no video memory).
     fn take_tile(&mut self, now: std::time::Instant, grow: &mut impl FnMut() -> Option<u32>) -> Option<Tile> {
         if let Some(t) = self.free.pop() {
             return Some(t);
         }
-        if self.cooling.front().is_some_and(|&(_, at)| now.duration_since(at) >= COOL) {
-            return self.cooling.pop_front().map(|(t, _)| t);
+        if self.cooling.front().is_some_and(|&(_, at, v)| now.duration_since(at) >= COOL && self.done >= v) {
+            return self.cooling.pop_front().map(|(t, _, _)| t);
         }
         let h = grow()?;
         self.free.extend((1..POOL_PAGES).rev().map(|t| (h, t)));
@@ -274,7 +289,8 @@ impl Book {
         Some(tiles)
     }
 
-    /// Resource `res` released: its pages are no longer its.
+    /// Resource `res` released: its pages are no longer its, and its own tiles wait for the
+    /// mapping queue's fence before another resource takes them.
     fn release(&mut self, res: usize, now: std::time::Instant) {
         let Some((space, used, extra)) = self.users.remove(&res) else { return };
         for a in used {
@@ -285,7 +301,8 @@ impl Book {
                 }
             }
         }
-        self.cooling.extend(extra.into_iter().map(|t| (t, now)));
+        let value = self.value;
+        self.cooling.extend(extra.into_iter().map(|t| (t, now, value)));
     }
 
     /// bytes of the pages (idle ones included) and own tiles in use
@@ -351,6 +368,9 @@ impl Pages {
         heaps.sort_unstable();
         heaps.dedup();
         for h in heaps {
+            // a tile naming a pool heap this book does not have is not mapped rather than a
+            // null heap handed to the driver
+            let Some(heap) = self.pools.get(h as usize) else { continue };
             let ranges = heap_ranges(h, tiles);
             let flags: Vec<D3D12_TILE_RANGE_FLAGS> = ranges.iter().map(|r| if r.0 { D3D12_TILE_RANGE_FLAG_NONE } else { D3D12_TILE_RANGE_FLAG_SKIP }).collect();
             let offsets: Vec<u32> = ranges.iter().map(|r| r.1).collect();
@@ -362,7 +382,7 @@ impl Pages {
                 1,
                 Some(&coord),
                 Some(&region),
-                &self.pools[h as usize],
+                heap,
                 ranges.len() as u32,
                 Some(flags.as_ptr()),
                 Some(offsets.as_ptr()),
@@ -372,6 +392,8 @@ impl Pages {
         }
         self.value += 1;
         let _ = self.queue.Signal(&self.fence, self.value);
+        // a tile given back from now on waits for this mapping too
+        self.book.value = self.value;
     }
 }
 
@@ -416,7 +438,10 @@ unsafe fn place_on_pages(dev: &ID3D12Device, this: *mut c_void, space: Space, va
     let mut total = 0u32;
     dev.GetResourceTiling(res, Some(&mut total), None, None, None, 0, std::ptr::null_mut());
     let own = console_bytes.map_or(total as usize, |b| (b as usize).div_ceil(PAGE)).min(total as usize);
+    // a tile given back is not reused before the mappings signalled so far have run
+    let completed = pages.fence.GetCompletedValue();
     let Pages { book, pools, .. } = pages;
+    book.done = completed;
     let Some(tiles) = book.claim(space, raw as usize, va, own, total as usize, std::time::Instant::now(), &mut || Pages::grow(dev, pools)) else {
         // no video memory for all of it: the texture goes
         drop(g);
@@ -606,6 +631,40 @@ mod tests {
         assert!(b.claim(Space::Textures, 5, va + 8 * PAGE, 3, 3, t + s(5), &mut || None).is_none());
         assert!(!b.users.contains_key(&5));
         assert!(b.pages.get(&(Space::Textures, va + 8 * PAGE)).is_some_and(|p| p.users == 0), "its page is idle, not in use");
+    }
+
+    /// A tile given back waits for the mapping queue's fence as well as `COOL`: the GPU may
+    /// still be reading it, and a mapping of the tile into another resource would hand it over
+    /// while that work runs. The stamp is the queue's value at the release; a tile whose release
+    /// came before any mapping (value 0) needs no fence.
+    #[test]
+    fn a_tile_given_back_waits_for_the_mapping_queue_fence() {
+        let (t, va) = (Instant::now(), 0x5_0000_0000usize);
+        let s = Duration::from_secs;
+        let mut b = Book::new();
+        let mut grow = heaps();
+        // five mappings have been signalled, three have run
+        b.value = 5;
+        b.done = 3;
+        let first = b.claim(Space::Textures, 1, va, 1, 1, t, &mut grow).unwrap();
+        b.release(1, t);
+        b.sweep(t + s(3));
+        b.free.clear();
+        assert!(b.claim(Space::Textures, 2, va + PAGE, 1, 1, t + s(5), &mut || None).is_none(), "cooled down but the fence has not reached its value: not reused");
+        b.done = 4;
+        assert!(b.claim(Space::Textures, 3, va + PAGE, 1, 1, t + s(5), &mut || None).is_none(), "still short of 5");
+        b.done = 5;
+        assert_eq!(b.claim(Space::Textures, 4, va + PAGE, 1, 1, t + s(5), &mut || None).unwrap(), first, "the fence has passed: reused");
+        // a tile given back before any mapping carries 0 and needs no fence
+        let mut b = Book::new();
+        let mut grow = heaps();
+        b.value = 9;
+        let tile = b.claim(Space::Textures, 1, va, 1, 1, t, &mut grow).unwrap();
+        b.value = 0;
+        b.release(1, t);
+        b.sweep(t + s(3));
+        b.free.clear();
+        assert_eq!(b.claim(Space::Textures, 2, va + PAGE, 1, 1, t + s(5), &mut || None).unwrap(), tile);
     }
 
     /// On the GPU: kept-in-step textures placed at one title address are one memory (an upload

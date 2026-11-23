@@ -2346,6 +2346,14 @@ pub(super) unsafe extern "system" fn resource_barrier_x(this: *mut c_void, n: u3
             if b[5] == b[6] {
                 continue;
             }
+            // a transition of no resource: the PC driver reads the resource at once
+            if (b[2] as u64 | (b[3] as u64) << 32) as usize == 0 {
+                static Z: AtomicU64 = AtomicU64::new(0);
+                if Z.fetch_add(1, Ordering::Relaxed) < 8 {
+                    crate::xlog_warn!("D3D12.X: ResourceBarrier: a transition with no resource skipped");
+                }
+                continue;
+            }
             // UAV writes before (or after) the transition: the same holds for the window buffers
             uav_transition |= (b[5] | b[6]) & UNORDERED_ACCESS != 0;
         }
@@ -2416,7 +2424,26 @@ fn note_gpu_write(what: &str, va: usize, n: u64) {
     }
 }
 
+/// A console record names no resource where the PC needs one. The PC driver reads the
+/// resource's fields at once (nvwgf2umx reads `[resource+0x3c]`), so a null one is an access
+/// violation inside the driver – the call is skipped instead (a record without a resource does
+/// nothing on the console either).
+fn no_resource(what: &str, res: usize) -> bool {
+    if res != 0 {
+        return false;
+    }
+    static N: AtomicU64 = AtomicU64::new(0);
+    let n = N.fetch_add(1, Ordering::Relaxed);
+    if n < 8 || n.is_power_of_two() {
+        crate::xlog_warn!("D3D12.X: {what} with no resource – skipped ({n} so far)");
+    }
+    true
+}
+
 pub(super) unsafe extern "system" fn copy_buffer_region_x(this: *mut c_void, dst: usize, dst_off: u64, src: usize, src_off: u64, n: u64) {
+    if no_resource("CopyBufferRegion", dst) || no_resource("CopyBufferRegion source", src) {
+        return;
+    }
     if super::present::trace_frame() {
         if let Some(a) = real::title_address(dst) {
             note_gpu_write("CopyBufferRegion", a + dst_off as usize, n);
@@ -2522,6 +2549,9 @@ pub(super) unsafe extern "system" fn copy_texture_region_x(this: *mut c_void, ds
         }
     }
     let (Some(d), Some(s)) = (pc_location(dst), pc_location(src)) else { return };
+    if no_resource("CopyTextureRegion", transmute_copy::<_, usize>(&d.pResource)) || no_resource("CopyTextureRegion source", transmute_copy::<_, usize>(&s.pResource)) {
+        return;
+    }
     pc::<unsafe extern "system" fn(*mut c_void, *const D3D12_TEXTURE_COPY_LOCATION, u32, u32, u32, *const D3D12_TEXTURE_COPY_LOCATION, *const D3D12_BOX)>(this, PC_COPY_TEXTURE_REGION)(this, &d, x, y, z, &s, bx);
     std::mem::forget((d, s)); // borrowed resource pointers
 }
@@ -2581,6 +2611,9 @@ unsafe fn trace_resolve(what: &str, dst: usize, src: usize, format: i32, extra: 
 
 /// command list #19 ResolveSubresource(dst, dst sub, src, src sub, format) (PC #19)
 pub(super) unsafe extern "system" fn resolve_subresource_x(this: *mut c_void, dst: usize, dst_sub: u32, src: usize, src_sub: u32, format: i32) {
+    if no_resource("ResolveSubresource", dst) || no_resource("ResolveSubresource source", src) {
+        return;
+    }
     super::present::note_use(dst, super::present::USE_COPY);
     trace_resolve("ResolveSubresource", dst, src, format, "");
     pc::<unsafe extern "system" fn(*mut c_void, usize, u32, usize, u32, i32)>(this, PC_RESOLVE_SUBRESOURCE)(this, dst, dst_sub, src, src_sub, format)
@@ -2590,6 +2623,9 @@ pub(super) unsafe extern "system" fn resolve_subresource_x(this: *mut c_void, ds
 /// mode) (PC #64)
 #[allow(clippy::too_many_arguments)]
 pub(super) unsafe extern "system" fn resolve_subresource_region_x(this: *mut c_void, dst: usize, dst_sub: u32, x: u32, y: u32, src: usize, src_sub: u32, rect: *const windows::Win32::Foundation::RECT, format: i32, mode: i32) {
+    if no_resource("ResolveSubresourceRegion", dst) || no_resource("ResolveSubresourceRegion source", src) {
+        return;
+    }
     super::present::note_use(dst, super::present::USE_COPY);
     if super::present::trace_frame() {
         trace_resolve("ResolveSubresourceRegion", dst, src, format, &format!(" mode {mode} at ({x}, {y}) rect {:?}", rect.as_ref().map(|r| (r.left, r.top, r.right, r.bottom))));
@@ -2600,6 +2636,9 @@ pub(super) unsafe extern "system" fn resolve_subresource_region_x(this: *mut c_v
 /// CopyResource(dst, src) (PC #17; DMA list #13): buffers placed below their console address
 /// are copied as their own bytes (the PC resources also hold what lies before them)
 pub(super) unsafe extern "system" fn copy_resource_x(this: *mut c_void, dst: usize, src: usize) {
+    if no_resource("CopyResource", dst) || no_resource("CopyResource source", src) {
+        return;
+    }
     super::present::note_use(dst, super::present::USE_COPY);
     super::title_textures::note_gpu_write(dst);
     if super::present::trace_frame() {
@@ -2699,6 +2738,13 @@ mod tests {
     unsafe extern "system" fn reset_test_native(this: *mut c_void, _alloc: usize, _pso: usize) -> i32 {
         *(this as *mut usize) = RESET_TEST_REPLACEMENT_VT.load(Ordering::SeqCst) as usize;
         RESET_TEST_HR.load(Ordering::SeqCst) as i32
+    }
+
+    #[test]
+    fn a_record_without_a_resource_is_not_passed_to_the_driver() {
+        // the PC driver reads the resource at once (nvwgf2umx: `test byte [res+0x3c],1`)
+        assert!(no_resource("CopyResource", 0));
+        assert!(!no_resource("CopyResource", 0x1000));
     }
 
     #[test]
