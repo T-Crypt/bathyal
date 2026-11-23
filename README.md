@@ -117,6 +117,8 @@ next to `bathyal.exe`, directly next to `bathyal.exe`, in `%LOCALAPPDATA%\XCL\D3
 - **Network:** title network access is enabled by default. Use `XCL_NETWORK=0` when bringing up an
   unfamiliar title: XCL blocks its WinHTTP and Winsock traffic while keeping loopback available. This
   also prevents a title crash reporter from sending a process dump containing local paths and names.
+- **Linux:** cross-build for `x86_64-pc-windows-gnu` and run under Wine + vkd3d-proton: setup, scripts
+  and known state in [`docs/linux.md`](docs/linux.md).
 - **GPU:** developed on AMD RDNA4. The console's geometry and NGG programs run as a compute pass plus a
   mesh pass, so a GPU without mesh shaders draws none of them. On GPUs with 32-lane waves only
   (NVIDIA) console wave64 compute, geometry and mesh programs run as two 32-lane halves that exchange
