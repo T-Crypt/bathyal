@@ -155,7 +155,14 @@ fn pc() -> Option<&'static Pc> {
     .as_ref()
 }
 
+/// Set when the system runtime is there but refused to initialise (e.g. 0x80073cfc without a working
+/// Gaming Services): its objects then fail fast on first use, so XCL's own fallbacks are used instead.
+static PC_INIT_FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 unsafe fn pc_object(c: &Guid, i: &Guid) -> Option<usize> {
+    if PC_INIT_FAILED.load(Ordering::Acquire) {
+        return None;
+    }
     let mut o: *mut c_void = std::ptr::null_mut();
     ((pc()?.query)(c, i, &mut o) >= 0 && !o.is_null()).then_some(o as usize)
 }
@@ -189,7 +196,8 @@ unsafe fn pc_init(gdk: u64, os: u64, flags: u64, options: *mut c_void) {
         hr = p.init.map(|f| f(gdk >> 32, gdk & 0xFFFF_FFFF)).unwrap_or(-1);
     }
     if hr < 0 {
-        crate::xlog_warn!("XGameRuntime PC: initialization → {:#x}", hr as u32);
+        crate::xlog_warn!("XGameRuntime PC: initialization → {:#x} – using XCL's own XAsync / fallbacks", hr as u32);
+        PC_INIT_FAILED.store(true, Ordering::Release);
     }
     start_pc_async();
 }
