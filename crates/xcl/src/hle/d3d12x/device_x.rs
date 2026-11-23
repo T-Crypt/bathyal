@@ -864,14 +864,13 @@ fn standin_texture(x: &[u8; 0x38]) -> Option<crate::hle::xg::Texture> {
 }
 
 /// A PC format whose console layout stands in for one that the PC has none for, of the same
-/// bits per texel: R1 (8), the packed 4:2:2 pair (16 a pixel), XR_BIAS (32), and the 96-bit
-/// ones, which take the smallest the PC has above them (128). None: not one of those.
+/// bits per texel: R1 (8), the packed 4:2:2 pair (16 a pixel), and the 96-bit ones, which take
+/// the smallest the PC has above them (128). None: not one of those.
 pub fn pc_standin_format(f: u32) -> Option<u32> {
     Some(match f {
         5..=8 => 2,    // R32G32B32 family: R32G32B32A32_FLOAT
         66 => 61,      // R1_UNORM: R8_UNORM
         68 | 69 => 56, // R8G8_B8G8 / G8R8_G8B8 (2 bytes a pixel): R16_UNORM
-        89 => 28,      // R10G10B10_XR_BIAS_A2_UNORM: R8G8B8A8_UNORM
         _ => return None,
     })
 }
@@ -1207,9 +1206,9 @@ mod tests {
         assert_eq!(format(&x), 72);
 
         // a format the PC has no layout for: a stand-in of the same bits a texel
-        assert_eq!((pc_standin_format(89), pc_standin_format(68), pc_standin_format(66), pc_standin_format(6)), (Some(28), Some(56), Some(61), Some(2)));
-        assert_eq!((pc_standin_format(28), pc_standin_format(0), pc_standin_format(130)), (None, None, None));
-        for f in [89u32, 68, 66, 6] {
+        assert_eq!((pc_standin_format(68), pc_standin_format(66), pc_standin_format(6)), (Some(56), Some(61), Some(2)));
+        assert_eq!((pc_standin_format(28), pc_standin_format(0), pc_standin_format(89)), (None, None, None));
+        for f in [68u32, 66, 6] {
             x[0x20..0x24].copy_from_slice(&f.to_le_bytes());
             x[0x30..0x34].copy_from_slice(&0x1u32.to_le_bytes());
             assert!(crate::hle::xg::Texture::new(&x).is_err(), "XG should not model {f}");
