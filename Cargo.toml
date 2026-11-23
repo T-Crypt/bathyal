@@ -6,3 +6,7 @@ members = ["crates/xcl", "tests/testtitle", "tests/testgamedll"]
 version = "0.1.0"
 edition = "2021"
 license = "GPL-2.0-only"
+
+# Keep optimized benchmark code while retaining names and line information for CPU profiles.
+[profile.bench]
+debug = 1
