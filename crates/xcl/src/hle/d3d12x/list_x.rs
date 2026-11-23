@@ -548,6 +548,9 @@ struct ListState {
     pending_waits: Vec<PendingWait>,
     /// bottom-of-pipe writes into memory the GPU does not see (`cpu_writes`)
     cpu_writes: Vec<super::cpu_writes::Write>,
+    /// copies with a side outside the unified-memory windows, done by the CPU after the queue's
+    /// earlier work: `(destination, source, bytes)`
+    copies: Vec<super::cpu_writes::Copy>,
     /// Dedicated 256-byte buffer holding the current predicate value (created lazily in COMMON state).
     pred_buf: Option<ID3D12Resource>,
     /// True while `pred_buf` is in `D3D12_RESOURCE_STATE_PREDICATION` on this open recording.
@@ -571,11 +574,20 @@ impl ListState {
             last.1 = last.1.max(end);
         }
         if crate::gpu::uma::get().is_some_and(|u| u.is_sparse(va as usize)) {
-            if self.sparse_writes.is_empty() {
-                SPARSE_WRITE_LISTS.fetch_add(1, Ordering::AcqRel);
-            }
-            self.sparse_writes.push((va as usize, size as usize));
+            self.note_sparse(va as usize, size as usize);
         }
+    }
+
+    /// A sparse-window range whose CPU view the GPU's writes must reach (before the CPU reads
+    /// it: a copy out of it, a wait on it).
+    fn note_sparse(&mut self, va: usize, size: usize) {
+        if size == 0 {
+            return;
+        }
+        if self.sparse_writes.is_empty() {
+            SPARSE_WRITE_LISTS.fetch_add(1, Ordering::AcqRel);
+        }
+        self.sparse_writes.push((va, size));
     }
 
     fn clear_sparse_writes(&mut self) -> Vec<(usize, usize)> {
@@ -918,14 +930,26 @@ pub(super) unsafe fn readback_sparse_writes(queue: *mut c_void, lists: &[*mut c_
     }
 }
 
-/// After `lists` went to `queue`: their writes into memory the GPU does not see (`cpu_writes`).
+/// After `lists` went to `queue`: their work on memory the GPU does not see (`cpu_writes`):
+/// bottom-of-pipe writes, and copies with a side outside the unified-memory windows.
 pub(super) unsafe fn cpu_writes_after(queue: *mut c_void, lists: &[*mut c_void]) {
-    let writes: Vec<super::cpu_writes::Write> = {
+    let (writes, copies): (Vec<super::cpu_writes::Write>, Vec<super::cpu_writes::Copy>) = {
         let g = LISTS.lock().unwrap();
         let Some(m) = g.as_ref() else { return };
-        lists.iter().filter_map(|&l| m.get(&(l as usize))).flat_map(|s| s.cpu_writes.iter().cloned()).collect()
+        (
+            lists.iter().filter_map(|&l| m.get(&(l as usize))).flat_map(|s| s.cpu_writes.iter().cloned()).collect(),
+            lists.iter().filter_map(|&l| m.get(&(l as usize))).flat_map(|s| s.copies.iter().copied()).collect(),
+        )
     };
-    super::cpu_writes::after(queue, writes);
+    super::cpu_writes::after(queue, deferred_work(writes, copies));
+}
+
+/// The work of a list's recorded bottom-of-pipe writes and CPU copies, in that order, for
+/// `cpu_writes::after` (`KickoffX` submits its one list itself).
+pub(super) fn deferred_work(writes: Vec<super::cpu_writes::Write>, copies: Vec<super::cpu_writes::Copy>) -> Vec<super::cpu_writes::Work> {
+    let mut work: Vec<super::cpu_writes::Work> = writes.into_iter().map(super::cpu_writes::Work::Words).collect();
+    work.extend(copies.into_iter().map(super::cpu_writes::Work::Copy));
+    work
 }
 
 /// Submit `lists` through `submit`, splitting the batch before any list whose `Wait32/64BitValueX`
@@ -968,17 +992,26 @@ pub(super) unsafe fn execute_with_waits(lists: &[*mut c_void], mut submit: impl 
 // ---------------------------------------------------------------------------------------
 
 /// command list #60 CopyMemoryToMemoryX(destination, source, size, flags)
+///
+/// Both sides in unified-memory windows: a GPU copy (`CopyBufferRegion`). A side outside them
+/// – the title's own memory, which the PC's GPU has no address for – the CPU copies, after the
+/// queue's earlier work as `cpu_writes` does; a destination in a sparse window's video memory
+/// gets the bytes then too (`sparse::flush_written`), a source there is read back first.
 pub(super) unsafe extern "system" fn copy_memory_x(this: *mut c_void, dst: u64, src: u64, size: u64, _flags: u32) {
     static N: AtomicU64 = AtomicU64::new(0);
     const W: &str = "CopyMemoryToMemoryX";
     if size == 0 || !size.is_multiple_of(4) {
         return warn(&N, W, format_args!("size {size:#x} is not a non-zero multiple of 4"));
     }
-    let (Some((d, doff)), Some((s, soff))) = (real::uma_window_buffer(dst as usize, size as usize), real::uma_window_buffer(src as usize, size as usize)) else {
-        note_gpu_write("CopyMemoryToMemoryX", dst as usize, size);
-        return warn(&N, W, format_args!("{src:#x} → {dst:#x} ({size:#x} bytes) is not in unified memory"));
+    note_gpu_write(W, dst as usize, size);
+    // in a window whose video memory reaches it: the GPU's copy
+    let window = |p: u64| {
+        real::uma_window_buffer(p as usize, size as usize)
+            .filter(|_| !crate::gpu::uma::get().is_some_and(|u| u.is_sparse(p as usize)) || super::sparse::has_video_memory(p as usize, size as usize))
     };
-    note_gpu_write("CopyMemoryToMemoryX", dst as usize, size);
+    let (Some((d, doff)), Some((s, soff))) = (window(dst), window(src)) else {
+        return cpu_copy(this, dst, src, size, W);
+    };
     if d == s && dst < src + size && src < dst + size {
         return warn(&N, W, format_args!("{src:#x} → {dst:#x} ({size:#x} bytes) overlap"));
     }
@@ -991,6 +1024,31 @@ pub(super) unsafe extern "system" fn copy_memory_x(this: *mut c_void, dst: u64, 
     transition(this, s, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
     as_copy_dest(this, d, || copy_buffer_region(this, d, doff, s, soff, size));
     transition(this, s, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
+}
+
+/// `CopyMemoryToMemoryX` with a side outside the unified-memory windows: the CPU copies it once
+/// the queue is past this list's earlier work (`cpu_writes::after`).
+unsafe fn cpu_copy(this: *mut c_void, dst: u64, src: u64, size: u64, what: &str) {
+    static N: AtomicU64 = AtomicU64::new(0);
+    let (dp, sp) = (dst as usize, src as usize);
+    if !super::cpu_writes::writable(dp, size as usize) || !super::cpu_writes::readable(sp, size as usize) {
+        return warn(&N, what, format_args!("{src:#x} → {dst:#x} ({size:#x} bytes) is not in unified memory and the CPU cannot copy it"));
+    }
+    let mut g = LISTS.lock().unwrap();
+    let Some(s) = g.as_mut().and_then(|m| m.get_mut(&(this as usize))) else { return };
+    if crate::gpu::uma::get().is_some_and(|u| u.is_sparse(sp)) {
+        // the GPU's writes to the source reach its CPU view before the copy reads it
+        s.note_sparse(sp, size as usize);
+    }
+    s.copies.push((dp, sp, size as usize));
+    drop(g);
+    let n = N.fetch_add(1, Ordering::Relaxed);
+    if n < 4 || n.is_power_of_two() {
+        crate::xlog_info!(
+            "D3D12.X: {what}: {src:#x} → {dst:#x} ({size:#x} bytes) outside unified memory is copied by the CPU after the queue's work (#{n}{})",
+            if crate::gpu::uma::get().is_some_and(|u| u.is_sparse(dp)) { ", into the destination window's video memory" } else { "" }
+        );
+    }
 }
 
 unsafe fn device_of(list: *mut c_void) -> Option<ID3D12Device> {
@@ -1534,11 +1592,12 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
         let sparse_writes = s.clear_sparse_writes();
         s.written_ranges.clear();
         let cpu_writes = std::mem::take(&mut s.cpu_writes);
+        let copies = std::mem::take(&mut s.copies);
         let pred_in_state = std::mem::replace(&mut s.pred_in_state, false);
         let pred_buf = s.pred_buf.as_ref().map(|r| r.as_raw() as usize);
-        (s.allocator, q, s.bound_pso, s.depth_bias, s.index_buffer, s.depth_bounds, s.predication, pred_buf, pred_in_state, active_query, waits, (sparse_writes, cpu_writes))
+        (s.allocator, q, s.bound_pso, s.depth_bias, s.index_buffer, s.depth_bounds, s.predication, pred_buf, pred_in_state, active_query, waits, (sparse_writes, cpu_writes, copies))
     };
-    let (sparse_writes, cpu_writes) = sparse_writes;
+    let (sparse_writes, cpu_writes, copies) = sparse_writes;
 
     // End any active occlusion query before Close (PC forbids closing with an open query).
     if let Some(((h, i), qty)) = active_query {
@@ -1575,7 +1634,7 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
             super::sparse::readback_after_execute(q, &sparse_writes);
         }
     }
-    super::cpu_writes::after(q_raw, cpu_writes);
+    super::cpu_writes::after(q_raw, deferred_work(cpu_writes, copies));
 
     let ext_closed = *(this as *const usize);
     let init_pso = super::pso_async::resolve_for_bind(bound_pso);
@@ -2137,6 +2196,7 @@ pub unsafe extern "system" fn reset_x(this: *mut c_void, alloc: usize, pso: usiz
         s.clear_sparse_writes();
         s.clear_waits();
         s.cpu_writes.clear();
+        s.copies.clear();
         s.predication = None;
         s.pred_in_state = false;
         s.bindings = Bindings::default();
@@ -2750,6 +2810,30 @@ mod tests {
         assert!(s.has_prior_write(0x0FFC, 8));
         assert!(!s.has_prior_write(0x1008, 4));
         assert!(!s.has_prior_write(0x0FF8, 8));
+    }
+
+    /// CopyMemoryToMemoryX with a side outside the unified-memory windows (two buffers of the
+    /// CPU's own) is recorded for the CPU to do once the queue is past the list's earlier work.
+    #[test]
+    fn copy_outside_unified_memory_goes_to_the_cpu() {
+        let src = Box::new([0x5Au8; 0x100]);
+        let dst = Box::new([0u8; 0x100]);
+        let (s, d) = (src.as_ptr() as u64, dst.as_ptr() as u64);
+        let l = 0x7100_0002usize as *mut c_void;
+        unsafe {
+            on_create(l, 0x100, 0, D3D12_COMMAND_LIST_TYPE_DIRECT);
+            copy_memory_x(l, d, s, 0x100, 0);
+        }
+        let copies = {
+            let g = LISTS.lock().unwrap();
+            g.as_ref().unwrap().get(&(l as usize)).unwrap().copies.clone()
+        };
+        assert_eq!(copies, vec![(d as usize, s as usize, 0x100usize)], "one CPU copy, in the list's record");
+        assert!(*dst == [0u8; 0x100], "nothing copied at the record");
+        // the CPU's copy does it
+        unsafe { super::super::cpu_writes::copy_now(copies[0].0, copies[0].1, copies[0].2) };
+        assert!(*dst == [0x5Au8; 0x100]);
+        LISTS.lock().unwrap().as_mut().unwrap().remove(&(l as usize));
     }
 
     #[test]

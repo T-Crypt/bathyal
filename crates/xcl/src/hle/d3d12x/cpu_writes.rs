@@ -1,12 +1,14 @@
-//! Write32/64BitValueBottomOfPipeX into memory the GPU does not see: done by the CPU once the GPU
-//! has finished the work before them.
+//! Work on memory the GPU does not see, done by the CPU once the GPU has finished the work
+//! before it: Write32/64BitValueBottomOfPipeX, and CopyMemoryToMemoryX with a side outside
+//! unified memory.
 //!
 //! A console title marks its GPU progress with bottom-of-pipe writes into its own memory and
 //! waits on them (a retail game: plain `VirtualAlloc` memory, outside XCL's unified memory).
 //! The PC GPU cannot write there; dropped, the title waited for ever after its second frame.
-//! Here each queue gets a fence of XCL's: after a submission whose lists carry such writes the
-//! queue signals it, and a worker thread does the writes, in submission order, when the GPU is
-//! there – what bottom of pipe means.
+//! It also copies through its memory the GPU has no address for (command list #60 with a side
+//! outside the windows). Here each queue gets a fence of XCL's: after a submission whose lists
+//! carry such work the queue signals it, and a worker thread does the work, in submission
+//! order, when the GPU is there – what bottom of pipe means.
 
 use std::collections::HashMap;
 use std::ffi::c_void;
@@ -30,10 +32,20 @@ pub(super) enum Write {
     ReadbackU64 { va: usize, src: usize, _buf: ID3D12Resource },
 }
 
+/// A copy the CPU does after the queue's earlier work: (destination, source, bytes).
+/// Its bytes are read from the source when it runs, so they are what the GPU has left there.
+pub(super) type Copy = (usize, usize, usize);
+
+/// What a worker does for one submission, in this order.
+pub(super) enum Work {
+    Words(Write),
+    Copy(Copy),
+}
+
 struct Job {
     fence: ID3D12Fence,
     value: u64,
-    writes: Vec<Write>,
+    work: Vec<Work>,
 }
 
 // SAFETY: the fence is a free-threaded COM object; the writes are plain data
@@ -63,13 +75,14 @@ fn worker() -> &'static Mutex<mpsc::Sender<Job>> {
                 if job.fence.GetCompletedValue() < job.value && job.fence.SetEventOnCompletion(job.value, HANDLE(event as *mut c_void)).is_ok() {
                     th::WaitForSingleObject(event, WAIT_MS);
                 }
-                for w in &job.writes {
+                for w in &job.work {
                     match w {
-                        Write::Immediate(va, words) => write_now(*va, words),
-                        Write::ReadbackU64 { va, src, .. } => {
+                        Work::Words(Write::Immediate(va, words)) => write_now(*va, words),
+                        Work::Words(Write::ReadbackU64 { va, src, .. }) => {
                             let value = (*(*src as *const AtomicU64)).load(Ordering::Acquire);
                             write_u64_now(*va, value);
                         }
+                        Work::Copy((dst, src, bytes)) => copy_now(*dst, *src, *bytes),
                     }
                 }
             }
@@ -110,21 +123,50 @@ unsafe fn write_u64_now(va: usize, value: u64) {
     (*(va as *const AtomicU64)).store(value, Ordering::Release);
 }
 
+/// `[va, va + bytes)` as the CPU sees it: committed, and writable when `write`.
+unsafe fn commit_check(va: usize, bytes: usize, write: bool) -> bool {
+    use windows_sys::Win32::System::Memory::{
+        VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_EXECUTE_READWRITE, PAGE_READONLY, PAGE_READWRITE,
+    };
+    if crate::gpu::uma::get().is_some_and(|u| u.in_committed_window(va, bytes)) {
+        // the coherent windows are committed read-write as a whole (no VirtualQuery walk)
+        return true;
+    }
+    let mut m: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+    let found = VirtualQuery(va as *const c_void, &mut m, std::mem::size_of_val(&m)) != 0;
+    let ok = if write {
+        m.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE) != 0
+    } else {
+        m.Protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_EXECUTE_READWRITE) != 0
+    };
+    found && m.State == MEM_COMMIT && ok && m.BaseAddress as usize + m.RegionSize >= va + bytes
+}
+
 /// Whether `[va, va + bytes)` is memory the CPU can write for the GPU later.
 pub(super) fn writable(va: usize, bytes: usize) -> bool {
     crate::hle::kernelx::lazy::ensure(va, bytes);
-    use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_EXECUTE_READWRITE, PAGE_READWRITE};
-    let mut m: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
-    let found = unsafe { VirtualQuery(va as *const c_void, &mut m, std::mem::size_of_val(&m)) } != 0;
-    found
-        && m.State == MEM_COMMIT
-        && m.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE) != 0
-        && m.BaseAddress as usize + m.RegionSize >= va + bytes
+    unsafe { commit_check(va, bytes, true) }
 }
 
-/// `writes` of lists just submitted to `queue`: done when the GPU has finished them.
-pub(super) unsafe fn after(queue: *mut c_void, writes: Vec<Write>) {
-    if writes.is_empty() || queue.is_null() {
+/// Whether `[va, va + bytes)` is memory the CPU can read for a copy.
+pub(super) fn readable(va: usize, bytes: usize) -> bool {
+    crate::hle::kernelx::lazy::ensure(va, bytes);
+    unsafe { commit_check(va, bytes, false) }
+}
+
+/// `bytes` from `src` to `dst` on the CPU, when both are memory it can reach; a destination in
+/// a sparse window then goes to that window's video memory for the GPU's later work.
+pub(super) unsafe fn copy_now(dst: usize, src: usize, bytes: usize) {
+    if bytes == 0 || !writable(dst, bytes) || !readable(src, bytes) {
+        return;
+    }
+    std::ptr::copy(src as *const u8, dst as *mut u8, bytes);
+    super::sparse::flush_written(dst, bytes);
+}
+
+/// `work` of lists just submitted to `queue`: done when the GPU has finished them.
+pub(super) unsafe fn after(queue: *mut c_void, work: Vec<Work>) {
+    if work.is_empty() || queue.is_null() {
         return;
     }
     let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&queue) else { return };
@@ -147,10 +189,10 @@ pub(super) unsafe fn after(queue: *mut c_void, writes: Vec<Write>) {
         if q.Signal(&entry.fence, entry.value).is_err() {
             return;
         }
-        Job { fence: entry.fence.clone(), value: entry.value, writes }
+        Job { fence: entry.fence.clone(), value: entry.value, work }
     };
     static FIRST: std::sync::Once = std::sync::Once::new();
-    FIRST.call_once(|| crate::xlog_info!("D3D12.X: bottom-of-pipe writes outside unified memory are done by the CPU after the GPU ({} in the first submission)", job.writes.len()));
+    FIRST.call_once(|| crate::xlog_info!("D3D12.X: bottom-of-pipe writes outside unified memory are done by the CPU after the GPU ({} in the first submission)", job.work.len()));
     let _ = worker().lock().unwrap().send(job);
 }
 
@@ -175,7 +217,7 @@ mod tests {
             let cell = Box::new([0u32; 2]);
             let va = cell.as_ptr() as usize;
             assert!(writable(va, 8));
-            after(q.as_raw(), vec![Write::Immediate(va, vec![7, 9])]);
+            after(q.as_raw(), vec![Work::Words(Write::Immediate(va, vec![7, 9]))]);
             let t = std::time::Instant::now();
             while (*(va as *const AtomicU32)).load(Ordering::Acquire) != 7 {
                 assert!(t.elapsed().as_secs() < 5, "never written");
@@ -228,13 +270,54 @@ mod tests {
             let dst = Box::new(0u64);
             let va = dst.as_ref() as *const u64 as usize;
             assert!(writable(va, 8));
-            after(q.as_raw(), vec![Write::ReadbackU64 { va, src: ptr as usize, _buf: rb }]);
+            after(q.as_raw(), vec![Work::Words(Write::ReadbackU64 { va, src: ptr as usize, _buf: rb })]);
             let t = std::time::Instant::now();
             while (*(va as *const AtomicU64)).load(Ordering::Acquire) != expected {
                 assert!(t.elapsed().as_secs() < 5, "readback value never written");
                 std::thread::yield_now();
             }
             assert_eq!(*dst, expected);
+        }
+    }
+
+    /// A copy of the title's memory outside unified memory lands too, after the queue has done
+    /// what came before it.
+    #[test]
+    fn copies_land_after_the_queue() {
+        unsafe {
+            let mut dev: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                let factory: IDXGIFactory4 = CreateDXGIFactory1().unwrap();
+                let warp: IDXGIAdapter = factory.EnumWarpAdapter().unwrap();
+                D3D12CreateDevice(&warp, D3D_FEATURE_LEVEL_11_0, &mut dev).expect("WARP D3D12 device");
+            }
+            let dev = dev.unwrap();
+            let q: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() }).unwrap();
+            let src = Box::new([0xA5u8; 0x400]);
+            let dst = Box::new([0u8; 0x400]);
+            let (s, d) = (src.as_ptr() as usize, dst.as_ptr() as usize);
+            assert!(writable(d, 0x400) && readable(s, 0x400));
+            after(q.as_raw(), vec![Work::Copy((d, s, 0x400))]);
+            let t = std::time::Instant::now();
+            while *dst.first().unwrap() != 0xA5 {
+                assert!(t.elapsed().as_secs() < 5, "never copied");
+                std::thread::yield_now();
+            }
+            assert_eq!(*dst, *src, "the whole range");
+        }
+    }
+
+    /// A copy the CPU cannot make (a source that is no memory of the title's) changes nothing.
+    #[test]
+    fn a_copy_the_cpu_cannot_make_changes_nothing() {
+        unsafe {
+            let dst = Box::new([0u8; 0x100]);
+            let d = dst.as_ptr() as usize;
+            copy_now(d, 0x10, 0x100);
+            assert!(!readable(0x10, 0x100));
+            assert_eq!(*dst, [0u8; 0x100]);
+            copy_now(d, d, 0);
+            assert_eq!(*dst, [0u8; 0x100]);
         }
     }
 }
