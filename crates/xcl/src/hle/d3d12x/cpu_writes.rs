@@ -12,7 +12,7 @@
 
 use std::collections::HashMap;
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{mpsc, Mutex, OnceLock};
 
 use windows::core::Interface;
@@ -20,8 +20,17 @@ use windows::Win32::Foundation::HANDLE;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows_sys::Win32::System::Threading as th;
 
-/// (address, the dwords from there)
-pub(super) type Write = (usize, Vec<u32>);
+/// A bottom-of-pipe write into memory outside unified memory, applied by the CPU once the
+/// queue's fence reaches the submission that recorded it.
+#[derive(Clone)]
+pub(super) enum Write {
+    /// Immediate dwords to store starting at `va`.
+    Immediate(usize, Vec<u32>),
+    /// A 64-bit value resolved by the GPU into a persistently mapped READBACK buffer slot
+    /// (`src`), copied atomically to `va` once the queue's fence completes. Holding `_buf` keeps
+    /// the mapping alive until the worker finishes.
+    ReadbackU64 { va: usize, src: usize, _buf: ID3D12Resource },
+}
 
 /// A copy the CPU does after the queue's earlier work: (destination, source, bytes).
 /// Its bytes are read from the source when it runs, so they are what the GPU has left there.
@@ -68,7 +77,11 @@ fn worker() -> &'static Mutex<mpsc::Sender<Job>> {
                 }
                 for w in &job.work {
                     match w {
-                        Work::Words((va, words)) => write_now(*va, words),
+                        Work::Words(Write::Immediate(va, words)) => write_now(*va, words),
+                        Work::Words(Write::ReadbackU64 { va, src, .. }) => {
+                            let value = (*(*src as *const AtomicU64)).load(Ordering::Acquire);
+                            write_u64_now(*va, value);
+                        }
                         Work::Copy((dst, src, bytes)) => copy_now(*dst, *src, *bytes),
                     }
                 }
@@ -94,6 +107,19 @@ unsafe fn write_now(va: usize, words: &[u32]) {
     for (i, &w) in words.iter().enumerate() {
         (*((va + 4 * i) as *const AtomicU32)).store(w, Ordering::Release);
     }
+}
+
+/// An 8-byte aligned 64-bit value at `va`, if the memory is still there and writable.
+unsafe fn write_u64_now(va: usize, value: u64) {
+    use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_EXECUTE_READWRITE, PAGE_READWRITE};
+    let mut m: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+    if VirtualQuery(va as *const c_void, &mut m, std::mem::size_of_val(&m)) == 0 || m.State != MEM_COMMIT {
+        return;
+    }
+    if m.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE) == 0 || (m.BaseAddress as usize + m.RegionSize) < va + 8 {
+        return;
+    }
+    (*(va as *const AtomicU64)).store(value, Ordering::Release);
 }
 
 /// `[va, va + bytes)` as the CPU sees it: committed, and writable when `write`.
@@ -190,7 +216,7 @@ mod tests {
             let cell = Box::new([0u32; 2]);
             let va = cell.as_ptr() as usize;
             assert!(writable(va, 8));
-            after(q.as_raw(), vec![Work::Words((va, vec![7, 9]))]);
+            after(q.as_raw(), vec![Work::Words(Write::Immediate(va, vec![7, 9]))]);
             let t = std::time::Instant::now();
             while (*(va as *const AtomicU32)).load(Ordering::Acquire) != 7 {
                 assert!(t.elapsed().as_secs() < 5, "never written");
@@ -238,6 +264,51 @@ mod tests {
             assert_eq!(*dst, [0u8; 0x100]);
             copy_now(d, d, 0);
             assert_eq!(*dst, [0u8; 0x100]);
+        }
+    }
+
+    /// A `ReadbackU64` write copies the 64-bit value from the mapped readback buffer after the
+    /// queue finishes.
+    #[test]
+    fn readback_u64_lands_after_the_queue() {
+        unsafe {
+            let mut dev: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                let factory: IDXGIFactory4 = CreateDXGIFactory1().unwrap();
+                let warp: IDXGIAdapter = factory.EnumWarpAdapter().unwrap();
+                D3D12CreateDevice(&warp, D3D_FEATURE_LEVEL_11_0, &mut dev).expect("WARP D3D12 device");
+            }
+            let dev = dev.unwrap();
+            let q: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() }).unwrap();
+            let hp = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() };
+            let rd = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                Width: 8,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                ..Default::default()
+            };
+            let mut rb: Option<ID3D12Resource> = None;
+            dev.CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COPY_DEST, None, &mut rb).unwrap();
+            let rb = rb.unwrap();
+            let mut ptr: *mut c_void = std::ptr::null_mut();
+            rb.Map(0, None, Some(&mut ptr)).unwrap();
+            let expected = 0x1234_5678_9ABC_DEF0u64;
+            (*(ptr as *const AtomicU64)).store(expected, Ordering::Release);
+
+            let dst = Box::new(0u64);
+            let va = dst.as_ref() as *const u64 as usize;
+            assert!(writable(va, 8));
+            after(q.as_raw(), vec![Work::Words(Write::ReadbackU64 { va, src: ptr as usize, _buf: rb })]);
+            let t = std::time::Instant::now();
+            while (*(va as *const AtomicU64)).load(Ordering::Acquire) != expected {
+                assert!(t.elapsed().as_secs() < 5, "readback value never written");
+                std::thread::yield_now();
+            }
+            assert_eq!(*dst, expected);
         }
     }
 }

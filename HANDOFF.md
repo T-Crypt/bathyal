@@ -1950,6 +1950,37 @@ three `graphics PSO rejected (0x8007000e)` just before are the driver's E_OUTOFM
   `fitted_bc5_tables_are_well_formed` (pair table is a permutation, 214 slots fitted, unknown slot
   ends the rebuild).
 
+## Whole-wave reductions as wave operations, 2026-11-23
+- The reduction of the pack's PS (and one VS) is now recognised as a whole (`recomp/reductions.rs`) and replaced
+  with wave operations, on every GPU and at both wave sizes (`docs/wave64-on-wave32.md`, "Whole-wave reductions"):
+  `s_or_saveexec -1`, `v_cndmask` of x / the op's identity by a mask within the saved EXEC, three DPP8 steps,
+  row_mirror, `v_permlanex16`, `v_readlane` 32 / 0 (wave64) or 0 (wave32), EXEC restored; min_u32 / max_u32 / or_b32.
+  The pack's DPP8 selects are not lane-xor permutations (`[2,2,0,0,6,6,4,4]`, `[4,4,4,4,0,0,0,0]` after the pair
+  step): the matcher follows the set of lanes each lane has read and asks for the whole row after the mirror.
+- Emitted: `xcl_wave_<op>(x, mask)` = the op over the mask's lanes per 16-lane row of the hardware wave
+  (`WaveActiveMin(row == k ? q : identity)`; in a PS q is first the op over the quad through quad reads – helper
+  lanes, which wave operations leave out, are in a mask taken from EXEC after `s_wqm`); from the rows sH, sT and what
+  vA / vB hold in every lane afterwards. A 64-lane wave of a wave32 program: rows 0–1 / 2–3 by `xcl_half`.
+- Census (`retail_wave_reductions_census`, ignored): wave64 VS / PS all 1 082 sites in 436 programs (min 325, max
+  322, or 435 sites); wave32 PS all 2 106 sites in 926 programs (min 588, max 588, or 930). The lane-32 constants of
+  #133 are all inside them; 110 of those programs still get the 32-lane form for spill slots. Compute / mesh keep the
+  steps (same form at 4 371 of 4 607 wave32 CS sites, 94 of 1 148 wave64 CS, 17 of 17 wave64 MS; the rest sums,
+  prefix sums, a float min / max, `v_and`).
+- `retail_wave64_graphics_lane_forms`: the native HLSL changes for exactly the 1 362 VS / PS with a reduction (the 25 336 others byte-identical – per-program digests, `XCL_FORMS_LIST`, against
+  `XCL_NO_WAVE_REDUCTIONS=1`); the other modes' 32-lane digest stays `09d45ad13eddc30d`; the 32-lane form differs
+  for 287 programs (spill slots; 613 before). DXC compiles all of them.
+- Tests on the RTX 5070 Ti: `gpu_ps_partial_wave_reductions` (wave64 and wave32; min / max / or over the odd pixels
+  and over the quads' lanes; whole target, 3 quads, 55 pixels; sT, sH, vA, vB of every pixel against a console
+  wave of the same lanes), `gpu_vs_partial_wave_reductions` (3 vertices), `reductions::tests`. Before
+  (`XCL_NO_WAVE_REDUCTIONS=1`, which gives `main`'s HLSL: digests `ac67db269b7452be` / `09d45ad13eddc30d`): every
+  partial-wave min is 0, the or over the quads' lanes of 3 quads misses two helper pixels, the VS min is 0.
+- Helper lanes (found in review): wave operations leave them out (on the RTX 5070 Ti they return 0 there), the
+  console leaves the result in every lane: in a PS each lane takes its quad's result (a helper gives the identity),
+  `gpu_ps_reduction_result_in_helper_lanes` (46 of 54 cases differed), `gpu_ps_reductions_in_branches_and_loops`.
+- Test runner: draws share one queue per device. After a test brings up the D3D12.X backend (`real::init`) its hooks
+  are on the adapter's device and the per-draw queues were not given back – the draw-heavy tests ended in
+  E_OUTOFMEMORY at CreateCommandQueue with several test threads.
+
 ## Next steps (priority)
 Little is left to do without the exe – the rest needs an actual run of the game.
 1. Once the user has a legal game exe: `xcl inspect`, `xcl run`, analysis of `report.json`

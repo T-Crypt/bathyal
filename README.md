@@ -117,6 +117,8 @@ next to `bathyal.exe`, directly next to `bathyal.exe`, in `%LOCALAPPDATA%\XCL\D3
 - **Network:** title network access is enabled by default. Use `XCL_NETWORK=0` when bringing up an
   unfamiliar title: XCL blocks its WinHTTP and Winsock traffic while keeping loopback available. This
   also prevents a title crash reporter from sending a process dump containing local paths and names.
+- **Linux:** cross-build for `x86_64-pc-windows-gnu` and run under Wine + vkd3d-proton: setup, scripts
+  and known state in [`docs/linux.md`](docs/linux.md).
 - **GPU:** developed on AMD RDNA4. The console's geometry and NGG programs run as a compute pass plus a
   mesh pass, so a GPU without mesh shaders draws none of them. On GPUs with 32-lane waves only
   (NVIDIA) console wave64 compute, geometry and mesh programs run as two 32-lane halves that exchange
@@ -157,7 +159,22 @@ bathyal rpf D:\data\shaders.rpf --extract NAME --out folder
 
 ```powershell
 .\scripts\test.ps1                         # cargo build --workspace + cargo test --workspace
+cargo bench -p xcl                          # synthetic performance benchmarks
+cargo bench -p xcl --bench core             # run one benchmark target
+.\scripts\flamegraph.ps1 -Bench gpu_cpu     # profile a benchmark target on Windows
 ```
+
+Benchmarks use generated inputs and public XCL APIs; they do not require game files or a title
+executable. Cargo stores Criterion measurements under `target/criterion`. Use `-- --save-baseline
+NAME` and `-- --baseline NAME` to compare a change with a saved local baseline.
+
+CPU flamegraphs use the external [`cargo-flamegraph`](https://github.com/flamegraph-rs/flamegraph)
+tool and the benchmark profile retains debug symbols for readable stacks. Install the tool with
+`cargo install flamegraph`, then run the wrapper above. A single Criterion case can be selected
+with `-Filter 'recompiler_translate/linear/256'`; `-Output path.svg` changes the default
+`target/flamegraphs/<bench>.svg`. The wrapper never installs software or requests elevation.
+Flamegraphs sample on-CPU work only: use PIX or WPA to investigate GPU execution, fence waits,
+lock contention, scheduling, and other off-CPU time.
 
 Unit tests, an end-to-end test with our own "console title" (`tests/testtitle`) and GPU tests
 (D3D12, SM 6.6; skipped without a GPU / DXC; `XCL_ADAPTER=1` or `XCL_ADAPTER=radeon` picks
