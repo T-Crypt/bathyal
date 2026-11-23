@@ -157,7 +157,6 @@ impl Texture {
         if width == 0 || width > 16384 || height == 0 || height > 16384 || array == 0 {
             return Err(E_INVALIDARG);
         }
-        // depth + stencil formats: a 4-byte depth plane and a 1-byte stencil plane
         // depth + stencil formats: a 4-byte depth plane (the console's D16_UNORM_S8_UINT family,
         // 118 – 120: a 2-byte one) and a 1-byte stencil plane
         // (its R16_UNORM_X8_TYPELESS view format, 119, the library lays out as a plain 2-byte

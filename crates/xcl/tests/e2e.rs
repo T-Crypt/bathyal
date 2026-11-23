@@ -73,6 +73,7 @@ fn launcher_uses_configured_exe_in_an_ambiguous_folder() {
         .arg("run")
         .arg(&game)
         .env("XCL_DATA_ROOT", &data)
+        .env("XCL_SHADER_DUMP", "1")
         .output();
     let boot = std::fs::read_to_string(title.join("cache").join("boot.json"));
     std::fs::remove_dir_all(&root).unwrap();

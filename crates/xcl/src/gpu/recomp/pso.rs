@@ -297,7 +297,79 @@ mod translated {
     }
 }
 
+fn blob_disk_key(blob: &[u8], stage: Stage, sampler_base: u32, windows: u32, split_wave64: bool) -> u64 {
+    let mut h = crate::gpu::shader::fnv64(blob);
+    h ^= stage as u64;
+    h = h.wrapping_mul(0x100_0000_01b3);
+    for b in sampler_base.to_le_bytes().into_iter().chain(windows.to_le_bytes()).chain([split_wave64 as u8]) {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100_0000_01b3);
+    }
+    h
+}
+
+/// Translation plus DXC, remembered by the console blob. The DXIL cache is keyed by the
+/// generated HLSL, so a later launch would otherwise translate every shader again just to
+/// find the file it already wrote.
+fn load_blob_compiled(key: u64) -> Option<Compiled> {
+    let bytes = std::fs::read(dxc::cache_dir().join(format!("blob-{key:016x}.xsh"))).ok()?;
+    if bytes.len() < 12 || &bytes[..4] != b"XSH1" {
+        return None;
+    }
+    let n = u32::from_le_bytes(bytes[4..8].try_into().ok()?) as usize;
+    if n > 64 {
+        return None;
+    }
+    let samplers_end = 8 + n * 17;
+    if bytes.len() < samplers_end + 32 {
+        return None;
+    }
+    let mut samplers = Vec::with_capacity(n);
+    for i in 0..n {
+        let at = 8 + i * 17;
+        let mut words = [0u32; 4];
+        for k in 0..4 {
+            words[k] = u32::from_le_bytes(bytes[at + k * 4..at + k * 4 + 4].try_into().ok()?);
+        }
+        samplers.push((words, bytes[at + 16] != 0));
+    }
+    let dxil = bytes[samplers_end..].to_vec();
+    (&dxil[..4] == b"DXBC").then_some(Compiled { dxil, samplers })
+}
+
+fn store_blob_compiled(key: u64, compiled: &Compiled) {
+    if compiled.samplers.len() > 64 || compiled.dxil.len() < 32 {
+        return;
+    }
+    let dir = dxc::cache_dir();
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    let mut body = Vec::with_capacity(8 + compiled.samplers.len() * 17 + compiled.dxil.len());
+    body.extend_from_slice(b"XSH1");
+    body.extend_from_slice(&(compiled.samplers.len() as u32).to_le_bytes());
+    for (words, comparison) in &compiled.samplers {
+        for word in words {
+            body.extend_from_slice(&word.to_le_bytes());
+        }
+        body.push(*comparison as u8);
+    }
+    body.extend_from_slice(&compiled.dxil);
+    let path = dir.join(format!("blob-{key:016x}.xsh"));
+    let tmp = path.with_extension(format!("tmp{}", std::process::id()));
+    if std::fs::write(&tmp, &body).is_ok() && std::fs::rename(&tmp, &path).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+}
+
 fn compile_console_shader(blob: &[u8], stage: Stage, sampler_base: u32, windows: u32, split_wave64: bool) -> Result<Compiled, String> {
+    let disk = cache_allowed(stage, |name| std::env::var_os(name).is_some());
+    let key = blob_disk_key(blob, stage, sampler_base, windows, split_wave64);
+    if disk {
+        if let Some(compiled) = load_blob_compiled(key) {
+            return Ok(compiled);
+        }
+    }
     let (mut t, profile) = console_translation(blob, stage, sampler_base, windows, split_wave64)?;
     if let Some([r, g, b]) = (stage == Stage::Pixel).then(|| debug_color(blob)).flatten() {
         t.hlsl = t.hlsl.replacen("    return xo;\n}", &format!("    xo.t0 = float4({r:.3}, {g:.3}, {b:.3}, 1.0);\n    return xo;\n}}"), 1);
@@ -329,7 +401,11 @@ fn compile_console_shader(blob: &[u8], stage: Stage, sampler_base: u32, windows:
         t.hlsl = t.hlsl.replacen("    if (!xcl_live) discard;\n    return xo;\n}", &format!("    xo.t0 = {expr};\n    return xo;\n}}"), 1);
     }
     let dxil = dxc::compile_cached(&t.hlsl, "main", profile)?.0;
-    Ok(Compiled { dxil, samplers: t.static_samplers })
+    let compiled = Compiled { dxil, samplers: t.static_samplers };
+    if disk {
+        store_blob_compiled(key, &compiled);
+    }
+    Ok(compiled)
 }
 
 /// Every `X_T.Sample(args)` of generated HLSL as `X_T.SampleLevel(args, 0.0f)`.
