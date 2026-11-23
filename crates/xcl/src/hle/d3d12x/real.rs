@@ -1556,6 +1556,20 @@ pub(super) fn note_title_address(res: usize, va: usize) {
     TITLE_ADDRESS.lock().unwrap().get_or_insert_with(HashMap::new).insert(res, va);
 }
 
+/// The format each texture was created with, in the title's own name: `device_x::pc_resource_desc`
+/// may have made it typeless for its views (an sRGB one with UAVs), so a shader view that names
+/// no format has to name this one.
+static TITLE_FORMAT: Mutex<Option<HashMap<usize, u32>>> = Mutex::new(None);
+
+/// The format the title created a texture with (None: not one XCL recorded).
+pub(super) fn title_format(res: usize) -> Option<u32> {
+    TITLE_FORMAT.lock().unwrap().as_ref().and_then(|m| m.get(&res).copied())
+}
+
+pub(super) fn note_title_format(res: usize, format: u32) {
+    TITLE_FORMAT.lock().unwrap().get_or_insert_with(HashMap::new).insert(res, format);
+}
+
 /// resources whose Map gave their unified-memory address (no PC mapping to undo)
 static UNMAPPABLE: Mutex<Option<HashSet<usize>>> = Mutex::new(None);
 
@@ -1934,9 +1948,10 @@ fn default_dsv(d: &D3D12_RESOURCE_DESC) -> Option<D3D12_DEPTH_STENCIL_VIEW_DESC>
     Some(v)
 }
 
-/// A shader view `v` (None: the resource's default one) of `rd` with the PC's format names
-/// (`device_x::pc_shader_view_format`) – None: as it is.
-fn pc_srv(rd: &D3D12_RESOURCE_DESC, v: Option<&D3D12_SHADER_RESOURCE_VIEW_DESC>) -> Option<D3D12_SHADER_RESOURCE_VIEW_DESC> {
+/// A shader view `v` (None: the resource's default one) of `rd`, created as the title's `created`
+/// format (`real::title_format`), with the PC's format names (`device_x::pc_shader_view_format`)
+/// – None: as it is.
+fn pc_srv(created: Option<u32>, rd: &D3D12_RESOURCE_DESC, v: Option<&D3D12_SHADER_RESOURCE_VIEW_DESC>) -> Option<D3D12_SHADER_RESOURCE_VIEW_DESC> {
     use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
     if rd.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER {
         return None;
@@ -1950,7 +1965,17 @@ fn pc_srv(rd: &D3D12_RESOURCE_DESC, v: Option<&D3D12_SHADER_RESOURCE_VIEW_DESC>)
             if !matches!(rf, 19 | 39 | 44 | 53) && !super::device_x::typeless_format(rf) {
                 return None;
             }
-            let mut v = D3D12_SHADER_RESOURCE_VIEW_DESC { Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING, ..Default::default() };
+            // the console's default view is the format the title created the texture with, not
+            // its typeless PC one (an sRGB texture with UAVs is read as sRGB); with no record of
+            // it, the family's own readable format
+            let own = created.unwrap_or(0);
+            let own = super::device_x::pc_shader_view_format(rf, own);
+            let own = if own == 0 || super::device_x::typeless_format(own) { rf } else { own };
+            let mut v = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                Format: DXGI_FORMAT(super::device_x::pc_view_format(own) as i32),
+                Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                ..Default::default()
+            };
             if rd.DepthOrArraySize > 1 {
                 v.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
                 v.Anonymous.Texture2DArray = D3D12_TEX2D_ARRAY_SRV { MipLevels: u32::MAX, ArraySize: rd.DepthOrArraySize as u32, ..Default::default() };
@@ -1966,7 +1991,7 @@ fn pc_srv(rd: &D3D12_RESOURCE_DESC, v: Option<&D3D12_SHADER_RESOURCE_VIEW_DESC>)
     }
     let f = super::device_x::pc_shader_view_format(rf, out.Format.0 as u32);
     // a typeless resource whose family has no obvious view (none of the console's): as it was
-    if f == 0 {
+    if f == 0 || super::device_x::typeless_format(f) {
         return None;
     }
     let stencil = super::device_x::stencil_view(rf, f);
@@ -1993,7 +2018,7 @@ unsafe extern "system" fn dev_create_srv_x(this: *mut c_void, res: *mut c_void, 
     }
     // a depth buffer's view in the formats the PC has for it (a D24S8 format itself, R16_UNORM of
     // a D16S8 buffer …: an invalid call, the device removed)
-    if let Some(v) = ID3D12Resource::from_raw_borrowed(&res).and_then(|r| pc_srv(&r.GetDesc(), copy.as_ref())) {
+    if let Some(v) = ID3D12Resource::from_raw_borrowed(&res).and_then(|r| pc_srv(title_format(res as usize), &r.GetDesc(), copy.as_ref())) {
         copy = Some(v);
     }
     let desc = copy.as_ref().map_or(desc, |c| c as *const _);
@@ -2172,7 +2197,7 @@ fn buffer_words_at(va: u64, format: windows::Win32::Graphics::Dxgi::Common::DXGI
 
 /// A UAV view desc `d` (None: the resource's own) of `rd` with the PC's format names
 /// (`device_x::pc_shader_view_format`, `device_x::pc_unorm_format`) – None: as it is. A resource
-/// the PC holds typeless (`pc_resource_desc`: an R9G9B9E5 target, an sRGB one with UAVs) needs a
+/// the PC holds typeless (`pc_resource_desc`: an sRGB one with UAVs) needs a
 /// typed desc of its own.
 fn pc_uav_desc(rd: &D3D12_RESOURCE_DESC, d: Option<&D3D12_UNORDERED_ACCESS_VIEW_DESC>) -> Option<D3D12_UNORDERED_ACCESS_VIEW_DESC> {
     use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
@@ -2288,7 +2313,7 @@ unsafe extern "system" fn dev_create_uav_x(this: *mut c_void, res: *mut c_void, 
             Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
             Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 { Texture2D: D3D12_TEX2D_SRV { MostDetailedMip: mip, MipLevels: 1, PlaneSlice: 0, ResourceMinLODClamp: 0.0 } },
         };
-        if let Some(v) = pc_srv(&rd, Some(&srv)) {
+        if let Some(v) = pc_srv(title_format(res as usize), &rd, Some(&srv)) {
             srv = v;
         }
         let g: unsafe extern "system" fn(*mut c_void, *mut c_void, *const D3D12_SHADER_RESOURCE_VIEW_DESC, u64) = std::mem::transmute(orig_fn(this, 18));
@@ -2336,6 +2361,7 @@ unsafe fn create_display_target(this: *mut c_void, props: usize, desc: usize, st
         return hr;
     }
     let size = crate::hle::xg::Texture::new(&x).map_or(0, |t| t.size()) as usize;
+    super::device_x::record_title_format(ppv, &x);
     let at = if size > 0 { crate::hle::kernelx::runtime_alloc(size, crate::hle::kernelx::D3D_DISPLAY_TARGET) } else { None };
     if let Some(p) = at {
         note_title_address(*ppv as usize, p);
@@ -2351,6 +2377,15 @@ unsafe fn create_display_target(this: *mut c_void, props: usize, desc: usize, st
 }
 
 unsafe extern "system" fn dev_create_committed_resource_x(this: *mut c_void, props: usize, flags: usize, desc: usize, state: usize, clear: usize, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+    let hr = create_committed_resource_inner(this, props, flags, desc, state, clear, riid, ppv);
+    // the format the title named, for a shader view of it that names none (`title_format`)
+    if hr >= 0 && desc != 0 && crate::gpu::shader::readable(desc, 0x38) {
+        super::device_x::record_title_format(ppv, &(desc as *const [u8; 0x38]).read_unaligned());
+    }
+    hr
+}
+
+unsafe fn create_committed_resource_inner(this: *mut c_void, props: usize, flags: usize, desc: usize, state: usize, clear: usize, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
     static SEEN: AtomicU64 = AtomicU64::new(0);
     if desc != 0 && std::env::var_os("XCL_D3D12_TRACE").is_some() && SEEN.fetch_add(1, Ordering::Relaxed) < 8 {
         let w = |o: usize| *((desc + o) as *const u32);
@@ -4663,7 +4698,7 @@ unsafe extern "system" fn dev_create_root_signature(this: *mut c_void, mask: u32
 // ---------------------------------------------------------------------------------------
 
 /// The view a render target view without a description has, for a texture `pc_resource_desc`
-/// made typeless (an sRGB one with UAVs, an R9G9B9E5 target) – None: the resource's format is
+/// made typeless (an sRGB one with UAVs) – None: the resource's format is
 /// a typed one.
 fn default_rtv(d: &D3D12_RESOURCE_DESC) -> Option<D3D12_RENDER_TARGET_VIEW_DESC> {
     use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
@@ -5593,9 +5628,9 @@ mod typeless_uav_view_tests {
         }
     }
 
-    /// A resource the PC holds typeless (an sRGB texture with UAVs, an R9G9B9E5 target) gets a
-    /// typed UAV desc: the sRGB one's UNORM for shaders that write values, the shared-exponent
-    /// one's R32_FLOAT or, as the console names it, R32_UINT for the packed 32 bits.
+    /// A resource the PC holds typeless (an sRGB texture with UAVs, a depth buffer) gets a typed
+    /// UAV desc: the sRGB one's UNORM for shaders that write values. An R9G9B9E5 target the PC
+    /// holds as half floats keeps the title's view format as its UAV.
     #[test]
     fn typeless_resources_get_typed_uav_descs() {
         // sRGB typeless: a named sRGB view becomes UNORM, keeping its mip
@@ -5609,29 +5644,30 @@ mod typeless_uav_view_tests {
         assert_eq!((v.Format.0, v.ViewDimension.0), (28, D3D12_UAV_DIMENSION_TEXTURE2DARRAY.0));
         assert_eq!(unsafe { v.Anonymous.Texture2DArray }.ArraySize, 3);
 
-        // R9G9B9E5 typeless: floats for the console format, the packed bits' format as named
-        assert_eq!(pc_uav_desc(&rd(39, 1), Some(&uav(67, 0))).map(|v| v.Format.0), Some(41));
-        assert_eq!(pc_uav_desc(&rd(39, 1), None).map(|v| v.Format.0), Some(41));
-        assert!(pc_uav_desc(&rd(39, 1), Some(&uav(42, 0))).is_none(), "R32_UINT stays R32_UINT");
+        // an R9G9B9E5 target the PC holds as half floats: the console's view is half floats too
+        assert_eq!(pc_uav_desc(&rd(10, 1), Some(&uav(67, 0))).map(|v| v.Format.0), Some(10));
+        assert_eq!(pc_uav_desc(&rd(10, 1), None).map(|v| v.Format.0), Some(10));
 
         // a resource that is its own typed format is left as the title made it
         assert!(pc_uav_desc(&rd(28, 1), Some(&uav(28, 0))).is_none());
         assert!(pc_uav_desc(&rd(28, 1), None).is_none());
         assert!(pc_uav_desc(&rd(67, 1), Some(&uav(67, 0))).is_none(), "a sampled R9G9B9E5 texture");
 
-        // an SRV of a typeless sRGB resource: its own view is the sRGB one
-        let s = pc_srv(&rd(27, 1), None).expect("the sRGB texture's own SRV");
+        // an SRV of a typeless sRGB resource: its own view is the sRGB one, by the format the
+        // title created it with and, with none recorded, by its family's
+        let s = pc_srv(Some(29), &rd(27, 1), None).expect("the sRGB texture's own SRV");
         assert_eq!((s.Format.0, s.ViewDimension.0), (29, D3D12_SRV_DIMENSION_TEXTURE2D.0));
-        let s = pc_srv(&rd(39, 1), None).expect("an R32_TYPELESS texture's own SRV");
+        let s = pc_srv(None, &rd(27, 1), None).expect("the sRGB texture's own SRV, unrecorded");
+        assert_eq!(s.Format.0, 29);
+        let s = pc_srv(None, &rd(39, 1), None).expect("an R32_TYPELESS texture's own SRV");
         assert_eq!(s.Format.0, 41);
-        assert!(pc_srv(&rd(28, 1), None).is_none());
+        assert!(pc_srv(None, &rd(28, 1), None).is_none());
+        assert!(pc_srv(None, &rd(27, 1), Some(&D3D12_SHADER_RESOURCE_VIEW_DESC { Format: DXGI_FORMAT(27), ..Default::default() })).is_none(), "a typeless SRV format is not one the PC takes");
 
         // the same for an RTV and, with no description, a view of the console's own format
         let r = default_rtv(&rd(27, 1)).expect("the sRGB texture's own RTV");
         assert_eq!((r.Format.0, r.ViewDimension.0), (29, D3D12_RTV_DIMENSION_TEXTURE2D.0));
-        let r = default_rtv(&rd(39, 3)).expect("the R9G9B9E5 target's own RTV");
-        assert_eq!((r.Format.0, r.ViewDimension.0), (41, D3D12_RTV_DIMENSION_TEXTURE2DARRAY.0));
-        assert_eq!(unsafe { r.Anonymous.Texture2DArray }.ArraySize, 3);
+        assert!(default_rtv(&rd(10, 1)).is_none(), "the half floats are the resource's own format");
         assert!(default_rtv(&rd(28, 1)).is_none());
         assert!(default_rtv(&rd(44, 1)).is_none(), "a depth buffer's views name it");
     }
