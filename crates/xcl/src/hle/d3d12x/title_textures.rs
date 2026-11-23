@@ -349,6 +349,88 @@ pub(super) unsafe fn refresh(queue: *mut c_void) {
     own_work(|| refresh_once(queue));
 }
 
+/// The write-watch ranges split into at most `WATCH_THREADS` parts of about equal size, or one
+/// part when the set is small enough that threads would cost more than they save.
+fn watch_parts(ranges: &[(usize, usize)]) -> Vec<Vec<(usize, usize)>> {
+    const MIN_PARALLEL: usize = 256 << 20;
+    let total: usize = ranges.iter().map(|r| r.1).sum();
+    if ranges.len() < 2 || total < MIN_PARALLEL || watch_threads() < 2 {
+        return vec![ranges.to_vec()];
+    }
+    let k = watch_threads().min(ranges.len());
+    let share = total.div_ceil(k);
+    let mut parts: Vec<Vec<(usize, usize)>> = vec![Vec::new()];
+    let mut acc = 0usize;
+    for &r in ranges {
+        if acc >= share && parts.len() < k {
+            parts.push(Vec::new());
+            acc = 0;
+        }
+        parts.last_mut().unwrap().push(r);
+        acc += r.1;
+    }
+    parts
+}
+
+/// `XCL_WATCH_THREADS` (default 8, 1 = the serial loop): threads that read the write-watch.
+fn watch_threads() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| std::env::var("XCL_WATCH_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(8).clamp(1, 32))
+}
+
+/// GetWriteWatch with reset over `ranges`: every written page's address goes to `dirty`.
+unsafe fn watch_into(ranges: &[(usize, usize)], buf: &mut Vec<*mut c_void>, dirty: &mut Vec<usize>, page: &mut u32) {
+    if buf.len() < 16384 {
+        buf.resize(16384, std::ptr::null_mut());
+    }
+    for &(base, size) in ranges {
+        loop {
+            let mut n = buf.len();
+            if GetWriteWatch(WRITE_WATCH_FLAG_RESET, base as *const c_void, size, buf.as_mut_ptr(), &mut n, page) != 0 {
+                break;
+            }
+            dirty.extend(buf[..n].iter().map(|&p| p as usize));
+            if n < buf.len() {
+                break;
+            }
+        }
+    }
+}
+
+type WatchJob = (Vec<(usize, usize)>, std::sync::mpsc::Sender<(Vec<usize>, u32)>);
+
+/// The write-watch threads: a shared queue of jobs, each answered with (dirty pages, granularity).
+struct WatchPool(Mutex<std::sync::mpsc::Sender<WatchJob>>);
+
+impl WatchPool {
+    fn send(&self, job: WatchJob) {
+        let _ = self.0.lock().unwrap().send(job);
+    }
+}
+
+fn watch_pool() -> &'static WatchPool {
+    static POOL: std::sync::OnceLock<WatchPool> = std::sync::OnceLock::new();
+    POOL.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel::<WatchJob>();
+        let rx = Arc::new(Mutex::new(rx));
+        for i in 0..watch_threads() {
+            let rx = Arc::clone(&rx);
+            let _ = std::thread::Builder::new().name(format!("xcl-watch-{i}")).spawn(move || {
+                let mut buf: Vec<*mut c_void> = Vec::new();
+                loop {
+                    let job = rx.lock().unwrap().recv();
+                    let Ok((ranges, reply)) = job else { return };
+                    let mut found = Vec::new();
+                    let mut page = 0u32;
+                    unsafe { watch_into(&ranges, &mut buf, &mut found, &mut page) };
+                    let _ = reply.send((found, page));
+                }
+            });
+        }
+        WatchPool(Mutex::new(tx))
+    })
+}
+
 unsafe fn refresh_once(queue: *mut c_void) {
     let Some(u) = crate::gpu::uma::get() else { return };
     let sparse = u.has_sparse();
@@ -361,24 +443,30 @@ unsafe fn refresh_once(queue: *mut c_void) {
     let dirty_len = DIRTY_BUF.with(|dcell| {
         let mut dirty = dcell.borrow_mut();
         dirty.clear();
-        WATCH_BUF.with(|wcell| {
-            let mut buf = wcell.borrow_mut();
-            if buf.len() < 16384 {
-                buf.resize(16384, std::ptr::null_mut());
+        let parts = watch_parts(&ranges);
+        if parts.len() <= 1 {
+            WATCH_BUF.with(|wcell| watch_into(&ranges, &mut wcell.borrow_mut(), &mut dirty, &mut page));
+        } else {
+            // Large watched sets: GetWriteWatch walks every page of a range in the kernel, one
+            // range after another, and that walk held the title's submitting thread for most of
+            // its frame. The ranges are split over a pool of long-lived threads (created once,
+            // so the title's per-thread setup runs only for them); each range is still read and
+            // reset by exactly one call, so the dirty set is the same as the serial loop's.
+            let (tx, rx) = std::sync::mpsc::channel();
+            let n = parts.len();
+            for part in parts {
+                watch_pool().send((part, tx.clone()));
             }
-            for &(base, size) in ranges.iter() {
-                loop {
-                    let mut n = buf.len();
-                    if GetWriteWatch(WRITE_WATCH_FLAG_RESET, base as *const c_void, size, buf.as_mut_ptr(), &mut n, &mut page) != 0 {
-                        break;
-                    }
-                    dirty.extend(buf[..n].iter().map(|&p| p as usize));
-                    if n < buf.len() {
-                        break;
+            drop(tx);
+            for _ in 0..n {
+                if let Ok((found, g)) = rx.recv() {
+                    dirty.extend(found);
+                    if g != 0 {
+                        page = g;
                     }
                 }
             }
-        });
+        }
         dirty.sort_unstable();
         dirty.len()
     });
@@ -793,5 +881,21 @@ mod tests {
         // ranges a gap of under 1 MiB apart: one scan; further apart: two
         let wanted = vec![(0x1000_0000, 0x1000_1000), (0x1008_0000, 0x1008_1000), (0x1100_0000, 0x1100_1000)];
         assert_eq!(watch_ranges(&regions, wanted), vec![(0x1000_0000, 0x8_1000), (0x1100_0000, 0x1000)]);
+    }
+}
+
+#[cfg(test)]
+mod watch_parts_tests {
+    use super::watch_parts;
+
+    #[test]
+    fn small_sets_stay_serial_and_large_ones_split_without_losing_a_range() {
+        let small = vec![(0x1000usize, 0x10000usize), (0x20000, 0x10000)];
+        assert_eq!(watch_parts(&small), vec![small.clone()]);
+        let big: Vec<(usize, usize)> = (0..40).map(|i| (0x1_0000_0000 + i * (64 << 20), 64 << 20)).collect();
+        let parts = watch_parts(&big);
+        assert!(parts.len() > 1 && parts.len() <= 8, "{} parts", parts.len());
+        let flat: Vec<(usize, usize)> = parts.concat();
+        assert_eq!(flat, big, "every range exactly once, in order");
     }
 }
