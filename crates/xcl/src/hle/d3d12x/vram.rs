@@ -539,7 +539,8 @@ static COMMITTED: Mutex<Option<std::collections::HashMap<usize, usize>>> = Mutex
 /// A placed texture got a committed PC copy of its own (`bytes`: what the driver gave it).
 pub(super) unsafe fn note_committed_texture(this: *mut c_void, resource: usize) {
     let Some(dev) = ID3D12Device::from_raw_borrowed(&this) else { return };
-    let Some(r) = ID3D12Resource::from_raw_borrowed(&resource) else { return };
+    let raw = resource as *mut c_void;
+    let Some(r) = ID3D12Resource::from_raw_borrowed(&raw) else { return };
     let desc = r.GetDesc();
     let bytes = dev.GetResourceAllocationInfo(0, &[desc]).SizeInBytes as usize;
     if bytes == 0 || bytes == usize::MAX {
