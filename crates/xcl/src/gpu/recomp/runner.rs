@@ -1248,6 +1248,7 @@ fn run_in_region(dxil: &[u8], state: &KernelState, arena: &Arena) -> Result<Kern
                 dev.CreatePlacedResource(&heap, 0, &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut b).map_err(|x| format!("CreatePlacedResource: {x}"))?;
                 bufs.push(b.ok_or("arena")?);
             }
+            let mem_buf = bufs[0].clone();
             let pso: ID3D12PipelineState = dev
                 .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
                     pRootSignature: transmute_copy(&gpu.rs),
@@ -1276,12 +1277,30 @@ fn run_in_region(dxil: &[u8], state: &KernelState, arena: &Arena) -> Result<Kern
             list.ResourceBarrier(&before);
             // the heaps the directly indexed root signature expects (as in `dispatch_with`)
             let _bound = bind_resources(dev, &list, &[], &[])?;
+            // the windows as raw UAVs at MEM_HEAP_BASE.. of a shader-visible heap
+            // (`Options::heap_windows`; programs built with the root-UAV switch ignore it)
+            let dh: ID3D12DescriptorHeap = dev
+                .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                    NumDescriptors: super::MEM_HEAP_BASE + 4,
+                    Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                    NodeMask: 0,
+                })
+                .map_err(werr)?;
+            let inc = dev.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) as usize;
+            for k in 0..ARENA_MAX_WINDOWS {
+                let (b, size) = bufs.get(k).map_or((&mem_buf, arena.windows[0].1), |b| (b, arena.windows[k].1));
+                let mut h = dh.GetCPUDescriptorHandleForHeapStart();
+                h.ptr += (super::MEM_HEAP_BASE as usize + k) * inc;
+                dev.CreateUnorderedAccessView(b, None::<&ID3D12Resource>, Some(&raw_window_uav(size as u64)), h);
+            }
+            list.SetDescriptorHeaps(&[Some(dh.clone())]);
             list.SetComputeRootSignature(&gpu.rs);
             list.SetComputeRootUnorderedAccessView(0, io_buf.GetGPUVirtualAddress());
             list.SetComputeRootUnorderedAccessView(1, res_buf.GetGPUVirtualAddress());
             // u2..: one root UAV per window; unused slots repeat the first window
             for k in 0..ARENA_MAX_WINDOWS {
-                list.SetComputeRootUnorderedAccessView(2 + k as u32, bufs.get(k).unwrap_or(&bufs[0]).GetGPUVirtualAddress());
+                list.SetComputeRootUnorderedAccessView(2 + k as u32, bufs.get(k).unwrap_or(&mem_buf).GetGPUVirtualAddress());
             }
             list.Dispatch(1, 1, 1);
             let mut after = vec![transition(&res_buf, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE)];
@@ -1301,6 +1320,23 @@ fn run_in_region(dxil: &[u8], state: &KernelState, arena: &Arena) -> Result<Kern
             Ok(KernelResult { sgpr: raw[..KERNEL_SGPRS].to_vec(), vgpr, scc: raw[KERNEL_SCC_SLOT], raw, mem: Vec::new(), textures: Vec::new() })
         }
     })
+}
+}
+
+/// A raw UAV of a memory window of `bytes` (`Options::heap_windows`): at most 2^30 − 1 dwords,
+/// the largest byte size a 32-bit field holds (AMD's V# NUM_RECORDS). The sparse windows hand
+/// out their last 64 KiB tile – a view of 4 GiB − 64 KiB left it unreachable (zeros, dropped
+/// stores); this one misses only the window's last dword. On an RTX 3090 a view of exactly 2^30
+/// dwords works too (`aperture_tests::e1c_window_view_last_tile`); AMD is not measured.
+pub fn raw_window_uav(bytes: u64) -> D3D12_UNORDERED_ACCESS_VIEW_DESC {
+    let bytes = bytes.min((1u64 << 32) - 4);
+    D3D12_UNORDERED_ACCESS_VIEW_DESC {
+        Format: DXGI_FORMAT_R32_TYPELESS,
+        ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+        Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+            Buffer: D3D12_BUFFER_UAV { FirstElement: 0, NumElements: (bytes / 4) as u32, StructureByteStride: 0, CounterOffsetInBytes: 0, Flags: D3D12_BUFFER_UAV_FLAG_RAW },
+        },
+    }
 }
 
 /// Create a committed resource from a description (validation of decoded descriptors).
@@ -1399,7 +1435,25 @@ fn dispatch_with(
             transition(&mem_buf, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
             transition(&res_buf, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
         ]);
-        let _bound = bind_resources(dev, &list, &[], &[])?;
+        let bound = bind_resources(dev, &list, &[], &[])?;
+        // A PSO built by the backend's hook uses the runtime's window count: with heap windows
+        // (`Options::heap_windows`) its accesses go to ResourceDescriptorHeap[MEM_HEAP_BASE + w],
+        // so every window slot is a raw view of `mem` (no textures here to share the heap with).
+        let dh: ID3D12DescriptorHeap = dev
+            .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                NumDescriptors: super::MEM_HEAP_BASE + 4,
+                Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                NodeMask: 0,
+            })
+            .map_err(werr)?;
+        let inc = dev.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) as usize;
+        for k in 0..4usize {
+            let mut h = dh.GetCPUDescriptorHandleForHeapStart();
+            h.ptr += (super::MEM_HEAP_BASE as usize + k) * inc;
+            dev.CreateUnorderedAccessView(&mem_buf, None::<&ID3D12Resource>, Some(&raw_window_uav(mem_bytes)), h);
+        }
+        list.SetDescriptorHeaps(&[Some(dh.clone()), Some(bound._heaps[1].clone())]);
         list.SetComputeRootSignature(rs);
         list.SetComputeRootUnorderedAccessView(0, io_buf.GetGPUVirtualAddress());
         list.SetComputeRootUnorderedAccessView(1, res_buf.GetGPUVirtualAddress());
