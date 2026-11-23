@@ -1415,7 +1415,12 @@ of the title (it writes to address 0 after a failed D3D12 call: `call 0x14068c76
   call; it stays 2 s after the last one). XDefiant from an empty cache: ~1750 shaders in ~2 min 15 s. Before,
   `dxc::wait_for_memory` held each compile up to a minute while less than 6 GB of commit was left, and with
   XDefiant's own ~10 GB committed only ~4 GB were: its last ~160 shaders came a few a minute (it looked hung at
-  ~1600). Now a compile goes at once with 6 GB left, else alone (one at a time). After a cold-cache run
+  ~1600). Now a compile goes at once with 6 GB left, else alone (one at a time). Since 2026-11-23: at once while
+  commit covers 6 GB + 300 MB per running compile (their current use is already out of the available commit, so only
+  their growth is reserved; #113 reserved 1 GB each on top: with 8.1 GB free, Minecraft's 716 programs, 15 threads,
+  12.7–15.2 s → 6.4–6.7 s, 5.3–5.6 s with no gate); the count only rises from the value a decision saw (no burst on
+  one reading); after a minute's wait one compile per minute goes in regardless (it was every waiting one); waiters
+  wake when a compile ends (`may_start`, `gate_tests`). Driver PSO compiles are still not gated. After a cold-cache run
   XDefiant's logo / UI text was missing at times. Cold-cache runs (empty `XCL_DXIL_CACHE`, 1 756 shaders) show
   the logo at ~70 s and the text ~15 s later, by themselves; draws wait for pipelines still being built
   (`resolve_wait` in `bind::graphics_bound`, 0 draws with stand-ins). The text missing for good (also warm) on
@@ -1626,7 +1631,7 @@ of the title (it writes to address 0 after a failed D3D12 call: `call 0x14068c76
 - **Ending a run without a stuck process**: a host killed from outside with GPU work in flight stayed in the driver
   holding 12–16 GB. `XCL_RUN_SECONDS=n` ends the title itself: every fence the title created is signalled to the
   maximum (GPU waits on future values complete), the queues drain, then TerminateProcess (`real::end_title`). Shader
-  compiles: at most 6 at once and they wait while the system has < 6 GB of commit left (`dxc::wait_for_memory`).
+  compiles: `dxc::compile_threads` at once, gated by commit left (`dxc::wait_for_memory`).
 - **Window**: titles create their window with CreateWindowExA / RegisterClassExA but DefWindowProcW (its title showed
   as CJK characters); `hle::user` makes them Unicode calls. The window stays white (console titles never paint it).
 - Diagnostics: `XCL_TRACE_FRAME=1` (what console code does with each presented resource; render-target binds, UAV
@@ -1720,7 +1725,7 @@ of the title (it writes to address 0 after a failed D3D12 call: `call 0x14068c76
 - Not exact yet, on every GPU: whole-wave code in a partial wave reads lanes the PC never launched (the console's
   inactive lanes run it). Measured on the 5070 Ti: such lanes read 0 – a min reduction (identity -1) gives 0 in a
   3-quad wave, max / or / sum are right. 325 of the 436 reduction programs have a min reduction. Needs the reduction
-  recognised as a whole (`docs/wave64-on-wave32.md`, "Vertex and pixel shaders").
+  recognised as a whole (`docs/wave64-on-wave32.md`, "Vertex and pixel shaders"). Done next (below).
 - Merged as PR #133. On the RX 9070 (64-lane waves) the native-form digest of the 26 698 programs equals `main`'s (the
   forms test run on both); the three GPU tests pass, also with `XCL_SPLIT_WAVE64=1`; XDefiant and Minecraft run with
   and without `XCL_SPLIT_WAVE64=1` (the forced split form starts with a cold shader cache: XDefiant black while compiling).
@@ -1820,7 +1825,9 @@ right after its first `CreateShaderResourceView` (the first descriptor written i
 the Zen 2 instructions such a CPU lacks – `clwb` (Intel: Ice Lake+), `clzero`, `rdpru`, `monitorx` / `mwaitx`
 (AMD only), `rdpid` – and the vectored handler (`eh::emulate_console_only`) emulates them and steps over
 (`clwb` / `monitorx` / `mwaitx`: nothing, the PC's memory is coherent; `clzero`: 64 zero bytes at rAX; `rdpru`:
-QueryPerformanceCounter; `rdpid`: the processor number). Logged once per instruction. Any other illegal instruction
+QueryPerformanceCounter; `rdpid`: the processor number). SSE4a (AMD only): `extrq` / `insertq` on the exception's
+XMM registers, `movntss` / `movntsd` as a plain store of the low dword / quadword (fs / gs-relative ones are not
+emulated). Logged once per instruction. Any other illegal instruction
 (and `ud2`, a title's own trap) is logged with its 16 code bytes, in the first-chance handler and in the crash line.
 SHA-NI is not emulated (also missing on those CPUs): add it if a title's code bytes show `0F 38 C8..CD`.
 
@@ -1836,6 +1843,87 @@ SHA-NI is not emulated (also missing on those CPUs): add it if a title's code by
   size at every submit; a page guard (read-only until the first CPU write, `kernelx::lazy`) was tried and reverted
   pending measurement past the menus.
 
+## Console CPU instructions the PC lacks (2026-11-23)
+A title on an Intel CPU before Ice Lake / Alder Lake dies with 0xC000001D (illegal instruction) in its own code
+right after its first `CreateShaderResourceView` (the first descriptor written into title memory). `insn.rs` decodes
+the Zen 2 instructions such a CPU lacks – `clwb` (Intel: Ice Lake+), `clzero`, `rdpru`, `monitorx` / `mwaitx`
+(AMD only), `rdpid` – and the vectored handler (`eh::emulate_console_only`) emulates them and steps over
+(`clwb` / `monitorx` / `mwaitx`: nothing, the PC's memory is coherent; `clzero`: 64 zero bytes at rAX; `rdpru`:
+QueryPerformanceCounter; `rdpid`: the processor number). Logged once per instruction. Any other illegal instruction
+(and `ud2`, a title's own trap) is logged with its 16 code bytes, in the first-chance handler and in the crash line.
+SHA-NI is not emulated (also missing on those CPUs): add it if a title's code bytes show `0F 38 C8..CD`.
+- With both emulated a title shows its first frame on an i5/i7 Coffee Lake + RTX 3060 too (`first game frame
+  shown (3840x2160)`), then dies on an assert right after `chad.dll!XDspConnectWithMaximumStreamLimit` returned the
+  stub's E_NOTIMPL. `chad.dll` (the console's audio DSP offload, `XDsp*`) is routed to `acphal` now: every XDsp
+  function is acknowledged (S_OK; Connect writes a fake handle into its last pointer argument – the signatures are not
+  published, the first call of each is logged with its arguments). `XCL_TRACE_IMPORTS=chad` traces stubs named by
+  prefix too (arguments and result), for the next unknown DLL.
+
+## The memory wall, and the texture computer's slot 10 (2026-11-23)
+With chad.dll acknowledged the title on the i5/i7 + RTX 3060 (32 GB) runs far past its first frame (local user,
+~2000 graphics pipelines, mesh shaders, the video-memory arena), then dies writing to address 0 in its thread start-up
+code (`+0x2215c35`, `rbx = rbp = 0`) – a path every other thread took. Its own crash reporter says why: `memory.load_percent
+84`, `system.memory.swap.free 801176` of `48801508` KB. The page file (48 GB) is full, the commit charge about 75 GB; the
+three `graphics PSO rejected (0x8007000e)` just before are the driver's E_OUTOFMEMORY. An allocation returned NULL.
+- `memstat.rs`: one line, `memory: process commit … (working set …); system commit … of …, … of RAM free (… % load);
+  video … of … local, … of … shared; the title asked for graphics …, Windows …, heaps …, physical pages …; sparse windows
+  … tiles (…) in … pools`, logged at every crash (`eh::unhandled_filter`), when the process ends with an error, and from
+  a thread whenever the process's commit grew by a GiB (every 30 s at most). "The title asked for" are gross counters
+  (`memstat::note` in kernelx's commit paths: sparse / UMA graphics memory, Windows commits, XMemAlloc heaps, the
+  homes of physical pages); video memory is `IDXGIAdapter3::QueryVideoMemoryInfo` (local, and the non-local segment:
+  system memory the driver spills into when the pools of title memory outgrow the card – on a 12 GB card every GiB of
+  title memory beyond it costs a second GiB of commit). The next run says whose memory it is.
+- The crash line has the code bytes at RIP for every exception now (`(code bytes: …)`), not only illegal instructions.
+- `xg_xs.dll` of a GDK (an older one: no `XGSuggestSwizzleMode`), disassembled: `XGCreateTextureComputer` is
+  `(desc, out)` → the factory at `+0x5dd0`; the computer's vtable (at `+0x50b68`, referenced from `+0x1852`) has 13 slots.
+  #10 is **GetResourceTiling** – `ID3D12Device::GetResourceTiling`'s six arguments, for the computer's resource: it reads
+  `*pNumSubresourceTilings`, writes a `D3D12_PACKED_MIP_INFO` (12 bytes), a `D3D12_TILE_SHAPE` (12), `D3D12_SUBRESOURCE_TILING`s
+  (12 each, indexed by D3D12 subresource skipping the packed levels). E_FAIL "Resource does not have a 64KB swizzle mode
+  compatible with tiled resources" unless the mode is 8–11 / 16–19 / 24–27; E_NOTIMPL "Texture1D and Texture3D is not
+  implemented yet"; the standard tile in elements by their size (256×256 … 64×64 for 1 … 16 bytes, halved per MSAA
+  doubling), reported in texels; a level's tiling is its padded size over the tile, its start tile the level's offset
+  in 64 KiB tiles plus the slice's; the packed levels one tile at the first one's offset. `xg::get_resource_tiling`
+  does this (test `resource_tiling_of_a_64kb_texture`). The guess merged from ivall/xcl#169 (GetSubresourceLayout /
+  Offset, sniffing which arguments are pointers) is gone: with the real arguments it answered E_INVALIDARG by luck (the
+  "plane" was the low half of a pointer) and would have written 0x70 bytes over a 12-byte tile shape otherwise.
+  #11 is `GetDescriptor(UINT plane, void* descriptor)`: "pDescriptor cannot be NULL", "PlaneIndex must be less than 3",
+  copies the plane's 32-byte hardware texture descriptor (not modelled, still a stub). #12 returns a flag byte of the
+  resource (bit 27 of a dword at `+0x2818`). A title's texture streaming calls #10 for every texture it places in a
+  tiled pool (179 calls in one run).
+- Scripts for the DLL (in the session's scratch, not the repo): a PE reader (`fo(va)`, `q(va)`), a scan of `.rdata` for
+  runs of code pointers (vtables), `x86_64-w64-mingw32-objdump -d -M intel --start-address … --stop-address …`.
+
+## Whole-wave reductions as wave operations, 2026-11-23
+- The reduction of the pack's PS (and one VS) is now recognised as a whole (`recomp/reductions.rs`) and replaced
+  with wave operations, on every GPU and at both wave sizes (`docs/wave64-on-wave32.md`, "Whole-wave reductions"):
+  `s_or_saveexec -1`, `v_cndmask` of x / the op's identity by a mask within the saved EXEC, three DPP8 steps,
+  row_mirror, `v_permlanex16`, `v_readlane` 32 / 0 (wave64) or 0 (wave32), EXEC restored; min_u32 / max_u32 / or_b32.
+  The pack's DPP8 selects are not lane-xor permutations (`[2,2,0,0,6,6,4,4]`, `[4,4,4,4,0,0,0,0]` after the pair
+  step): the matcher follows the set of lanes each lane has read and asks for the whole row after the mirror.
+- Emitted: `xcl_wave_<op>(x, mask)` = the op over the mask's lanes per 16-lane row of the hardware wave
+  (`WaveActiveMin(row == k ? q : identity)`; in a PS q is first the op over the quad through quad reads – helper
+  lanes, which wave operations leave out, are in a mask taken from EXEC after `s_wqm`); from the rows sH, sT and what
+  vA / vB hold in every lane afterwards. A 64-lane wave of a wave32 program: rows 0–1 / 2–3 by `xcl_half`.
+- Census (`retail_wave_reductions_census`, ignored): wave64 VS / PS all 1 082 sites in 436 programs (min 325, max
+  322, or 435 sites); wave32 PS all 2 106 sites in 926 programs (min 588, max 588, or 930). The lane-32 constants of
+  #133 are all inside them; 110 of those programs still get the 32-lane form for spill slots. Compute / mesh keep the
+  steps (same form at 4 371 of 4 607 wave32 CS sites, 94 of 1 148 wave64 CS, 17 of 17 wave64 MS; the rest sums,
+  prefix sums, a float min / max, `v_and`).
+- `retail_wave64_graphics_lane_forms`: the native HLSL changes for exactly the 1 362 VS / PS with a reduction (the 25 336 others byte-identical – per-program digests, `XCL_FORMS_LIST`, against
+  `XCL_NO_WAVE_REDUCTIONS=1`); the other modes' 32-lane digest stays `09d45ad13eddc30d`; the 32-lane form differs
+  for 287 programs (spill slots; 613 before). DXC compiles all of them.
+- Tests on the RTX 5070 Ti: `gpu_ps_partial_wave_reductions` (wave64 and wave32; min / max / or over the odd pixels
+  and over the quads' lanes; whole target, 3 quads, 55 pixels; sT, sH, vA, vB of every pixel against a console
+  wave of the same lanes), `gpu_vs_partial_wave_reductions` (3 vertices), `reductions::tests`. Before
+  (`XCL_NO_WAVE_REDUCTIONS=1`, which gives `main`'s HLSL: digests `ac67db269b7452be` / `09d45ad13eddc30d`): every
+  partial-wave min is 0, the or over the quads' lanes of 3 quads misses two helper pixels, the VS min is 0.
+- Helper lanes (found in review): wave operations leave them out (on the RTX 5070 Ti they return 0 there), the
+  console leaves the result in every lane: in a PS each lane takes its quad's result (a helper gives the identity),
+  `gpu_ps_reduction_result_in_helper_lanes` (46 of 54 cases differed), `gpu_ps_reductions_in_branches_and_loops`.
+- Test runner: draws share one queue per device. After a test brings up the D3D12.X backend (`real::init`) its hooks
+  are on the adapter's device and the per-draw queues were not given back – the draw-heavy tests ended in
+  E_OUTOFMEMORY at CreateCommandQueue with several test threads.
+
 ## Next steps (priority)
 Little is left to do without the exe – the rest needs an actual run of the game.
 1. Once the user has a legal game exe: `xcl inspect`, `xcl run`, analysis of `report.json`
@@ -1849,6 +1937,6 @@ Little is left to do without the exe – the rest needs an actual run of the gam
    pipe/packer configuration for the _X modes (`texture::CONSOLE_PIPES`), MSAA.
 4. Audio: Opus is decoded (0x704F voices); with the exe check how the title feeds it (voice format, buffer framing, or a
    console API); XMA2 low priority (the game has none).
-5. Smaller: whole-wave reductions in partial waves (325 PS with a min reduction, every GPU), `image_sample_o` with an offset from a VGPR,
+5. Smaller: whole-wave reductions of compute / mesh programs in partial waves (VS / PS done), `image_sample_o` with an offset from a VGPR,
    smaller HLSL, further XGameRuntime APIs (XGameUI, XNetworking…), GameInput → system GameInput.dll,
    mapping physical pages at the game's address.

@@ -33,7 +33,7 @@ use windows_sys::core::GUID;
 
 use super::layout::{self, Iface};
 use crate::stubs;
-use crate::util::{HRESULT, E_INVALIDARG, E_NOINTERFACE, S_FALSE, S_OK};
+use crate::util::{HRESULT, E_INVALIDARG, E_NOINTERFACE, E_OUTOFMEMORY, S_FALSE, S_OK};
 
 const DLL: &str = "d3d12_xs.dll";
 const EXTRA_SLOTS: usize = 64;
@@ -359,6 +359,13 @@ unsafe fn open_uma(device: &ID3D12Device) {
         w0_va
     );
     *UMA_HEAPS.lock().unwrap() = heaps;
+    // shaders take the windows from the shared descriptor heap (`pso::heap_windows`)
+    if n > 1 && crate::gpu::recomp::pso::heap_windows() {
+        let views: Vec<(usize, usize)> = bufs.iter().enumerate().map(|(k, b)| (b.0, u.window(k).1)).collect();
+        if super::console_heap::set_window_views(device, &views) {
+            crate::xlog_info!("D3D12.X: memory windows from the shared descriptor heap (no per-access switch)");
+        }
+    }
     *UMA_BUFFER.lock().unwrap() = bufs;
 }
 
@@ -404,8 +411,17 @@ pub fn stats() -> D3d12Stats {
 
 static DEVICE: AtomicUsize = AtomicUsize::new(0);
 
+/// The backend device runs on a software adapter (WARP or the Basic Render Driver).
+static SOFTWARE_ADAPTER: AtomicBool = AtomicBool::new(false);
+
 pub fn device_raw() -> *mut c_void {
     DEVICE.load(Ordering::Acquire) as *mut c_void
+}
+
+/// Whether the backend device is a software renderer: it draws, but it has no sparse
+/// reservations, real mesh pipeline or 4 GiB aperture, so tests that check those skip.
+pub fn software_adapter() -> bool {
+    SOFTWARE_ADAPTER.load(Ordering::Relaxed)
 }
 
 /// The process's video memory on the device's adapter: (local, non-local) bytes in use.
@@ -510,6 +526,7 @@ pub fn init() -> Result<String, String> {
                 if let Ok(dev) = crate::gpu::agility::create_device(&adapter, D3D_FEATURE_LEVEL_12_0) {
                     device = Some(dev);
                     name = format!("{} ({} MiB VRAM)", crate::gpu::adapter::name(&desc), desc.DedicatedVideoMemory >> 20);
+                    SOFTWARE_ADAPTER.store(crate::gpu::adapter::software(&desc), Ordering::Relaxed);
                     break;
                 }
             }
@@ -521,6 +538,7 @@ pub fn init() -> Result<String, String> {
                 let d = crate::gpu::agility::create_device(&warp, D3D_FEATURE_LEVEL_11_0)
                     .map_err(|e| format!("D3D12 device (WARP): {e}"))?;
                 name = "WARP (software renderer)".into();
+                SOFTWARE_ADAPTER.store(true, Ordering::Relaxed);
                 d
             }
         };
@@ -541,20 +559,22 @@ pub fn init() -> Result<String, String> {
     }
 }
 
-/// A debug layer message: errors and warnings into the log – the first 8 of each message id
-/// (3 000 in all). One cap for all of them (200) was used up in seconds by two per-frame state
-/// errors of a retail game, long before the message that came with its device removal.
+/// A debug layer message into the log: the first 20 errors and the first 8 warnings of each
+/// message id (3 000 in all). One cap for all of them (200) was used up in seconds by two
+/// per-frame state errors of a retail game, long before the message that came with its device
+/// removal.
 unsafe extern "system" fn debug_message(_category: D3D12_MESSAGE_CATEGORY, severity: D3D12_MESSAGE_SEVERITY, id: D3D12_MESSAGE_ID, text: windows::core::PCSTR, _context: *mut c_void) {
     static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     static PER_ID: Mutex<Option<HashMap<i32, u32>>> = Mutex::new(None);
     if severity.0 > D3D12_MESSAGE_SEVERITY_WARNING.0 {
         return;
     }
+    let cap = if severity.0 <= D3D12_MESSAGE_SEVERITY_ERROR.0 { 20 } else { 8 };
     {
         let mut g = PER_ID.lock().unwrap();
         let n = g.get_or_insert_with(HashMap::new).entry(id.0).or_insert(0);
         *n += 1;
-        if *n > 8 {
+        if *n > cap {
             return;
         }
     }
@@ -1021,6 +1041,9 @@ fn console_slots(kind: Kind) -> Vec<(usize, usize)> {
                 (90, l::write32_bottom_of_shader_x as usize),
                 (93, l::kickoff_x as usize),
                 (94, l::set_depth_bias_x as usize),
+                // DispatchMesh after RSSetShadingRate / RSSetShadingRateImage (#124 / #125) as on
+                // the PC – inferred, see `bind::dispatch_mesh`
+                (126, b::dispatch_mesh as usize),
                 // console compute/BVH builder extensions (`XboxBvhBuilder.dll`)
                 (146, l::uav_barrier_x as usize),
                 (148, b::allocate_upload_memory as usize),
@@ -3154,15 +3177,66 @@ fn note_fallback(what: &str, hr: HRESULT, ok: bool) {
 type PsoFn = unsafe extern "system" fn(*mut c_void, *const c_void, *const GUID, *mut *mut c_void) -> HRESULT;
 
 unsafe fn finish_pso(this: *mut c_void, f: PsoFn, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
-    let mut hr = f(this, desc, riid, ppv);
+    let mut hr = driver_pso(f, this, desc, riid, ppv);
     if hr == E_NOINTERFACE {
         let iid = pc_iid(Kind::PipelineState);
-        hr = f(this, desc, &iid, ppv);
+        hr = driver_pso(f, this, desc, &iid, ppv);
     }
     if hr >= 0 && !ppv.is_null() && !(*ppv).is_null() {
         adopt(*ppv, Kind::PipelineState);
     }
     hr
+}
+
+thread_local! {
+    /// the driver ran out of memory on a pipeline with heap windows (`with_switch_fallback`)
+    static HEAP_WINDOW_OOM: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// heap-window driver calls still to fail with E_OUTOFMEMORY (`inject_heap_window_oom`)
+static INJECTED_OOM: AtomicU64 = AtomicU64::new(0);
+/// pipelines built in the switch form after the driver refused them with heap windows
+static SWITCH_FORM_RETRIES: AtomicU64 = AtomicU64::new(0);
+
+/// Tests: the next `n` driver pipeline calls with heap windows fail with E_OUTOFMEMORY without
+/// reaching the driver (0 stops it), as NVIDIA 616.92 refuses some big retail programs (#156).
+#[doc(hidden)]
+pub fn inject_heap_window_oom(n: u64) {
+    INJECTED_OOM.store(n, Ordering::SeqCst);
+}
+
+/// Pipelines built in the switch form because the driver refused them with heap windows.
+pub fn switch_form_retries() -> u64 {
+    SWITCH_FORM_RETRIES.load(Ordering::Relaxed)
+}
+
+/// A driver pipeline call; E_OUTOFMEMORY while this thread translates with heap windows is
+/// noted for `with_switch_fallback`.
+unsafe fn driver_pso(f: PsoFn, this: *mut c_void, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+    let heap = crate::gpu::recomp::pso::mem_windows() & crate::gpu::recomp::HEAP_WINDOWS != 0;
+    let injected = heap && INJECTED_OOM.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1)).is_ok();
+    let hr = if injected { E_OUTOFMEMORY } else { f(this, desc, riid, ppv) };
+    if hr == E_OUTOFMEMORY && heap {
+        HEAP_WINDOW_OOM.with(|o| o.set(true));
+    }
+    hr
+}
+
+/// Build a translated pipeline (`build`: a `translated_*` path); when the driver ran out of
+/// memory on it with heap windows, translate it again in the switch form and build that.
+/// NVIDIA 616.92 refuses some big programs whose heap index depends on the window with
+/// E_OUTOFMEMORY in under a second, and builds the same programs in the switch form (#156).
+fn with_switch_fallback<R>(mut build: impl FnMut() -> R) -> R {
+    HEAP_WINDOW_OOM.with(|o| o.set(false));
+    let r = build();
+    if !HEAP_WINDOW_OOM.with(|o| o.replace(false)) {
+        return r;
+    }
+    let n = SWITCH_FORM_RETRIES.fetch_add(1, Ordering::Relaxed);
+    if n < 5 || n % 100 == 0 {
+        crate::xlog_warn!("D3D12.X: the driver ran out of memory on a pipeline with heap windows – building it in the switch form ({} so far)", n + 1);
+    }
+    crate::gpu::recomp::pso::in_switch_form(build)
 }
 
 thread_local! {
@@ -3182,6 +3256,10 @@ fn attempt<R>(f: impl FnOnce() -> R) -> (R, bool) {
 }
 
 fn note_translation_error(e: String) {
+    // a refusal `with_switch_fallback` builds again in the switch form (it says so itself)
+    if HEAP_WINDOW_OOM.with(|o| o.get()) {
+        return;
+    }
     if crate::gpu::recomp::dxc::in_cached_only() {
         ATTEMPT_NOTES.with(|n| n.borrow_mut().push(e));
         return;
@@ -3332,6 +3410,10 @@ fn wait_for_commit() {
 }
 
 unsafe fn translated_compute_pso(this: *mut c_void, f: PsoFn, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> Option<Result<HRESULT, ()>> {
+    with_switch_fallback(|| translated_compute_pso_once(this, f, desc, riid, ppv))
+}
+
+unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> Option<Result<HRESULT, ()>> {
     use crate::gpu::recomp::pso::{console_to_dxil_for, is_console, Stage};
     if !crate::gpu::shader::readable(desc as usize, std::mem::size_of::<D3D12_COMPUTE_PIPELINE_STATE_DESC>()) {
         return None;
@@ -3388,6 +3470,10 @@ unsafe fn translated_compute_pso(this: *mut c_void, f: PsoFn, desc: *const c_voi
 }
 
 unsafe fn translated_graphics_pso(this: *mut c_void, f: PsoFn, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> Option<HRESULT> {
+    with_switch_fallback(|| translated_graphics_pso_once(this, f, desc, riid, ppv))
+}
+
+unsafe fn translated_graphics_pso_once(this: *mut c_void, f: PsoFn, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> Option<HRESULT> {
     use crate::gpu::recomp::pso::{console_to_dxil_for, is_console, Stage};
     if !crate::gpu::shader::readable(desc as usize, std::mem::size_of::<D3D12_GRAPHICS_PIPELINE_STATE_DESC>()) {
         return None;
@@ -3830,6 +3916,19 @@ pub struct TwoPassPso {
     pub mesh_groups_per_record: u32,
     /// "MS" or "GS"
     pub kind: &'static str,
+    /// GS: the vertex fetch in front of the compute pass (Err: why the draws cannot have one)
+    pub fetch: Option<Result<GsFetch, String>>,
+}
+
+/// The vertex fetch of a GS pipeline (`recomp::fetch`): its compute pipeline state (XCL's,
+/// root signature `fetch_rs`), the title's vertex buffer slot of each fetch slot, and the ES
+/// input registers each vertex has.
+pub struct GsFetch {
+    pub pso: usize,
+    pub slots: Vec<u32>,
+    pub registers: u32,
+    /// some ES input has no element in the input layout (zero)
+    pub missing: Vec<String>,
 }
 
 impl Drop for TwoPassPso {
@@ -3837,6 +3936,86 @@ impl Drop for TwoPassPso {
         // the compute pipeline state is XCL's (the root signatures are cached or the title's)
         super::pso_async::release(self.compute);
     }
+}
+
+impl Drop for GsFetch {
+    fn drop(&mut self) {
+        super::pso_async::release(self.pso);
+    }
+}
+
+/// The vertex fetch's root signature (`recomp::fetch::root_signature`), made once.
+static FETCH_RS: AtomicUsize = AtomicUsize::new(0);
+
+pub fn fetch_rs() -> Option<usize> {
+    Some(FETCH_RS.load(Ordering::Acquire)).filter(|&p| p != 0)
+}
+
+unsafe fn fetch_rs_for(this: *mut c_void) -> Result<usize, String> {
+    if let Some(p) = fetch_rs() {
+        return Ok(p);
+    }
+    let dev = ID3D12Device::from_raw_borrowed(&this).ok_or("device")?;
+    let raw = crate::gpu::recomp::fetch::root_signature(dev)?.into_raw() as usize;
+    match FETCH_RS.compare_exchange(0, raw, Ordering::AcqRel, Ordering::Acquire) {
+        Ok(_) => Ok(raw),
+        Err(other) => {
+            drop(ID3D12RootSignature::from_raw(raw as *mut c_void));
+            Ok(other)
+        }
+    }
+}
+
+/// The vertex fetch of a GS pipeline from its description's input layout and the ES inputs
+/// (ISG1 of the console VS): elements matched by semantic.
+unsafe fn gs_fetch(this: *mut c_void, d: &D3D12_GRAPHICS_PIPELINE_STATE_DESC, vs: &[u8]) -> Result<GsFetch, String> {
+    use crate::gpu::recomp::fetch;
+    let inputs: Vec<crate::gpu::dxbc::SigElement> = crate::gpu::dxbc::signatures(vs).0.into_iter().filter(|e| e.system_value == 0).collect();
+    let registers = inputs.iter().map(|e| e.register + 1).max().unwrap_or(0);
+    let layout: &[D3D12_INPUT_ELEMENT_DESC] = if d.InputLayout.pInputElementDescs.is_null() || d.InputLayout.NumElements == 0 || d.InputLayout.NumElements > 64 {
+        &[]
+    } else {
+        std::slice::from_raw_parts(d.InputLayout.pInputElementDescs, d.InputLayout.NumElements as usize)
+    };
+    // offsets of D3D12_APPEND_ALIGNED_ELEMENT: after the previous element of the slot
+    let mut ends: HashMap<u32, u32> = HashMap::new();
+    let mut placed = Vec::new();
+    for el in layout {
+        let name = if el.SemanticName.is_null() { String::new() } else { el.SemanticName.to_string().unwrap_or_default() };
+        let f = el.Format.0 as u32;
+        let at = if el.AlignedByteOffset == D3D12_APPEND_ALIGNED_ELEMENT { *ends.get(&el.InputSlot).unwrap_or(&0) } else { el.AlignedByteOffset };
+        ends.insert(el.InputSlot, at + fetch::bytes(f).unwrap_or(4));
+        placed.push((name, el.SemanticIndex, el.InputSlot, at, f, el.InputSlotClass == D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA));
+    }
+    let (mut slots, mut elements, mut missing) = (Vec::<u32>::new(), Vec::new(), Vec::new());
+    for e in &inputs {
+        let Some((_, _, slot, at, f, inst)) = placed.iter().find(|p| p.0.eq_ignore_ascii_case(&e.name) && p.1 == e.index) else {
+            missing.push(e.semantic());
+            continue;
+        };
+        let k = match slots.iter().position(|s| s == slot) {
+            Some(k) => k,
+            None => {
+                slots.push(*slot);
+                slots.len() - 1
+            }
+        };
+        elements.push(fetch::Element { register: e.register, slot: k as u32, offset: *at, format: *f, per_instance: *inst });
+    }
+    let hlsl = fetch::hlsl(registers, &elements)?;
+    let cs = crate::gpu::recomp::dxc::compile_cached(&hlsl, "main", "cs_6_6")?.0;
+    let rs = fetch_rs_for(this)?;
+    let fc: PsoFn = std::mem::transmute(orig_fn(this, slot_of(this, "CreateComputePipelineState")));
+    let mut cdesc = D3D12_COMPUTE_PIPELINE_STATE_DESC::default();
+    cdesc.pRootSignature = std::mem::transmute::<*mut c_void, std::mem::ManuallyDrop<Option<ID3D12RootSignature>>>(rs as *mut c_void);
+    cdesc.CS = bytecode(&cs);
+    let iid = pc_iid(Kind::PipelineState);
+    let mut pso: *mut c_void = std::ptr::null_mut();
+    let hr = fc(this, &cdesc as *const _ as *const c_void, &iid, &mut pso);
+    if hr < 0 || pso.is_null() {
+        return Err(format!("the driver rejected the vertex fetch ({hr:#x})"));
+    }
+    Ok(GsFetch { pso: pso as usize, slots, registers, missing })
 }
 
 static TWO_PASS: Mutex<Option<HashMap<usize, std::sync::Arc<TwoPassPso>>>> = Mutex::new(None);
@@ -3929,7 +4108,7 @@ fn two_pass_ps(ps: Option<&[u8]>, split_wave64: bool) -> Result<(Option<Vec<u8>>
 /// Create the mesh pipeline (`stream`, RS and shaders already in it) and the compute pass;
 /// the title gets the mesh pipeline state.
 #[allow(clippy::too_many_arguments)]
-unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu::recomp::pso::TwoPass, mesh_rs: *mut c_void, kind: &'static str, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu::recomp::pso::TwoPass, mesh_rs: *mut c_void, kind: &'static str, fetch: Option<Result<GsFetch, String>>, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
     let Some(rs) = abi_rs_for(this, &tp.samplers) else { return E_INVALIDARG };
     let fs: PsoFn = std::mem::transmute(orig_fn(this, slot_of(this, "CreatePipelineState")));
     let desc: [usize; 2] = [stream.0.len(), stream.0.as_ptr() as usize];
@@ -3944,7 +4123,7 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
     cdesc.CS = bytecode(&tp.cs);
     let iid = pc_iid(Kind::PipelineState);
     let mut compute: *mut c_void = std::ptr::null_mut();
-    let hc = fc(this, &cdesc as *const _ as *const c_void, &iid, &mut compute);
+    let hc = driver_pso(fc, this, &cdesc as *const _ as *const c_void, &iid, &mut compute);
     if hc < 0 || compute.is_null() {
         note_translation_error(format!("the driver rejected the compute pass of the console {kind} ({hc:#x})"));
         let release: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*(*(*ppv as *const *const usize)).add(2));
@@ -3953,7 +4132,7 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
         return E_INVALIDARG;
     }
     note_pso_rs(*ppv, mesh_rs);
-    TWO_PASS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, std::sync::Arc::new(TwoPassPso { compute: compute as usize, compute_rs: rs as usize, mesh_rs: mesh_rs as usize, record: tp.record, mesh_groups_per_record: tp.mesh_groups_per_record, kind }));
+    TWO_PASS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, std::sync::Arc::new(TwoPassPso { compute: compute as usize, compute_rs: rs as usize, mesh_rs: mesh_rs as usize, record: tp.record, mesh_groups_per_record: tp.mesh_groups_per_record, kind, fetch }));
     let n = TRANSLATED_PSO.fetch_add(1, Ordering::Relaxed);
     if n < 5 || n % 1000 == 0 {
         crate::xlog_info!("D3D12.X: pipeline from the console {kind} in two passes (compute {} B + mesh {} B DXIL)", tp.cs.len(), tp.ms.len());
@@ -3964,6 +4143,10 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
 /// CreatePipelineState with a console MS: Some(hr) when it was a console mesh pipeline
 /// (translated, or E_INVALIDARG – console bytecode must not reach the driver).
 unsafe fn translated_mesh_stream(this: *mut c_void, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> Option<HRESULT> {
+    with_switch_fallback(|| translated_mesh_stream_once(this, desc, riid, ppv))
+}
+
+unsafe fn translated_mesh_stream_once(this: *mut c_void, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> Option<HRESULT> {
     use crate::gpu::recomp::pso::{console_mesh, is_console};
     if !crate::gpu::shader::readable(desc as usize, 16) {
         return None;
@@ -4035,7 +4218,7 @@ unsafe fn translated_mesh_stream(this: *mut c_void, desc: *const c_void, riid: *
             out.raw(*ty, payload, palign == 8);
         }
     }
-    Some(finish_two_pass(this, &out, tp, rs, "MS", riid, ppv))
+    Some(finish_two_pass(this, &out, tp, rs, "MS", None, riid, ppv))
 }
 
 /// A graphics PSO with a console VS + GS: the GS pipeline in two passes, as a mesh pipeline
@@ -4106,7 +4289,12 @@ unsafe fn translated_gs_pso(this: *mut c_void, d: &D3D12_GRAPHICS_PIPELINE_STATE
     if d.Flags.0 != 0 {
         out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_FLAGS, &d.Flags);
     }
-    finish_two_pass(this, &out, tp, rs, "GS", riid, ppv)
+    // the vertex fetch: a failure only keeps this pipeline's draws from running (logged there)
+    let fetch = gs_fetch(this, d, vs);
+    if let Err(e) = &fetch {
+        note_translation_error(format!("VS+GS vertex fetch: {e}"));
+    }
+    finish_two_pass(this, &out, tp, rs, "GS", Some(fetch), riid, ppv)
 }
 
 /// Rewrite a pipeline state stream with stand-in shaders. None if not possible.
@@ -4615,7 +4803,9 @@ pub(super) static QUEUE_SHIFTED: AtomicBool = AtomicBool::new(false);
 static QUEUE_OLDER: AtomicBool = AtomicBool::new(false);
 
 /// command list slots of the newer layout → the older layout's slot of the same method
-const NEWER_LIST_SLOTS: [(usize, usize); 21] = [(61, 59), (62, 60), (63, 61), (64, 62), (65, 63), (70, 68), (71, 69), (72, 70), (73, 71), (74, 72), (80, 78), (83, 81), (85, 83), (86, 84), (87, 85), (90, 88), (91, 89), (92, 90), (95, 93), (96, 94), (139, 10)];
+/// (128, 126): DispatchMesh, if the shift reaches it – not seen yet; `bind::dispatch_mesh` drops
+/// a call without a console mesh pipeline bound.
+const NEWER_LIST_SLOTS: [(usize, usize); 22] = [(61, 59), (62, 60), (63, 61), (64, 62), (65, 63), (70, 68), (71, 69), (72, 70), (73, 71), (74, 72), (80, 78), (83, 81), (85, 83), (86, 84), (87, 85), (90, 88), (91, 89), (92, 90), (95, 93), (96, 94), (128, 126), (139, 10)];
 
 /// The title called device method `slot`, which only runtimes with the newer layouts have (a retail game
 /// records its first lists before any queue call could tell).

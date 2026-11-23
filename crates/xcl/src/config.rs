@@ -87,7 +87,7 @@ impl Config {
             if let Some(m) = &m {
                 from.push(format!("title memory {m}"));
             }
-            self.title_memory = m.unwrap_or_else(|| "standard".into()).to_ascii_lowercase();
+            self.title_memory = m.unwrap_or_else(|| "standard".into()).trim().to_ascii_lowercase();
         }
         // the standard budgets; "advanced" adds memory the console docs do not give publicly –
         // the standard figure stays (xcl.toml can raise it)
@@ -220,8 +220,7 @@ impl Config {
             }
             // only a missing file gets the defaults written: an unreadable one (locked, not UTF-8)
             // must not be replaced by them (issue #106)
-            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(format!("{}: {e}", path.display())),
-            Err(_) => {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 let c = Config::default();
                 let body = toml::to_string_pretty(&c).map_err(|e| e.to_string())?;
                 if let Some(d) = path.parent() {
@@ -230,6 +229,7 @@ impl Config {
                 let _ = std::fs::write(path, format!("{HEADER}{body}"));
                 Ok(c)
             }
+            Err(e) => Err(format!("{}: {e}", path.display())),
         }
     }
 
@@ -355,12 +355,63 @@ mod tests {
 
     #[test]
     fn title_memory_is_read_in_any_case() {
-        let manifest = crate::manifest::Manifest { anaconda_memory: Some("Advanced".into()), ..Default::default() };
-        for (setting, m) in [("Auto", Some(&manifest)), ("ADVANCED", None)] {
+        let manifest_adv = crate::manifest::Manifest { anaconda_memory: Some("Advanced".into()), ..Default::default() };
+        let manifest_std = crate::manifest::Manifest { anaconda_memory: Some("Standard".into()), ..Default::default() };
+        for (setting, m, expected_mode, expected_uma) in [
+            ("auto", Some(&manifest_adv), "advanced", 4095),
+            ("Auto", Some(&manifest_adv), "advanced", 4095),
+            ("AUTO", Some(&manifest_adv), "advanced", 4095),
+            ("  aUtO  ", Some(&manifest_adv), "advanced", 4095),
+            ("auto", Some(&manifest_std), "standard", 2048),
+            ("Auto", None, "standard", 2048),
+            ("advanced", None, "advanced", 4095),
+            ("Advanced", None, "advanced", 4095),
+            ("ADVANCED", None, "advanced", 4095),
+            ("  AdVaNcEd  ", None, "advanced", 4095),
+            ("standard", None, "standard", 2048),
+            ("Standard", None, "standard", 2048),
+        ] {
             let mut c = Config { title_memory: setting.into(), ..Config::default() };
             c.resolve(m);
-            assert_eq!((c.title_memory.as_str(), c.uma_mb), ("advanced", 4095), "{setting}");
+            assert_eq!(
+                (c.title_memory.as_str(), c.uma_mb),
+                (expected_mode, expected_uma),
+                "failed for setting {setting:?}"
+            );
         }
+    }
+
+    #[test]
+    fn load_or_create_only_creates_on_not_found_and_preserves_on_errors() {
+        let dir = std::env::temp_dir().join(format!("xcl_cfg_robustness_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("xcl.toml");
+
+        // 1. Missing file: creates default xcl.toml
+        if path.exists() {
+            let _ = std::fs::remove_file(&path);
+        }
+        let created = Config::load_or_create(&path).expect("creates when missing");
+        assert_eq!(created.device_type, "anaconda");
+        assert!(path.exists());
+        let original_content = std::fs::read_to_string(&path).unwrap();
+        assert!(original_content.starts_with("# XCL"));
+
+        // 2. Corrupted TOML (syntax error): fails and does NOT overwrite file
+        let corrupted_toml = "device_type = [invalid toml syntax";
+        std::fs::write(&path, corrupted_toml).unwrap();
+        let res = Config::load_or_create(&path);
+        assert!(res.is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), corrupted_toml);
+
+        // 3. Unreadable / Invalid UTF-8 data: fails and does NOT overwrite file
+        let invalid_utf8 = [0xFF, 0xFE, 0xFD, 0xFC];
+        std::fs::write(&path, &invalid_utf8).unwrap();
+        let res = Config::load_or_create(&path);
+        assert!(res.is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), invalid_utf8);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

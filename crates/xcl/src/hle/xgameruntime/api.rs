@@ -155,7 +155,14 @@ fn pc() -> Option<&'static Pc> {
     .as_ref()
 }
 
+/// Set when the system runtime is there but refused to initialise (e.g. 0x80073cfc without a working
+/// Gaming Services): its objects then fail fast on first use, so XCL's own fallbacks are used instead.
+static PC_INIT_FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 unsafe fn pc_object(c: &Guid, i: &Guid) -> Option<usize> {
+    if PC_INIT_FAILED.load(Ordering::Acquire) {
+        return None;
+    }
     let mut o: *mut c_void = std::ptr::null_mut();
     ((pc()?.query)(c, i, &mut o) >= 0 && !o.is_null()).then_some(o as usize)
 }
@@ -189,7 +196,8 @@ unsafe fn pc_init(gdk: u64, os: u64, flags: u64, options: *mut c_void) {
         hr = p.init.map(|f| f(gdk >> 32, gdk & 0xFFFF_FFFF)).unwrap_or(-1);
     }
     if hr < 0 {
-        crate::xlog_warn!("XGameRuntime PC: initialization → {:#x}", hr as u32);
+        crate::xlog_warn!("XGameRuntime PC: initialization → {:#x} – using XCL's own XAsync / fallbacks", hr as u32);
+        PC_INIT_FAILED.store(true, Ordering::Release);
     }
     start_pc_async();
 }
@@ -215,14 +223,14 @@ pub unsafe extern "system" fn UninitializeApiImpl() {
 static ERROR_CB: Mutex<Option<(usize, usize)>> = Mutex::new(None);
 static ERROR_OPTIONS: AtomicUsize = AtomicUsize::new(0);
 
-pub unsafe extern "system" fn XErrorReport(hr: HRESULT, message: *const u8) {
+pub unsafe extern "system-unwind" fn XErrorReport(hr: HRESULT, message: *const u8) {
     let text = crate::util::from_cstr_ptr(message).unwrap_or_default();
     crate::xlog_warn!("XErrorReport {:#x}: {text}", hr as u32);
     // Copy and release `ERROR_CB` before invoking the guest callback so re-entrant calls to
     // `XErrorSetCallback` or `XErrorReport` do not deadlock.
     let entry = *ERROR_CB.lock().unwrap();
     if let Some((cb, ctx)) = entry {
-        let f: unsafe extern "system" fn(HRESULT, *const u8, *mut c_void) -> bool = std::mem::transmute(cb);
+        let f: unsafe extern "system-unwind" fn(HRESULT, *const u8, *mut c_void) -> bool = std::mem::transmute(cb);
         let _ = f(hr, message, ctx as *mut c_void);
     }
 }
@@ -405,7 +413,7 @@ unsafe fn unknown_slot(this: *const Obj, slot: usize) -> usize {
     }
 }
 
-type Fwd = unsafe extern "system" fn(*const Obj, usize, usize, usize, usize, usize, usize, usize, usize, usize) -> usize;
+type Fwd = unsafe extern "system-unwind" fn(*const Obj, usize, usize, usize, usize, usize, usize, usize, usize, usize) -> usize;
 
 /// Call slot `slot` of the PC object with the caller's arguments (up to 9; extra ones are
 /// ignored by the callee).
@@ -420,14 +428,14 @@ unsafe fn forward(this: *const Obj, slot: usize, a: [usize; 9]) -> usize {
 
 /// Slot `slot` of an XCL object: its API function with the caller's arguments after `this`.
 unsafe fn call_target(this: *const Obj, slot: usize, a: [usize; 9]) -> usize {
-    let f: unsafe extern "system" fn(usize, usize, usize, usize, usize, usize, usize, usize, usize) -> usize = std::mem::transmute((*this).targets[slot]);
+    let f: unsafe extern "system-unwind" fn(usize, usize, usize, usize, usize, usize, usize, usize, usize) -> usize = std::mem::transmute((*this).targets[slot]);
     f(a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8])
 }
 
 macro_rules! per_slot {
     ($($n:literal)*) => {
         const SHIMS: [Fwd; SLOTS] = [$({
-            unsafe extern "system" fn f(this: *const Obj, a: usize, b: usize, c: usize, d: usize, e: usize, g: usize, h: usize, i: usize, j: usize) -> usize {
+            unsafe extern "system-unwind" fn f(this: *const Obj, a: usize, b: usize, c: usize, d: usize, e: usize, g: usize, h: usize, i: usize, j: usize) -> usize {
                 call_target(this, $n, [a, b, c, d, e, g, h, i, j])
             }
             f
@@ -439,7 +447,7 @@ macro_rules! per_slot {
             f
         }),*];
         const FORWARDS: [Fwd; SLOTS] = [$({
-            unsafe extern "system" fn f(this: *const Obj, a: usize, b: usize, c: usize, d: usize, e: usize, g: usize, h: usize, i: usize, j: usize) -> usize {
+            unsafe extern "system-unwind" fn f(this: *const Obj, a: usize, b: usize, c: usize, d: usize, e: usize, g: usize, h: usize, i: usize, j: usize) -> usize {
                 forward(this, $n, [a, b, c, d, e, g, h, i, j])
             }
             f
@@ -945,19 +953,19 @@ unsafe extern "system" fn empty_result(b: *mut XAsyncBlock) -> HRESULT {
     XAsyncGetStatus(b, false)
 }
 
-unsafe extern "system" fn resolve_privilege_async(_user: usize, _options: u32, _privilege: u32, b: *mut XAsyncBlock) -> HRESULT {
+unsafe extern "system-unwind" fn resolve_privilege_async(_user: usize, _options: u32, _privilege: u32, b: *mut XAsyncBlock) -> HRESULT {
     completed(b)
 }
 
-unsafe extern "system" fn resolve_issue_async(_user: usize, _url: usize, b: *mut XAsyncBlock) -> HRESULT {
+unsafe extern "system-unwind" fn resolve_issue_async(_user: usize, _url: usize, b: *mut XAsyncBlock) -> HRESULT {
     completed(b)
 }
 
-unsafe extern "system" fn sign_out_async(_user: usize, b: *mut XAsyncBlock) -> HRESULT {
+unsafe extern "system-unwind" fn sign_out_async(_user: usize, b: *mut XAsyncBlock) -> HRESULT {
     completed(b)
 }
 
-unsafe extern "system" fn prompt_space_async(_bytes: u64, b: *mut XAsyncBlock) -> HRESULT {
+unsafe extern "system-unwind" fn prompt_space_async(_bytes: u64, b: *mut XAsyncBlock) -> HRESULT {
     completed(b)
 }
 
@@ -970,7 +978,7 @@ unsafe extern "system" fn sign_out_deferral(out: *mut usize) -> HRESULT {
 
 /// XUserAddByIdWithUiAsync: the local user by either of its ids (XUserAddByIdWithUiResult =
 /// XUserAddResult)
-unsafe extern "system" fn add_by_id_async(id: u64, b: *mut XAsyncBlock) -> HRESULT {
+unsafe extern "system-unwind" fn add_by_id_async(id: u64, b: *mut XAsyncBlock) -> HRESULT {
     let mut h = std::ptr::null_mut();
     if find_user(id, &mut h) < 0 {
         return E_GAMEUSER_USER_NOT_FOUND;
@@ -998,7 +1006,7 @@ static PICTURE_ID: u8 = 0;
 
 /// XUserGetGamerPictureAsync(user, size, async): a plain picture (PNG) of the requested size
 /// (XUserGamerPictureSize: 64, 208, 424, 1080 pixels) – there is no profile offline.
-unsafe extern "system" fn gamer_picture_async(user: *mut c_void, size: u32, b: *mut XAsyncBlock) -> HRESULT {
+unsafe extern "system-unwind" fn gamer_picture_async(user: *mut c_void, size: u32, b: *mut XAsyncBlock) -> HRESULT {
     let side = match size {
         0 => 64,
         1 => 208,
@@ -1012,7 +1020,7 @@ unsafe extern "system" fn gamer_picture_async(user: *mut c_void, size: u32, b: *
     begin_with(b, &PICTURE_ID as *const u8 as usize, move || Ok(png_square(side, [0x5A, 0x6E, 0x82])))
 }
 
-unsafe extern "system" fn gamer_picture_result(b: *mut XAsyncBlock, size: usize, buf: *mut c_void, used: *mut usize) -> HRESULT {
+unsafe extern "system-unwind" fn gamer_picture_result(b: *mut XAsyncBlock, size: usize, buf: *mut c_void, used: *mut usize) -> HRESULT {
     XAsyncGetResult(b, &PICTURE_ID as *const u8 as *const c_void, size, buf, used)
 }
 
@@ -1101,15 +1109,15 @@ unsafe extern "system" fn install_chunks(id: *const u8, count: u32, sel: *const 
 static INSTALL_ID: u8 = 0;
 static MOUNT_ID: u8 = 0;
 
-unsafe extern "system" fn install_chunks_async(_id: usize, _count: u32, _sel: usize, _interval: u32, _suppress: bool, b: *mut XAsyncBlock) -> HRESULT {
+unsafe extern "system-unwind" fn install_chunks_async(_id: usize, _count: u32, _sel: usize, _interval: u32, _suppress: bool, b: *mut XAsyncBlock) -> HRESULT {
     begin_with(b, &INSTALL_ID as *const u8 as usize, || Ok((&MONITOR as *const u64 as usize).to_le_bytes().to_vec()))
 }
 
-unsafe extern "system" fn install_chunks_result(b: *mut XAsyncBlock, out: *mut usize) -> HRESULT {
+unsafe extern "system-unwind" fn install_chunks_result(b: *mut XAsyncBlock, out: *mut usize) -> HRESULT {
     XAsyncGetResult(b, &INSTALL_ID as *const u8 as *const c_void, 8, out as *mut c_void, std::ptr::null_mut())
 }
 
-unsafe extern "system" fn mount_with_ui_async(id: *const u8, b: *mut XAsyncBlock) -> HRESULT {
+unsafe extern "system-unwind" fn mount_with_ui_async(id: *const u8, b: *mut XAsyncBlock) -> HRESULT {
     let mut m: *mut c_void = std::ptr::null_mut();
     let hr = XPackageMount(id, &mut m);
     if hr < 0 {
@@ -1119,7 +1127,7 @@ unsafe extern "system" fn mount_with_ui_async(id: *const u8, b: *mut XAsyncBlock
     begin_with(b, &MOUNT_ID as *const u8 as usize, move || Ok(m.to_le_bytes().to_vec()))
 }
 
-unsafe extern "system" fn mount_with_ui_result(b: *mut XAsyncBlock, out: *mut usize) -> HRESULT {
+unsafe extern "system-unwind" fn mount_with_ui_result(b: *mut XAsyncBlock, out: *mut usize) -> HRESULT {
     XAsyncGetResult(b, &MOUNT_ID as *const u8 as *const c_void, 8, out as *mut c_void, std::ptr::null_mut())
 }
 
@@ -1141,7 +1149,7 @@ struct PackageDetails {
 }
 
 /// XPackageEnumeratePackages(kind, scope, context, callback): the game itself (no DLC).
-unsafe extern "system" fn enumerate_packages(kind: u32, _scope: u32, ctx: *mut c_void, cb: Option<unsafe extern "system" fn(*mut c_void, *const PackageDetails) -> bool>) -> HRESULT {
+unsafe extern "system-unwind" fn enumerate_packages(kind: u32, _scope: u32, ctx: *mut c_void, cb: Option<unsafe extern "system-unwind" fn(*mut c_void, *const PackageDetails) -> bool>) -> HRESULT {
     let Some(cb) = cb else { return E_INVALIDARG };
     if kind != 0 {
         return S_OK;
@@ -2051,6 +2059,46 @@ mod tests {
             let (hr, queried) = query(XACCESSIBILITY, iid);
             assert_eq!(hr, S_OK);
             assert!(!queried.is_null());
+        }
+    }
+
+    #[test]
+    fn vtable_shim_unwinds_cleanly_for_xerror_and_xpackage() {
+        let _g = crate::hle::xgameruntime::xasync::ASYNC_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        struct ResetErrorCb;
+        impl Drop for ResetErrorCb {
+            fn drop(&mut self) {
+                unsafe { error_set_callback(0, std::ptr::null_mut()) };
+            }
+        }
+
+        unsafe extern "system-unwind" fn throwing_error_cb(_hr: HRESULT, _msg: *const u8, _ctx: *mut c_void) -> bool {
+            panic!("guest XError callback unwind");
+        }
+
+        unsafe extern "system-unwind" fn throwing_pkg_cb(_ctx: *mut c_void, _details: *const PackageDetails) -> bool {
+            panic!("guest XPackageEnumeratePackages callback unwind");
+        }
+
+        let _reset = ResetErrorCb;
+        unsafe {
+            // (a) XError COM vtable shim (slot 3 -> XErrorReport -> guest callback).
+            let (hr, err) = query(XERROR, XERROR);
+            assert_eq!(hr, S_OK);
+            let report: unsafe extern "system-unwind" fn(*mut c_void, HRESULT, *const u8) = slot(err, 3);
+            let set_cb: unsafe extern "system" fn(*mut c_void, usize, *mut c_void) = slot(err, 4);
+            set_cb(err, throwing_error_cb as usize, std::ptr::null_mut());
+            let r1 = std::panic::catch_unwind(|| report(err, crate::util::E_FAIL, b"unwind test\0".as_ptr()));
+            assert!(r1.is_err(), "XError COM vtable shim must propagate unwind from guest callback");
+            assert!(ERROR_CB.lock().is_ok(), "ERROR_CB mutex must remain unpoisoned after unwind");
+
+            // (b) XPackage COM vtable shim (V1 slot 28 -> XPackageEnumeratePackages -> guest callback).
+            let (hr, pkg) = query(XPACKAGE, XPACKAGE_V1_IID);
+            assert_eq!(hr, S_OK);
+            let enum_pkgs: unsafe extern "system-unwind" fn(*mut c_void, u32, u32, *mut c_void, Option<unsafe extern "system-unwind" fn(*mut c_void, *const PackageDetails) -> bool>) -> HRESULT = slot(pkg, 28);
+            let r2 = std::panic::catch_unwind(|| enum_pkgs(pkg, 0, 0, std::ptr::null_mut(), Some(throwing_pkg_cb)));
+            assert!(r2.is_err(), "XPackage COM vtable shim must propagate unwind from guest callback");
         }
     }
 }

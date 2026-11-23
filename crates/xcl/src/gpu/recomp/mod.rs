@@ -53,14 +53,27 @@
 
 pub mod dxc;
 pub(crate) mod emit;
+pub mod fetch;
 pub mod mesh_dispatch;
 pub mod mesh_wave;
+pub mod partial_waves;
 pub mod x64_masks;
 pub mod pso;
+pub mod reductions;
 pub use emit::mesh_passthrough;
 pub mod runner;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod aperture_tests;
+
+/// First descriptor of the memory windows in the shader-visible heap (`Options::heap_windows`):
+/// window k is raw UAV `MEM_HEAP_BASE + k`.
+pub const MEM_HEAP_BASE: u32 = 0;
+
+/// Flag in a memory-windows count (`pso::mem_windows`, the translation caches' keys):
+/// `Options::heap_windows`. `translate` takes it out of `mem_windows`.
+pub const HEAP_WINDOWS: u32 = 0x100;
 pub mod upper_lanes;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -490,14 +503,37 @@ pub struct Options {
     /// then exactly the single-window form); 2..4 add `mem1`.. (u3..) and pick the window of
     /// every access from the high address bits
     pub mem_windows: u32,
+    /// with `mem_windows` > 1: reach window k through descriptor `MEM_HEAP_BASE + k` of the
+    /// shader-visible heap (a raw UAV of the window, `ResourceDescriptorHeap`) – one access per
+    /// site instead of a `switch` over the root UAVs `mem`, `mem1`.., which inlines every
+    /// access once per window (HANDOFF: twice the DXC + driver time with 4 windows)
+    pub heap_windows: bool,
     /// structured control flow when the program allows it (false, or `XCL_RECOMP_NO_STRUCTURED`:
     /// always the guarded block chain)
     pub structured: bool,
+    /// compute groups that are not whole console waves
+    pub pad_waves: PadWaves,
+}
+
+/// A compute group that is not a whole number of console waves (40 threads: one wave64 with
+/// lanes 0..39 launched) as a PC group of whole waves, its extra lanes inactive at the start
+/// as the console's are: for a program that can tell them (`partial_waves`: it turns them on
+/// in EXEC, or writes them with `v_writelane`). Every other program keeps its group.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PadWaves {
+    /// where the program can tell; `XCL_CS_PAD_ALL=1` / `XCL_NO_CS_PAD=1` make it `Always` /
+    /// `Never` (for comparison)
+    #[default]
+    WhereSeen,
+    /// every group that is not whole waves
+    Always,
+    /// never: the group as the console declares it
+    Never,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Options { mode: Mode::Kernel, wave64: true, hw_wave: 0, split_wave64: false, static_sampler_base: 0, mem_windows: 1, structured: true }
+        Options { mode: Mode::Kernel, wave64: true, hw_wave: 0, split_wave64: false, static_sampler_base: 0, mem_windows: 1, heap_windows: false, structured: true, pad_waves: PadWaves::WhereSeen }
     }
 }
 
@@ -1098,7 +1134,8 @@ pub fn wave_hazards(code: &[u8]) -> BTreeSet<&'static str> {
     wave_lane_reads(code).0
 }
 
-/// `wave_hazards` and the kinds of reads `upper_lanes` resolves.
+/// `wave_hazards` and the kinds of reads `upper_lanes` resolves – reads inside a whole-wave
+/// reduction recognised as a whole (`reductions`) count as that.
 pub fn wave_lane_reads(code: &[u8]) -> (BTreeSet<&'static str>, BTreeSet<&'static str>) {
     let mut insts = Vec::new();
     let mut off = 0;
@@ -1108,8 +1145,37 @@ pub fn wave_lane_reads(code: &[u8]) -> (BTreeSet<&'static str>, BTreeSet<&'stati
         insts.push(d);
     }
     rdna2::resolve_far_jumps(&mut insts);
-    let a = upper_lanes::analyze(&insts);
-    (a.hazards(&insts), a.resolved())
+    let mut a = upper_lanes::analyze(&insts);
+    let rs = wave_reductions(&insts, true);
+    let reduced: BTreeSet<u64> = rs.iter().flat_map(|r| r.rest.iter().copied()).collect();
+    a.reads.retain(|pc, _| !reduced.contains(pc));
+    let mut resolved = a.resolved();
+    if !rs.is_empty() {
+        resolved.insert("whole-wave min / max / or reduction (WaveActive*)");
+    }
+    (a.hazards(&insts), resolved)
+}
+
+/// The whole-wave reductions of a program of that wave size (`reductions`);
+/// `XCL_NO_WAVE_REDUCTIONS=1`: none – each step translated on its own, as before (for
+/// comparison).
+fn wave_reductions(insts: &[Decoded], wave64: bool) -> Vec<reductions::Reduction> {
+    if std::env::var_os("XCL_NO_WAVE_REDUCTIONS").is_some() {
+        return Vec::new();
+    }
+    reductions::find(insts, wave64)
+}
+
+/// The reductions a translation emits as wave operations: those of VS / PS, whose hardware
+/// wave holds (the lower part of) one wave64 console wave, or one or two wave32 console
+/// waves (`xcl_half`). Compute-like modes keep the steps: there a wave64 console wave is two
+/// hardware waves on GPUs with 32-lane waves (`x64`).
+fn graphics_reductions(insts: &[Decoded], opt: &Options) -> Vec<reductions::Reduction> {
+    if matches!(opt.mode, Mode::Vertex(_) | Mode::Pixel(_)) {
+        wave_reductions(insts, opt.wave64)
+    } else {
+        Vec::new()
+    }
 }
 
 /// Operations that cannot be split into two independent native wave32 halves while
@@ -1294,6 +1360,13 @@ fn constant_samplers(insts: &[Decoded], leaders: &BTreeSet<u64>) -> BTreeMap<u64
 }
 
 pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
+    let normalized;
+    let opt = if opt.mem_windows & HEAP_WINDOWS != 0 {
+        normalized = Options { mem_windows: opt.mem_windows & !HEAP_WINDOWS, heap_windows: true, ..opt.clone() };
+        &normalized
+    } else {
+        opt
+    };
     let mut insts: Vec<Decoded> = Vec::new();
     let mut off = 0usize;
     while off + 4 <= code.len() {
@@ -1335,19 +1408,49 @@ pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
     em.configure_round_modes(&insts, branches == 0);
     em.static_ss = constant_samplers(&insts, &leaders);
     // split wave64: masks only read lane by lane skip the halves' exchange (geometry mode
-    // continues from the ES into the GS through s_setpc: left as it is)
+    // continues from the ES into the GS through s_setpc: left as it is); pixel shaders: they
+    // skip the quad reads that give the helper lanes' bits
     if opt.wave64 && opt.split_wave64 && matches!(opt.mode, Mode::Kernel | Mode::Compute(_) | Mode::Mesh(_)) && std::env::var_os("XCL_X64_ALL_MASKS").is_none() {
-        em.x64_whole_live = x64_masks::by_pc(&insts, matches!(opt.mode, Mode::Kernel));
+        em.mask_whole_live = x64_masks::by_pc(&insts, matches!(opt.mode, Mode::Kernel));
+    } else if matches!(opt.mode, Mode::Pixel(_)) {
+        em.mask_whole_live = x64_masks::by_pc(&insts, false);
     }
-    // a wave64 VS / PS on a GPU that can run 32-lane waves: what lanes 32..63 hold where the
+    // pixel shaders: a mask written in a loop takes its helper lanes' bits from quad reads of
+    // the compare's vector operands (`quad_bits`, #134)
+    if matches!(opt.mode, Mode::Pixel(_)) {
+        em.loops = loop_ranges(&insts);
+    }
+    // a compute group that is not whole console waves: padded to whole waves where the
+    // program can tell the lanes its last wave does not launch
+    if let Mode::Compute(cs) = &opt.mode {
+        let lanes = if opt.wave64 { 64 } else { 32 };
+        let threads: u32 = cs.threads.iter().product();
+        let pad = match opt.pad_waves {
+            PadWaves::WhereSeen if std::env::var_os("XCL_NO_CS_PAD").is_some() => PadWaves::Never,
+            PadWaves::WhereSeen if std::env::var_os("XCL_CS_PAD_ALL").is_some() => PadWaves::Always,
+            p => p,
+        };
+        em.cs_pad = !threads.is_multiple_of(lanes)
+            && threads.next_multiple_of(lanes) <= 1024
+            && match pad {
+                PadWaves::Always => true,
+                PadWaves::Never => false,
+                PadWaves::WhereSeen => partial_waves::sees_lanes_not_launched(&insts, opt.wave64, threads % lanes).is_some(),
+            };
+    }
+    // a VS / PS: its whole-wave reductions as wave operations, at any wave size (`reductions`)
+    let reductions = graphics_reductions(&insts, opt);
+    let reduced: BTreeSet<u64> = reductions.iter().flat_map(|r| r.rest.iter().copied()).collect();
+    // a wave64 VS / PS on a GPU with 32-lane waves only: what lanes 32..63 hold where the
     // program reads them (the driver may still pick 64 lanes: decided at run time); only a
-    // program with a read to change gets the form
+    // program with a read to change – outside the reductions – gets the form
     if opt.wave64 && opt.split_wave64 && matches!(opt.mode, Mode::Vertex(_) | Mode::Pixel(_)) {
         let a = upper_lanes::analyze(&insts);
-        if a.reads.values().any(|r| matches!(r, upper_lanes::Read::Const(_) | upper_lanes::Read::Shadow)) {
+        if a.reads.iter().any(|(pc, r)| !reduced.contains(pc) && matches!(r, upper_lanes::Read::Const(_) | upper_lanes::Read::Shadow)) {
             em.upper = Some(a);
         }
     }
+    em.set_reductions(reductions);
     em.max_vgpr = insts
         .iter()
         .flat_map(|d| {

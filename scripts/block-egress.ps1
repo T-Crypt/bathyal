@@ -3,9 +3,9 @@
 # should have no egress. Needs an elevated shell. Running it again keeps the existing rule.
 #
 #   powershell -ExecutionPolicy Bypass -File scripts\block-egress.ps1
-#   powershell -ExecutionPolicy Bypass -File scripts\block-egress.ps1 -Program D:\other\xcl.exe
+#   powershell -ExecutionPolicy Bypass -File scripts\block-egress.ps1 -Program D:\other\bathyal.exe
 param(
-    [string]$Program = (Join-Path (Split-Path -Parent $PSScriptRoot) 'target\release\xcl.exe'),
+    [string]$Program = (Join-Path (Split-Path -Parent $PSScriptRoot) 'target\release\bathyal.exe'),
     [string]$Name = ''
 )
 $ErrorActionPreference = 'Stop'

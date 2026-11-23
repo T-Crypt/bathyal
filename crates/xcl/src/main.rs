@@ -7,7 +7,7 @@ use std::sync::atomic::Ordering;
 /// Our own TLS callback: ntdll calls it for every thread start/exit in the process.
 /// In host mode it initialises the game's static TLS for the new thread and forwards
 /// the notification to the game's TLS callbacks / DllMains.
-unsafe extern "system" fn xcl_tls_callback(_h: *mut c_void, reason: u32, _r: *mut c_void) {
+unsafe extern "system-unwind" fn xcl_tls_callback(_h: *mut c_void, reason: u32, _r: *mut c_void) {
     if xcl::host::HOST_MODE.load(Ordering::Acquire) {
         xcl::loader::on_tls_event(reason);
     }
@@ -15,30 +15,30 @@ unsafe extern "system" fn xcl_tls_callback(_h: *mut c_void, reason: u32, _r: *mu
 
 #[used]
 #[link_section = ".CRT$XLY"]
-static XCL_TLS_CALLBACK: unsafe extern "system" fn(*mut c_void, u32, *mut c_void) = xcl_tls_callback;
+static XCL_TLS_CALLBACK: unsafe extern "system-unwind" fn(*mut c_void, u32, *mut c_void) = xcl_tls_callback;
 
 const HELP: &str = "\
-XCL – Xbox Series X|S → Windows compatibility layer
+Bathyal – Xbox Series X|S → Windows compatibility layer (a fork of XCL)
 
 Usage:
-  xcl run <game folder | file.exe> [-- game arguments]
+  bathyal run <game folder | file.exe> [-- game arguments]
       Runs the game. The game folder is only read; writes, game saves and logs go to
       %LOCALAPPDATA%\\XCL\\<title>\\ (or %XCL_DATA_ROOT%\\<title>\\).
-  xcl inspect <file.exe|file.dll> [--json]
-      Analysis without running: imports and what XCL has for them (HLE / Windows / stub).
-  xcl disasm <file> [--offset N] [--length N] [--all] [--hex] [--fssm FILE]
+  bathyal inspect <file.exe|file.dll> [--json]
+      Analysis without running: imports and what Bathyal has for them (HLE / Windows / stub).
+  bathyal disasm <file> [--offset N] [--length N] [--all] [--hex] [--fssm FILE]
       Disassembler for console GPU code (RDNA2) – e.g. for shaders saved in <data>\\shaders\\.
       Console containers (XDAT/XBCH/FSSM) are unpacked; --fssm saves the unpacked FSSM.
-  xcl shaders <file | folder | package.rpf> [--top N] [--json] [--recomp] [--compile N]
+  bathyal shaders <file | folder | package.rpf> [--top N] [--json] [--recomp] [--compile N]
       Shader corpus statistics: formats, stages, RDNA2 instruction histogram (priorities
       for the recompiler). RPF9 packages are scanned for shader records.
       --recomp: translates every RDNA2 program → HLSL and shows what is missing;
       --compile N: additionally compiles N complete translations with DXC.
-  xcl rpf <package.rpf> [--top N] [--find NAME] [--extract NAME --out DIR]
+  bathyal rpf <package.rpf> [--top N] [--find NAME] [--extract NAME --out DIR]
       Lists or extracts readable inline records. Archives larger than 1 GB use a
       bounded-memory header probe; --probe requests it explicitly and --full overrides it.
       Use --probe only for header summaries, without --find, --extract, --out or --full.
-  xcl --version
+  bathyal --version
 ";
 
 fn main() {
@@ -67,7 +67,7 @@ fn main() {
         Some("shaders") if args.len() >= 2 => xcl::shaders::run(&PathBuf::from(&args[1]), &args[2..]),
         Some("rpf") if args.len() >= 2 => xcl::rpf::run(&PathBuf::from(&args[1]), &args[2..]),
         Some("--version") | Some("-V") => {
-            println!("xcl {}", env!("CARGO_PKG_VERSION"));
+            println!("bathyal {} (XCL fork)", env!("CARGO_PKG_VERSION"));
             0
         }
         None if started_by_double_click() => run_picked_game(),
@@ -110,7 +110,7 @@ fn run_picked_game() -> i32 {
     let Some(target) = target else { return 0 };
     let _ = std::fs::create_dir_all(xcl::launcher::data_root());
     let _ = std::fs::write(&last_file, target.to_string_lossy().as_bytes());
-    println!("xcl run \"{}\"", target.display());
+    println!("bathyal run \"{}\"", target.display());
     let code = xcl::launcher::run(&target, &[]);
     if code != 0 {
         println!("\nXCL ended with code {code}. Press Enter to close.");
@@ -199,9 +199,9 @@ fn menu(last: Option<&std::path::Path>) -> Choice {
     const AGAIN: i32 = 101;
     type TaskDialogIndirect = unsafe extern "system" fn(*const TASKDIALOGCONFIG, *mut i32, *mut i32, *mut i32) -> i32;
     let Some(f) = (unsafe { system_proc("comctl32.dll", "TaskDialogIndirect") }) else { return Choice::NoMenu };
-    let title = wide("XCL");
+    let title = wide("Bathyal");
     let heading = wide("Run an Xbox Series game");
-    let content = wide("XCL runs the game from its unpacked files. Choose the game's exe or its MicrosoftGame.config.");
+    let content = wide("Bathyal runs the game from its unpacked files. Choose the game's exe or its MicrosoftGame.config.");
     let again = last.map(|p| wide(&format!("Run again\n{}", p.display())));
     let choose = wide("Choose a game…\nThe game's exe or MicrosoftGame.config");
     let mut buttons = Vec::new();
@@ -237,7 +237,7 @@ fn pick_game_file() -> Option<PathBuf> {
     let f = unsafe { system_proc("comdlg32.dll", "GetOpenFileNameW") }?;
     // pairs of (description, pattern), each ending in NUL, the list in one more
     let filter: Vec<u16> = "Xbox game (*.exe, MicrosoftGame.config)\0*.exe;MicrosoftGame.config\0All files\0*.*\0\0".encode_utf16().collect();
-    let title = wide("XCL – choose a game");
+    let title = wide("Bathyal – choose a game");
     let mut file = vec![0u16; 32768];
     let mut ofn: OPENFILENAMEW = unsafe { std::mem::zeroed() };
     ofn.lStructSize = std::mem::size_of::<OPENFILENAMEW>() as u32;

@@ -474,11 +474,11 @@ unsafe extern "system" fn hk_disk_free_a(n: *const u8, spc: *mut u32, bps: *mut 
 type FnCreateDirW = unsafe extern "system" fn(*const u16, *const c_void) -> i32;
 type FnPathW = unsafe extern "system" fn(*const u16) -> i32;
 type FnMoveFileExW = unsafe extern "system" fn(*const u16, *const u16, u32) -> i32;
-type FnMoveFileWithProgressW = unsafe extern "system" fn(*const u16, *const u16, *const c_void, *const c_void, u32) -> i32;
-type FnMoveFileWithProgressA = unsafe extern "system" fn(*const u8, *const u8, *const c_void, *const c_void, u32) -> i32;
-type FnCopyFileExW = unsafe extern "system" fn(*const u16, *const u16, *const c_void, *const c_void, *mut i32, u32) -> i32;
+type FnMoveFileWithProgressW = unsafe extern "system-unwind" fn(*const u16, *const u16, *const c_void, *const c_void, u32) -> i32;
+type FnMoveFileWithProgressA = unsafe extern "system-unwind" fn(*const u8, *const u8, *const c_void, *const c_void, u32) -> i32;
+type FnCopyFileExW = unsafe extern "system-unwind" fn(*const u16, *const u16, *const c_void, *const c_void, *mut i32, u32) -> i32;
 type FnCopyFileW = unsafe extern "system" fn(*const u16, *const u16, i32) -> i32;
-type FnCopyFile2 = unsafe extern "system" fn(*const u16, *const u16, *const c_void) -> i32;
+type FnCopyFile2 = unsafe extern "system-unwind" fn(*const u16, *const u16, *const c_void) -> i32;
 type FnReplaceFileW = unsafe extern "system" fn(*const u16, *const u16, *const u16, u32, *const c_void, *const c_void) -> i32;
 static O_CREATE_DIR_W: AtomicUsize = AtomicUsize::new(0);
 static O_REMOVE_DIR_W: AtomicUsize = AtomicUsize::new(0);
@@ -606,7 +606,7 @@ unsafe extern "system" fn hk_move_file_ex_w(src: *const u16, dst: *const u16, fl
 
 /// MoveFileW reaches MoveFileWithProgressW without going through MoveFileExW (Windows 11; under
 /// Wine the ANSI moves do too). Where MoveFileExW calls it, the guard lets the inner call through.
-unsafe extern "system" fn hk_move_file_with_progress_w(src: *const u16, dst: *const u16, prog: *const c_void, data: *const c_void, flags: u32) -> i32 {
+unsafe extern "system-unwind" fn hk_move_file_with_progress_w(src: *const u16, dst: *const u16, prog: *const c_void, data: *const c_void, flags: u32) -> i32 {
     let orig = orig!(O_MOVE_FILE_PROGRESS_W as FnMoveFileWithProgressW);
     move_file(src, dst, flags, |s, d, f| orig(s, d, prog, data, f))
 }
@@ -630,7 +630,7 @@ unsafe extern "system" fn hk_move_file_ex_a(src: *const u8, dst: *const u8, flag
     move_file_a(src, dst, std::ptr::null(), std::ptr::null(), flags, || orig(src, dst, flags))
 }
 
-unsafe extern "system" fn hk_move_file_with_progress_a(src: *const u8, dst: *const u8, prog: *const c_void, data: *const c_void, flags: u32) -> i32 {
+unsafe extern "system-unwind" fn hk_move_file_with_progress_a(src: *const u8, dst: *const u8, prog: *const c_void, data: *const c_void, flags: u32) -> i32 {
     let orig = orig!(O_MOVE_FILE_PROGRESS_A as FnMoveFileWithProgressA);
     move_file_a(src, dst, prog, data, flags, || orig(src, dst, prog, data, flags))
 }
@@ -814,7 +814,7 @@ unsafe fn copy_file_ex_w_vfs(
     ok
 }
 
-unsafe extern "system" fn hk_copy_file_ex_w(src: *const u16, dst: *const u16, prog: *const c_void, data: *const c_void, cancel: *mut i32, flags: u32) -> i32 {
+unsafe extern "system-unwind" fn hk_copy_file_ex_w(src: *const u16, dst: *const u16, prog: *const c_void, data: *const c_void, cancel: *mut i32, flags: u32) -> i32 {
     let orig = orig!(O_COPY_FILE_EX_W as FnCopyFileExW);
     let (Some(_g), Some(v)) = (Guard::enter(), vfs::get()) else { return orig(src, dst, prog, data, cancel, flags) };
     let (Some(s), Some(d)) = (from_wide_ptr(src), from_wide_ptr(dst)) else { return orig(src, dst, prog, data, cancel, flags) };
@@ -886,7 +886,7 @@ unsafe fn copy_file_2_vfs(
     hr
 }
 
-unsafe extern "system" fn hk_copy_file_2(src: *const u16, dst: *const u16, params: *const c_void) -> i32 {
+unsafe extern "system-unwind" fn hk_copy_file_2(src: *const u16, dst: *const u16, params: *const c_void) -> i32 {
     let orig = orig!(O_COPY_FILE_2 as FnCopyFile2);
     let (Some(_g), Some(v)) = (Guard::enter(), vfs::get()) else { return orig(src, dst, params) };
     let (Some(s), Some(d)) = (from_wide_ptr(src), from_wide_ptr(dst)) else { return orig(src, dst, params) };

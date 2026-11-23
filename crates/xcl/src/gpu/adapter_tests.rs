@@ -1,4 +1,18 @@
 use super::{select_indices, Selector};
+use windows::Win32::Graphics::Dxgi::*;
+
+#[test]
+fn software_adapters_are_recognized() {
+    // the Basic Render Driver is not flagged software by DXGI, so its ids identify it
+    let basic = DXGI_ADAPTER_DESC1 { VendorId: 0x1414, DeviceId: 0x008c, ..Default::default() };
+    assert!(super::basic_render_driver(&basic));
+    assert!(super::software(&basic));
+    let warp = DXGI_ADAPTER_DESC1 { Flags: DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32, ..Default::default() };
+    assert!(super::software(&warp));
+    let gpu = DXGI_ADAPTER_DESC1 { VendorId: 0x10de, DeviceId: 0x2684, ..Default::default() };
+    assert!(!super::basic_render_driver(&gpu));
+    assert!(!super::software(&gpu));
+}
 
 #[test]
 fn selector_parsing() {

@@ -51,9 +51,9 @@ fn section_protection(ch: u32) -> u32 {
     }
 }
 
-type TlsCallback = unsafe extern "system" fn(*mut c_void, u32, *mut c_void);
-type DllMain = unsafe extern "system" fn(*mut c_void, u32, *mut c_void) -> i32;
-type ExeEntry = unsafe extern "system" fn(*mut c_void) -> u32;
+type TlsCallback = unsafe extern "system-unwind" fn(*mut c_void, u32, *mut c_void);
+type DllMain = unsafe extern "system-unwind" fn(*mut c_void, u32, *mut c_void) -> i32;
+type ExeEntry = unsafe extern "system-unwind" fn(*mut c_void) -> u32;
 
 /// Map an image, apply relocations, resolve imports, set up TLS / exception data and
 /// page protections. Does NOT run any code of the image.
@@ -191,7 +191,7 @@ fn map_image_ex(path: &Path, is_main: bool) -> Result<Arc<MappedModule>, String>
         let index_ptr = if t.address_of_index == 0 { std::ptr::null_mut() } else { adj(t.address_of_index) as *mut u32 };
         unsafe {
             // game DLLs loaded while its imports were resolved may point into it: its memory stays
-            tls_install(&module, template, template_len, t.total_len(), index_ptr).inspect_err(|_| modules::unregister_mapped(base))?;
+            tls_install(&module, template, template_len, t.total_len(), t.characteristics, index_ptr).inspect_err(|_| modules::unregister_mapped(base))?;
             if t.address_of_callbacks != 0 {
                 let mut cb = adj(t.address_of_callbacks) as *const u64;
                 let mut list = module.tls_callbacks.lock().unwrap();
@@ -234,8 +234,15 @@ fn map_image_ex(path: &Path, is_main: bool) -> Result<Arc<MappedModule>, String>
     Ok(module)
 }
 
-unsafe fn tls_install(m: &MappedModule, template: usize, len: usize, total: u64, index_ptr: *mut u32) -> Result<(), String> {
-    let k = crate::tls::install(&m.name, template, len, total, index_ptr, &cache_dir())?;
+unsafe fn tls_install(
+    m: &MappedModule,
+    template: usize,
+    len: usize,
+    total: u64,
+    characteristics: u32,
+    index_ptr: *mut u32,
+) -> Result<(), String> {
+    let k = crate::tls::install(&m.name, template, len, total, characteristics, index_ptr, &cache_dir())?;
     // the title's executable: slot 0, as a process's executable has it
     if !m.is_dll {
         if let Err(e) = crate::tls::take_slot_zero(&m.name, index_ptr, k) {
@@ -325,7 +332,7 @@ struct EntryArgs {
     entry: usize,
 }
 
-unsafe extern "system" fn main_thread(param: *mut c_void) -> u32 {
+unsafe extern "system-unwind" fn main_thread(param: *mut c_void) -> u32 {
     let args = Box::from_raw(param as *mut EntryArgs);
     let f: ExeEntry = std::mem::transmute(args.entry);
     f(peb() as *mut c_void)
@@ -359,10 +366,15 @@ pub fn run_main(m: &Arc<MappedModule>) -> u32 {
     );
     crate::log::flush();
     unsafe {
+        // SAFETY: `extern "system-unwind"` and `extern "system"` share the identical Win64 ABI;
+        // Windows `BaseThreadInitThunk` wraps the thread routine in an SEH handler so foreign/guest
+        // exceptions can reach `SetUnhandledExceptionFilter` instead of aborting in `main_thread`.
+        let start_routine: unsafe extern "system" fn(*mut c_void) -> u32 =
+            std::mem::transmute::<unsafe extern "system-unwind" fn(*mut c_void) -> u32, _>(main_thread);
         let h = CreateThread(
             std::ptr::null(),
             stack,
-            Some(main_thread),
+            Some(start_routine),
             args as *const c_void,
             STACK_SIZE_PARAM_IS_A_RESERVATION,
             std::ptr::null_mut(),
@@ -521,5 +533,69 @@ mod tests {
             assert!(r.as_ref().is_err_and(|e| e.contains("import table")), "attempt {attempt}: {:?}", r.map(|m| m.base));
             assert!(modules::find_mapped_by_name(&key).is_none(), "attempt {attempt}: still registered");
         }
+    }
+
+    #[test]
+    fn init_dll_and_tls_callback_unwind_cleanly() {
+        unsafe extern "system-unwind" fn throwing_dll_main(_base: *mut c_void, _reason: u32, _reserved: *mut c_void) -> i32 {
+            panic!("guest DllMain unwind");
+        }
+        unsafe extern "system-unwind" fn throwing_tls_cb(_base: *mut c_void, _reason: u32, _reserved: *mut c_void) {
+            panic!("guest TLS callback unwind");
+        }
+
+        // (a) Guest DllMain unwinding across `init_dll` drops `LoadGuard` and releases `LOAD_LOCK`.
+        let dll_main_addr = throwing_dll_main as usize;
+        let m_dll = Arc::new(MappedModule {
+            name: "unwind_test_dllmain.dll".into(),
+            path: PathBuf::from("unwind_test_dllmain.dll"),
+            base: dll_main_addr - 0x1000,
+            size: 0x2000,
+            entry_rva: 0x1000,
+            is_dll: true,
+            exports: OwnedExports::default(),
+            tls_callbacks: Mutex::new(Vec::new()),
+            no_thread_calls: AtomicBool::new(false),
+            initialized: AtomicBool::new(false),
+            stack_reserve: 0,
+        });
+        let r1 = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let (_g, _lock) = LoadGuard::enter();
+            let _ = init_dll(&m_dll);
+        }));
+        assert!(r1.is_err(), "init_dll must propagate unwind from guest DllMain");
+        assert_eq!(IN_LOAD.with(|c| c.get()), 0, "LoadGuard::drop must reset IN_LOAD on unwind");
+        LOAD_LOCK.clear_poison();
+        {
+            // Subsequent LoadGuard::enter() must succeed cleanly without deadlocking.
+            let (_g, _lock) = LoadGuard::enter();
+        }
+        assert!(!m_dll.initialized.load(Ordering::Acquire));
+
+        // (b) Guest TLS callback unwinding across `init_dll` drops `LoadGuard` cleanly.
+        let m_tls = Arc::new(MappedModule {
+            name: "unwind_test_tls.dll".into(),
+            path: PathBuf::from("unwind_test_tls.dll"),
+            base: 0x1000,
+            size: 0x1000,
+            entry_rva: 0,
+            is_dll: true,
+            exports: OwnedExports::default(),
+            tls_callbacks: Mutex::new(vec![throwing_tls_cb as usize]),
+            no_thread_calls: AtomicBool::new(false),
+            initialized: AtomicBool::new(false),
+            stack_reserve: 0,
+        });
+        let r2 = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let (_g, _lock) = LoadGuard::enter();
+            let _ = init_dll(&m_tls);
+        }));
+        assert!(r2.is_err(), "init_dll must propagate unwind from guest TLS callback");
+        assert_eq!(IN_LOAD.with(|c| c.get()), 0, "LoadGuard::drop must reset IN_LOAD on TLS unwind");
+        LOAD_LOCK.clear_poison();
+        {
+            let (_g, _lock) = LoadGuard::enter();
+        }
+        assert!(!m_tls.initialized.load(Ordering::Acquire));
     }
 }

@@ -75,7 +75,7 @@ pub struct Report {
     /// XCL slots it called that XCL does not implement
     #[serde(default)]
     pub xgameruntime: crate::hle::xgameruntime::api::ApiStats,
-    /// DirectStorage: BCPack requests refused (no decoder) by mode, and bytes filled under
+    /// DirectStorage: BCPack requests unpacked and refused (no decoder) by mode, and bytes filled under
     /// `XCL_DSTORAGE_BCPACK_FILL`
     #[serde(default)]
     pub dstorage: crate::hle::dstorage::DStorageStats,
@@ -132,7 +132,7 @@ pub fn build() -> Report {
         xcl_version: env!("CARGO_PKG_VERSION").to_string(),
         title: boot.map(|b| b.title.clone()).unwrap_or_default(),
         exe: boot.map(|b| b.exe_path.to_string_lossy().into_owned()).unwrap_or_default(),
-        crash: CRASH.lock().ok().and_then(|g| g.clone()),
+        crash: CRASH.lock().unwrap_or_else(|p| p.into_inner()).clone(),
         exit_code: None,
         environment: Vec::new(),
         imports_by_source: by_source,
@@ -154,14 +154,66 @@ pub fn build() -> Report {
     }
 }
 
+thread_local! {
+    static IN_WRITE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+struct InWriteGuard;
+impl InWriteGuard {
+    fn enter() -> Option<Self> {
+        IN_WRITE.with(|c| {
+            if c.get() {
+                None
+            } else {
+                c.set(true);
+                Some(InWriteGuard)
+            }
+        })
+    }
+}
+impl Drop for InWriteGuard {
+    fn drop(&mut self) {
+        IN_WRITE.with(|c| c.set(false));
+    }
+}
+
+/// Fallback report when a full `build()` cannot be completed (e.g. re-entrant crash or lock contention).
+fn build_fallback(crash: Option<String>) -> Report {
+    let boot = crate::state::boot();
+    Report {
+        xcl_version: env!("CARGO_PKG_VERSION").to_string(),
+        title: boot.map(|b| b.title.clone()).unwrap_or_default(),
+        exe: boot.map(|b| b.exe_path.to_string_lossy().into_owned()).unwrap_or_default(),
+        crash,
+        notes: vec![
+            "Fallback crash report written due to lock contention or re-entrant crash during exit.".into(),
+        ],
+        ..Default::default()
+    }
+}
+
+fn write_report_file(path: &std::path::Path, r: &Report) -> bool {
+    if let Ok(s) = serde_json::to_string_pretty(r) {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        std::fs::write(path, s).is_ok()
+    } else {
+        false
+    }
+}
+
 /// `m.try_lock()`, retried for `wait`: never an endless wait – the holder may be this very
-/// thread, crashed inside `build()`.
+/// thread, crashed inside `build()`. Recovers from mutex poisoning.
 fn lock_within<T>(m: &Mutex<T>, wait: Duration) -> Option<MutexGuard<'_, T>> {
     let end = Instant::now() + wait;
     loop {
         match m.try_lock() {
             Ok(g) => return Some(g),
-            Err(TryLockError::WouldBlock) if Instant::now() < end => std::thread::sleep(Duration::from_millis(10)),
+            Err(TryLockError::Poisoned(p)) => return Some(p.into_inner()),
+            Err(TryLockError::WouldBlock) if Instant::now() < end => {
+                std::thread::sleep(Duration::from_millis(2));
+            }
             Err(_) => return None,
         }
     }
@@ -171,19 +223,70 @@ fn lock_within<T>(m: &Mutex<T>, wait: Duration) -> Option<MutexGuard<'_, T>> {
 pub fn write_final(crash: Option<String>) {
     // the process ends: a cursor held in the XCL window is let go
     crate::hle::kbm::release();
-    // a crash is kept even while another thread writes the report, and is written once that
-    // thread is done – the process ends right after (#106); other calls give way at once
+
     let wait = if crash.is_some() { Duration::from_secs(2) } else { Duration::ZERO };
-    if let Some(c) = crash {
+
+    // Record crash in CRASH static first so it is never lost regardless of lock state
+    if let Some(c) = crash.as_ref() {
         if let Some(mut g) = lock_within(&CRASH, wait) {
-            g.get_or_insert(c);
+            g.get_or_insert_with(|| c.clone());
         }
     }
-    let Some(_g) = lock_within(&WRITE_LOCK, wait) else { return };
+
+    // Check re-entrancy on the same thread: if this thread already holds WRITE_LOCK and crashed
+    // inside build() or write_final(), avoid deadlocking on WRITE_LOCK or re-entering build()
+    let Some(_in_write_guard) = InWriteGuard::enter() else {
+        let recorded = CRASH.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        if let Some(boot) = crate::state::boot() {
+            let path = boot.report_path();
+            let mut r = load(&path).unwrap_or_else(|| build_fallback(None));
+            if recorded.is_some() {
+                r.crash = recorded;
+            }
+            write_report_file(&path, &r);
+        }
+        return;
+    };
+
+    // A crash is kept even while another thread writes the report, and is written once that
+    // thread is done – the process ends right after (#106); other calls give way at once
+    let lock_guard = lock_within(&WRITE_LOCK, wait);
+    let Some(_g) = lock_guard else {
+        // WRITE_LOCK had contention or timed out. If there is a crash recorded,
+        // ensure it is persisted even without the lock so crash info is never dropped.
+        let recorded = CRASH.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        if recorded.is_some() {
+            if let Some(boot) = crate::state::boot() {
+                let path = boot.report_path();
+                let mut r = load(&path).unwrap_or_else(|| build_fallback(None));
+                r.crash = recorded;
+                write_report_file(&path, &r);
+            }
+        }
+        return;
+    };
+
     let Some(boot) = crate::state::boot() else { return };
-    let r = build();
-    if let Ok(s) = serde_json::to_string_pretty(&r) {
-        let _ = std::fs::write(boot.report_path(), s);
+    let mut r = build();
+
+    // Re-check CRASH in case another thread recorded a crash while build() was running
+    if r.crash.is_none() {
+        let current = CRASH.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        if current.is_some() {
+            r.crash = current;
+        }
+    }
+
+    let path = boot.report_path();
+    write_report_file(&path, &r);
+
+    // If a crash arrived while writing to disk, update the file before releasing WRITE_LOCK
+    if r.crash.is_none() {
+        let current = CRASH.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        if let Some(c) = current {
+            r.crash = Some(c);
+            write_report_file(&path, &r);
+        }
     }
 }
 
@@ -195,8 +298,12 @@ pub fn load(path: &std::path::Path) -> Option<Report> {
 mod tests {
     use super::*;
 
+    static TEST_SERIAL: Mutex<()> = Mutex::new(());
+
     #[test]
     fn a_crash_is_kept_while_another_thread_writes_the_report() {
+        let _lock = TEST_SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        *CRASH.lock().unwrap_or_else(|p| p.into_inner()) = None;
         let (held, wait_held) = std::sync::mpsc::channel();
         let writer = std::thread::spawn(move || {
             let _g = WRITE_LOCK.lock().unwrap();
@@ -207,7 +314,87 @@ mod tests {
         // no boot record in unit tests: nothing is written to disk
         write_final(Some("boom".into()));
         writer.join().unwrap();
-        assert_eq!(CRASH.lock().unwrap().as_deref(), Some("boom"));
-        *CRASH.lock().unwrap() = None;
+        assert_eq!(CRASH.lock().unwrap_or_else(|p| p.into_inner()).as_deref(), Some("boom"));
+        *CRASH.lock().unwrap_or_else(|p| p.into_inner()) = None;
+    }
+
+    #[test]
+    fn lock_within_recovers_from_poisoned_mutex() {
+        let m = Mutex::new(42);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _g = m.lock().unwrap();
+            panic!("poisoning mutex");
+        }));
+        assert!(m.is_poisoned());
+        let guard = lock_within(&m, Duration::from_millis(50));
+        assert!(guard.is_some());
+        assert_eq!(*guard.unwrap(), 42);
+    }
+
+    #[test]
+    fn write_final_recovers_when_crash_mutex_is_poisoned() {
+        let _lock = TEST_SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        *CRASH.lock().unwrap_or_else(|p| p.into_inner()) = None;
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _g = CRASH.lock().unwrap_or_else(|p| p.into_inner());
+            panic!("poisoning CRASH");
+        }));
+        write_final(Some("recovered".into()));
+        assert_eq!(CRASH.lock().unwrap_or_else(|p| p.into_inner()).as_deref(), Some("recovered"));
+        *CRASH.lock().unwrap_or_else(|p| p.into_inner()) = None;
+    }
+
+    #[test]
+    fn first_crash_payload_is_preserved_under_contention() {
+        let _lock = TEST_SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        *CRASH.lock().unwrap_or_else(|p| p.into_inner()) = None;
+        write_final(Some("first-crash".into()));
+        write_final(Some("second-crash".into()));
+        assert_eq!(CRASH.lock().unwrap_or_else(|p| p.into_inner()).as_deref(), Some("first-crash"));
+        *CRASH.lock().unwrap_or_else(|p| p.into_inner()) = None;
+    }
+
+    #[test]
+    fn reentrant_write_final_does_not_deadlock() {
+        let _lock = TEST_SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        *CRASH.lock().unwrap_or_else(|p| p.into_inner()) = None;
+        let _guard = InWriteGuard::enter().unwrap();
+        // Inside write_final simulated: a crash occurs and write_final is called re-entrantly
+        write_final(Some("reentrant-crash".into()));
+        assert_eq!(CRASH.lock().unwrap_or_else(|p| p.into_inner()).as_deref(), Some("reentrant-crash"));
+        drop(_guard);
+        *CRASH.lock().unwrap_or_else(|p| p.into_inner()) = None;
+    }
+
+    #[test]
+    fn concurrent_exit_and_crash_persists_without_deadlock() {
+        let _lock = TEST_SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        *CRASH.lock().unwrap_or_else(|p| p.into_inner()) = None;
+        let mut handles = Vec::new();
+        for i in 0..10 {
+            handles.push(std::thread::spawn(move || {
+                if i % 2 == 0 {
+                    write_final(Some(format!("concurrent-crash-{i}")));
+                } else {
+                    write_final(None);
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        let recorded = CRASH.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        assert!(recorded.is_some());
+        assert!(recorded.unwrap().starts_with("concurrent-crash-"));
+        *CRASH.lock().unwrap_or_else(|p| p.into_inner()) = None;
+    }
+
+    #[test]
+    fn fallback_report_structure_is_valid() {
+        let r = build_fallback(Some("test-fallback-crash".into()));
+        assert_eq!(r.crash.as_deref(), Some("test-fallback-crash"));
+        let json = serde_json::to_string_pretty(&r).expect("fallback report must serialize to valid JSON");
+        let parsed: Report = serde_json::from_str(&json).expect("fallback report must deserialize");
+        assert_eq!(parsed.crash.as_deref(), Some("test-fallback-crash"));
     }
 }

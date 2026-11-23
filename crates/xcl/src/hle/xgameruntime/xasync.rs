@@ -16,7 +16,7 @@
 
 use std::collections::HashMap;
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 use super::taskqueue::{self, Item, PORT_COMPLETION, PORT_WORK};
@@ -50,7 +50,7 @@ pub struct XAsyncProviderData {
     pub context: *mut c_void,
 }
 
-pub type XAsyncProvider = unsafe extern "system" fn(u32, *const XAsyncProviderData) -> HRESULT;
+pub type XAsyncProvider = unsafe extern "system-unwind" fn(u32, *const XAsyncProviderData) -> HRESULT;
 
 /// The PC runtime's XAsync / XTaskQueue object (0 = XCL's own queues). Its slots: 3 GetStatus,
 /// 4 GetResultSize, 5 Cancel, 6 Run, 7 Begin, 9 Schedule, 10 Complete, 11 GetResult.
@@ -74,14 +74,14 @@ unsafe fn pc(slot: usize) -> Option<(usize, usize)> {
 /// XAsync object when in use – its queue handles mean nothing to XCL's – else XCL's).
 pub unsafe fn submit_callback(queue: *mut c_void, port: u32, ctx: *mut c_void, cb: usize) -> HRESULT {
     if let Some((o, f)) = pc(18) {
-        let f: unsafe extern "system" fn(usize, *mut c_void, u32, *mut c_void, usize) -> HRESULT = std::mem::transmute(f);
+        let f: unsafe extern "system-unwind" fn(usize, *mut c_void, u32, *mut c_void, usize) -> HRESULT = std::mem::transmute(f);
         return f(o, queue, port, ctx, cb);
     }
     super::taskqueue::XTaskQueueSubmitCallback(queue, port, ctx, cb)
 }
 
-pub type XAsyncWork = unsafe extern "system" fn(*mut XAsyncBlock) -> HRESULT;
-type Completion = unsafe extern "system" fn(*mut XAsyncBlock);
+pub type XAsyncWork = unsafe extern "system-unwind" fn(*mut XAsyncBlock) -> HRESULT;
+type Completion = unsafe extern "system-unwind" fn(*mut XAsyncBlock);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Phase {
@@ -116,6 +116,9 @@ pub struct State {
     identity: usize,
     /// For XAsyncRun.
     work: usize,
+    /// Keeps XCL's `begin_with` / `begin_with_fixups` payload alive as long as any `Arc<State>`
+    /// exists (eliminating concurrent/unwind UAF when `PC_ASYNC == 0`).
+    _owned_payload: Option<Arc<Payload>>,
     inner: Mutex<Inner>,
     cv: Condvar,
 }
@@ -195,7 +198,7 @@ unsafe fn call_provider(s: &State, op: u32, b: *mut XAsyncBlock, buffer: *mut c_
     f(op, &data)
 }
 
-unsafe extern "system" fn do_work_cb(ctx: *mut c_void, canceled: bool) {
+unsafe extern "system-unwind" fn do_work_cb(ctx: *mut c_void, canceled: bool) {
     let b = ctx as *mut XAsyncBlock;
     let Lookup::Active(s) = lookup(b) else { return };
     if canceled {
@@ -217,7 +220,7 @@ unsafe extern "system" fn do_work_cb(ctx: *mut c_void, canceled: bool) {
     }
 }
 
-unsafe extern "system" fn completion_cb(ctx: *mut c_void, _canceled: bool) {
+unsafe extern "system-unwind" fn completion_cb(ctx: *mut c_void, _canceled: bool) {
     let b = ctx as *mut XAsyncBlock;
     if (*b).callback != 0 {
         let f: Completion = std::mem::transmute((*b).callback);
@@ -225,17 +228,52 @@ unsafe extern "system" fn completion_cb(ctx: *mut c_void, _canceled: bool) {
     }
 }
 
-pub unsafe extern "system" fn XAsyncBegin(
+/// Removes `b` from `ACTIVE` and marks it aborted/consumed (waking any waiters) if `OP_BEGIN`
+/// or `XAsyncSchedule` unwinds while the block is still `Phase::Pending`. If the block already
+/// completed synchronously before unwinding (e.g. `Phase::Done` with payload), it is left intact.
+struct BeginCleanup {
+    b: *mut XAsyncBlock,
+    s: Arc<State>,
+    armed: bool,
+}
+
+impl Drop for BeginCleanup {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let woke = {
+            let mut map = active_map().lock().unwrap_or_else(|e| e.into_inner());
+            let mut g = self.s.inner.lock().unwrap_or_else(|e| e.into_inner());
+            if g.phase == Phase::Pending {
+                if map.get(&(self.b as usize)).is_some_and(|cur| cur.id == self.s.id) {
+                    map.remove(&(self.b as usize));
+                }
+                unsafe {
+                    write_header(self.b, BlockHeader { status: E_ABORT, flags: FLAG_DONE | FLAG_CONSUMED, id: self.s.id });
+                }
+                g.status = E_ABORT;
+                g.result_size = 0;
+                g.phase = Phase::Consumed;
+                true
+            } else {
+                false
+            }
+        };
+        if woke {
+            self.s.cv.notify_all();
+        }
+    }
+}
+
+unsafe fn xasync_begin_inner(
     b: *mut XAsyncBlock,
     context: *mut c_void,
     identity: *const c_void,
     _identity_name: *const u8,
     provider: usize,
+    owned_payload: Option<Arc<Payload>>,
 ) -> HRESULT {
-    if let Some((o, f)) = pc(7) {
-        let f: unsafe extern "system" fn(usize, *mut XAsyncBlock, *mut c_void, *const c_void, *const u8, usize) -> HRESULT = std::mem::transmute(f);
-        return f(o, b, context, identity, _identity_name, provider);
-    }
     if b.is_null() || provider == 0 {
         return E_INVALIDARG;
     }
@@ -245,22 +283,39 @@ pub unsafe extern "system" fn XAsyncBegin(
         context: context as usize,
         identity: identity as usize,
         work: 0,
+        _owned_payload: owned_payload,
         inner: Mutex::new(Inner { status: E_PENDING, result_size: 0, phase: Phase::Pending }),
         cv: Condvar::new(),
     });
     register_state(b, s.clone());
+    let mut cleanup = BeginCleanup { b, s: s.clone(), armed: true };
     // A failing Begin fails the async call, not XAsyncBegin (libHttpClient): the caller gets
     // the error once, through the block, and not also as this return value.
     let hr = call_provider(&s, OP_BEGIN, b, std::ptr::null_mut(), 0);
+    cleanup.armed = false;
     if hr < 0 {
         XAsyncComplete(b, hr, 0);
     }
     S_OK
 }
 
-pub unsafe extern "system" fn XAsyncSchedule(b: *mut XAsyncBlock, delay_ms: u32) -> HRESULT {
+pub unsafe extern "system-unwind" fn XAsyncBegin(
+    b: *mut XAsyncBlock,
+    context: *mut c_void,
+    identity: *const c_void,
+    identity_name: *const u8,
+    provider: usize,
+) -> HRESULT {
+    if let Some((o, f)) = pc(7) {
+        let f: unsafe extern "system-unwind" fn(usize, *mut XAsyncBlock, *mut c_void, *const c_void, *const u8, usize) -> HRESULT = std::mem::transmute(f);
+        return f(o, b, context, identity, identity_name, provider);
+    }
+    xasync_begin_inner(b, context, identity, identity_name, provider, None)
+}
+
+pub unsafe extern "system-unwind" fn XAsyncSchedule(b: *mut XAsyncBlock, delay_ms: u32) -> HRESULT {
     if let Some((o, f)) = pc(9) {
-        let f: unsafe extern "system" fn(usize, *mut XAsyncBlock, u32) -> HRESULT = std::mem::transmute(f);
+        let f: unsafe extern "system-unwind" fn(usize, *mut XAsyncBlock, u32) -> HRESULT = std::mem::transmute(f);
         return f(o, b, delay_ms);
     }
     if b.is_null() {
@@ -276,9 +331,9 @@ pub unsafe extern "system" fn XAsyncSchedule(b: *mut XAsyncBlock, delay_ms: u32)
     S_OK
 }
 
-pub unsafe extern "system" fn XAsyncComplete(b: *mut XAsyncBlock, result: HRESULT, required: usize) {
+pub unsafe extern "system-unwind" fn XAsyncComplete(b: *mut XAsyncBlock, result: HRESULT, required: usize) {
     if let Some((o, f)) = pc(10) {
-        let f: unsafe extern "system" fn(usize, *mut XAsyncBlock, HRESULT, usize) = std::mem::transmute(f);
+        let f: unsafe extern "system-unwind" fn(usize, *mut XAsyncBlock, HRESULT, usize) = std::mem::transmute(f);
         return f(o, b, result, required);
     }
     // E_PENDING is not a completion: the provider still has work to do (libHttpClient).
@@ -303,9 +358,36 @@ pub unsafe extern "system" fn XAsyncComplete(b: *mut XAsyncBlock, result: HRESUL
     // Snapshot callback/queue before publishing completion so a waiter woken from
     // `XAsyncGetStatus(b, true)` can safely destroy a stack-allocated `XAsyncBlock`.
     let (cb, queue_ptr) = ((*b).callback, (*b).queue);
+    // If guest `OP_CLEANUP` unwinds, finalize `FLAG_DONE`, remove `b` from `ACTIVE`, move to
+    // `Phase::Consumed`, and wake any `XAsyncGetStatus(_, true)` waiters.
+    struct CompleteCleanup<'a> {
+        b: *mut XAsyncBlock,
+        s: &'a State,
+        status: HRESULT,
+        armed: bool,
+    }
+    impl Drop for CompleteCleanup<'_> {
+        fn drop(&mut self) {
+            if !self.armed {
+                return;
+            }
+            {
+                let mut map = active_map().lock().unwrap_or_else(|e| e.into_inner());
+                unsafe { write_header(self.b, BlockHeader { status: self.status, flags: FLAG_DONE, id: self.s.id }) };
+                if map.get(&(self.b as usize)).is_some_and(|cur| cur.id == self.s.id) {
+                    map.remove(&(self.b as usize));
+                }
+                let mut g = self.s.inner.lock().unwrap_or_else(|e| e.into_inner());
+                g.phase = Phase::Consumed;
+            }
+            self.s.cv.notify_all();
+        }
+    }
+    let mut complete_guard = CompleteCleanup { b, s: &s, status, armed: true };
     if cleanup_now {
         call_provider(&s, OP_CLEANUP, b, std::ptr::null_mut(), 0);
     }
+    complete_guard.armed = false;
     // Persist the finalized status into `b.internal` under `ACTIVE`, remove `s` if no payload
     // remains, and publish `Done`/`Consumed` (lock order: `ACTIVE` -> `s.inner`) before
     // submitting the completion callback or waking waiters.
@@ -318,12 +400,18 @@ pub unsafe extern "system" fn XAsyncComplete(b: *mut XAsyncBlock, result: HRESUL
         let mut g = s.inner.lock().unwrap();
         g.phase = if cleanup_now { Phase::Consumed } else { Phase::Done };
     }
+    struct NotifyGuard<'a>(&'a Condvar);
+    impl Drop for NotifyGuard<'_> {
+        fn drop(&mut self) {
+            self.0.notify_all();
+        }
+    }
+    let _notify = NotifyGuard(&s.cv);
     if cb != 0 {
         if let Some(q) = taskqueue::queue_from(queue_ptr) {
             let _ = taskqueue::submit_now(&q, PORT_COMPLETION, Item { cb: completion_cb as usize, ctx: b as usize });
         }
     }
-    s.cv.notify_all();
 }
 
 pub unsafe extern "system" fn XAsyncGetStatus(b: *mut XAsyncBlock, wait: bool) -> HRESULT {
@@ -372,7 +460,7 @@ pub unsafe extern "system" fn XAsyncGetResultSize(b: *mut XAsyncBlock, size: *mu
     }
 }
 
-pub unsafe extern "system" fn XAsyncGetResult(
+pub unsafe extern "system-unwind" fn XAsyncGetResult(
     b: *mut XAsyncBlock,
     identity: *const c_void,
     size: usize,
@@ -380,7 +468,7 @@ pub unsafe extern "system" fn XAsyncGetResult(
     used: *mut usize,
 ) -> HRESULT {
     if let Some((o, f)) = pc(11) {
-        let f: unsafe extern "system" fn(usize, *mut XAsyncBlock, *const c_void, usize, *mut c_void, *mut usize) -> HRESULT = std::mem::transmute(f);
+        let f: unsafe extern "system-unwind" fn(usize, *mut XAsyncBlock, *const c_void, usize, *mut c_void, *mut usize) -> HRESULT = std::mem::transmute(f);
         return f(o, b, identity, size, buffer, used);
     }
     match lookup(b) {
@@ -422,11 +510,36 @@ pub unsafe extern "system" fn XAsyncGetResult(
                 (g.status, g.result_size)
             };
             if need > 0 {
+                // If guest `OP_GET_RESULT` or `OP_CLEANUP` unwinds, finalize `FLAG_CONSUMED` and
+                // remove `b` from `ACTIVE` without re-entering guest `OP_CLEANUP` during unwind.
+                struct ConsumeCleanup<'a> {
+                    b: *mut XAsyncBlock,
+                    s: &'a State,
+                    status: HRESULT,
+                    armed: bool,
+                }
+                impl Drop for ConsumeCleanup<'_> {
+                    fn drop(&mut self) {
+                        if !self.armed {
+                            return;
+                        }
+                        let mut map = active_map().lock().unwrap_or_else(|e| e.into_inner());
+                        unsafe {
+                            write_header(self.b, BlockHeader { status: self.status, flags: FLAG_DONE | FLAG_CONSUMED, id: self.s.id });
+                        }
+                        if map.get(&(self.b as usize)).is_some_and(|cur| cur.id == self.s.id) {
+                            map.remove(&(self.b as usize));
+                        }
+                        self.s.inner.lock().unwrap_or_else(|e| e.into_inner()).phase = Phase::Consumed;
+                    }
+                }
+                let mut consume_guard = ConsumeCleanup { b, s: &s, status, armed: true };
                 let hr = call_provider(&s, OP_GET_RESULT, b, buffer, size);
                 if !used.is_null() {
                     *used = need;
                 }
                 call_provider(&s, OP_CLEANUP, b, std::ptr::null_mut(), 0);
+                consume_guard.armed = false;
                 let mut map = active_map().lock().unwrap();
                 write_header(b, BlockHeader { status, flags: FLAG_DONE | FLAG_CONSUMED, id: s.id });
                 if map.get(&(b as usize)).is_some_and(|cur| cur.id == s.id) {
@@ -443,9 +556,9 @@ pub unsafe extern "system" fn XAsyncGetResult(
     }
 }
 
-pub unsafe extern "system" fn XAsyncCancel(b: *mut XAsyncBlock) {
+pub unsafe extern "system-unwind" fn XAsyncCancel(b: *mut XAsyncBlock) {
     if let Some((o, f)) = pc(5) {
-        let f: unsafe extern "system" fn(usize, *mut XAsyncBlock) = std::mem::transmute(f);
+        let f: unsafe extern "system-unwind" fn(usize, *mut XAsyncBlock) = std::mem::transmute(f);
         return f(o, b);
     }
     let Lookup::Active(s) = lookup(b) else { return };
@@ -459,9 +572,9 @@ pub unsafe extern "system" fn XAsyncCancel(b: *mut XAsyncBlock) {
     let _ = call_provider(&s, OP_CANCEL, b, std::ptr::null_mut(), 0);
 }
 
-pub unsafe extern "system" fn XAsyncRun(b: *mut XAsyncBlock, work: usize) -> HRESULT {
+pub unsafe extern "system-unwind" fn XAsyncRun(b: *mut XAsyncBlock, work: usize) -> HRESULT {
     if let Some((o, f)) = pc(6) {
-        let f: unsafe extern "system" fn(usize, *mut XAsyncBlock, usize) -> HRESULT = std::mem::transmute(f);
+        let f: unsafe extern "system-unwind" fn(usize, *mut XAsyncBlock, usize) -> HRESULT = std::mem::transmute(f);
         return f(o, b, work);
     }
     if b.is_null() || work == 0 {
@@ -473,11 +586,14 @@ pub unsafe extern "system" fn XAsyncRun(b: *mut XAsyncBlock, work: usize) -> HRE
         context: 0,
         identity: 0,
         work,
+        _owned_payload: None,
         inner: Mutex::new(Inner { status: E_PENDING, result_size: 0, phase: Phase::Pending }),
         cv: Condvar::new(),
     });
-    register_state(b, s);
+    register_state(b, s.clone());
+    let mut cleanup = BeginCleanup { b, s, armed: true };
     let hr = XAsyncSchedule(b, 0);
+    cleanup.armed = false;
     if hr < 0 {
         XAsyncComplete(b, hr, 0);
     }
@@ -499,9 +615,11 @@ pub struct PayloadBuf {
 struct Payload {
     result: Mutex<Option<Result<PayloadBuf, HRESULT>>>,
     work: Mutex<Option<Box<dyn FnOnce() -> Result<PayloadBuf, HRESULT> + Send>>>,
+    cleaned_up: AtomicBool,
+    owned_by_pc: bool,
 }
 
-unsafe extern "system" fn payload_provider(op: u32, data: *const XAsyncProviderData) -> HRESULT {
+unsafe extern "system-unwind" fn payload_provider(op: u32, data: *const XAsyncProviderData) -> HRESULT {
     let d = &*data;
     let p = &*(d.context as *const Payload);
     match op {
@@ -534,7 +652,16 @@ unsafe extern "system" fn payload_provider(op: u32, data: *const XAsyncProviderD
             S_OK
         }
         OP_CLEANUP => {
-            drop(Box::from_raw(d.context as *mut Payload));
+            if p.owned_by_pc {
+                if !p.cleaned_up.swap(true, Ordering::AcqRel) {
+                    drop(Arc::from_raw(d.context as *const Payload));
+                }
+            } else {
+                // Release captured work/result buffers promptly while keeping `Payload` itself
+                // alive until every `Arc<State>` drops (UAF-safe across concurrent workers).
+                *p.work.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                *p.result.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            }
             S_OK
         }
         _ => S_OK,
@@ -554,14 +681,32 @@ pub unsafe fn begin_with_fixups<F>(b: *mut XAsyncBlock, identity: usize, work: F
 where
     F: FnOnce() -> Result<PayloadBuf, HRESULT> + Send + 'static,
 {
-    let p = Box::into_raw(Box::new(Payload { result: Mutex::new(None), work: Mutex::new(Some(Box::new(work))) }));
-    let hr = XAsyncBegin(b, p as *mut c_void, identity as *const c_void, std::ptr::null(), payload_provider as usize);
-    if hr < 0 {
-        // SAFETY: `XAsyncBegin` rejected the call before adopting `p`, so `OP_CLEANUP` will
-        // never run; reclaim the `Box<Payload>` allocated above to avoid leaking it.
-        drop(Box::from_raw(p));
+    if let Some((o, f)) = pc(7) {
+        let p = Arc::into_raw(Arc::new(Payload {
+            result: Mutex::new(None),
+            work: Mutex::new(Some(Box::new(work))),
+            cleaned_up: AtomicBool::new(false),
+            owned_by_pc: true,
+        }));
+        let f: unsafe extern "system-unwind" fn(usize, *mut XAsyncBlock, *mut c_void, *const c_void, *const u8, usize) -> HRESULT = std::mem::transmute(f);
+        let hr = f(o, b, p as *mut c_void, identity as *const c_void, std::ptr::null(), payload_provider as usize);
+        if hr < 0 {
+            // SAFETY: The PC runtime rejected `XAsyncBegin` synchronously before adopting `p`.
+            let payload = &*p;
+            if !payload.cleaned_up.swap(true, Ordering::AcqRel) {
+                drop(Arc::from_raw(p));
+            }
+        }
+        return hr;
     }
-    hr
+    let payload = Arc::new(Payload {
+        result: Mutex::new(None),
+        work: Mutex::new(Some(Box::new(work))),
+        cleaned_up: AtomicBool::new(false),
+        owned_by_pc: false,
+    });
+    let ctx = Arc::as_ptr(&payload) as *mut c_void;
+    xasync_begin_inner(b, ctx, identity as *const c_void, std::ptr::null(), payload_provider as usize, Some(payload))
 }
 
 #[cfg(test)]
@@ -1224,6 +1369,252 @@ mod tests {
             assert_eq!(ctx_err.cb_calls.load(Ordering::SeqCst), 1);
 
             taskqueue::XTaskQueueTerminate(q, true, std::ptr::null_mut(), 0);
+            taskqueue::XTaskQueueCloseHandle(q);
+        }
+    }
+
+    #[test]
+    fn provider_and_completion_callbacks_unwind_cleanly() {
+        let _g = crate::hle::xgameruntime::xasync::ASYNC_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        unsafe extern "system-unwind" fn throwing_provider(op: u32, _data: *const XAsyncProviderData) -> HRESULT {
+            if op == OP_BEGIN {
+                panic!("guest XAsyncProvider unwind");
+            }
+            S_OK
+        }
+
+        unsafe extern "system-unwind" fn noop_provider(_op: u32, _data: *const XAsyncProviderData) -> HRESULT {
+            S_OK
+        }
+
+        unsafe extern "system-unwind" fn throwing_completion(_b: *mut XAsyncBlock) {
+            panic!("guest XAsync completion callback unwind");
+        }
+
+        unsafe {
+            let mut q = std::ptr::null_mut();
+            assert_eq!(taskqueue::XTaskQueueCreate(taskqueue::MODE_IMMEDIATE, taskqueue::MODE_IMMEDIATE, &mut q), S_OK);
+
+            // (a) Unwind from guest XAsyncProvider::OP_BEGIN across XAsyncBegin.
+            let mut b1: XAsyncBlock = std::mem::zeroed();
+            b1.queue = q;
+            let r1 = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                XAsyncBegin(&mut b1, std::ptr::null_mut(), std::ptr::null(), std::ptr::null(), throwing_provider as usize)
+            }));
+            assert!(r1.is_err(), "XAsyncBegin must propagate unwind from guest provider");
+            assert!(
+                !active_map().lock().unwrap().contains_key(&(&mut b1 as *mut XAsyncBlock as usize)),
+                "BeginCleanup must remove active entry when OP_BEGIN unwinds"
+            );
+
+            // (b) Unwind from guest completion callback across XAsyncComplete (MODE_IMMEDIATE).
+            let mut b2: XAsyncBlock = std::mem::zeroed();
+            b2.queue = q;
+            b2.callback = throwing_completion as usize;
+            assert_eq!(XAsyncBegin(&mut b2, std::ptr::null_mut(), std::ptr::null(), std::ptr::null(), noop_provider as usize), S_OK);
+            let r2 = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                XAsyncComplete(&mut b2, S_OK, 0);
+            }));
+            assert!(r2.is_err(), "XAsyncComplete must propagate unwind from guest completion callback");
+            assert_eq!(XAsyncGetStatus(&mut b2, false), S_OK);
+            assert!(taskqueue::XTaskQueueIsEmpty(q, taskqueue::PORT_COMPLETION));
+
+            assert_eq!(taskqueue::XTaskQueueTerminate(q, true, std::ptr::null_mut(), 0), S_OK);
+            taskqueue::XTaskQueueCloseHandle(q);
+        }
+    }
+
+    #[test]
+    fn begin_cleanup_preserves_sync_completed_payload_and_payload_ownership_on_unwind() {
+        let _g = crate::hle::xgameruntime::xasync::ASYNC_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        unsafe extern "system-unwind" fn throwing_completion(_b: *mut XAsyncBlock) {
+            panic!("immediate completion callback unwind");
+        }
+        unsafe extern "system-unwind" fn throwing_monitor(_ctx: *mut c_void, _q: *mut c_void, _port: u32) {
+            panic!("work monitor unwind");
+        }
+        struct DropCount(Arc<AtomicU32>);
+        impl Drop for DropCount {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        unsafe {
+            let mut q = std::ptr::null_mut();
+            assert_eq!(taskqueue::XTaskQueueCreate(taskqueue::MODE_IMMEDIATE, taskqueue::MODE_IMMEDIATE, &mut q), S_OK);
+
+            // (a) Synchronous completion with non-empty payload inside OP_BEGIN followed by an
+            // unwinding immediate completion callback must NOT strip `b` from `ACTIVE` or lose its
+            // payload / leak `Payload`.
+            let drops_a = Arc::new(AtomicU32::new(0));
+            let probe_a = DropCount(Arc::clone(&drops_a));
+            let mut b_a: XAsyncBlock = std::mem::zeroed();
+            b_a.queue = q;
+            b_a.callback = throwing_completion as usize;
+            let r_a = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                begin_with(&mut b_a, 0xA1, move || {
+                    let _keep = &probe_a;
+                    Ok(b"data".to_vec())
+                })
+            }));
+            assert!(r_a.is_err());
+            assert_eq!(XAsyncGetStatus(&mut b_a, false), S_OK);
+            let mut sz = 0usize;
+            assert_eq!(XAsyncGetResultSize(&mut b_a, &mut sz), S_OK);
+            assert_eq!(sz, 4, "BeginCleanup must not erase completed payload from ACTIVE");
+            let mut buf = [0u8; 4];
+            let mut used = 0usize;
+            assert_eq!(XAsyncGetResult(&mut b_a, 0xA1 as *const c_void, 4, buf.as_mut_ptr() as *mut c_void, &mut used), S_OK);
+            assert_eq!(&buf, b"data");
+            assert_eq!(used, 4);
+            assert_eq!(drops_a.load(Ordering::SeqCst), 1, "Payload must be dropped once via OP_CLEANUP");
+            assert!(!active_map().lock().unwrap().contains_key(&(&mut b_a as *mut XAsyncBlock as usize)));
+
+            // (b) Synchronous completion with empty payload (OP_CLEANUP already freed Payload)
+            // followed by an unwinding immediate completion callback must not double-free Payload.
+            let drops_b = Arc::new(AtomicU32::new(0));
+            let probe_b = DropCount(Arc::clone(&drops_b));
+            let mut b_b: XAsyncBlock = std::mem::zeroed();
+            b_b.queue = q;
+            b_b.callback = throwing_completion as usize;
+            let r_b = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                begin_with(&mut b_b, 0xB2, move || {
+                    let _keep = &probe_b;
+                    Ok(Vec::new())
+                })
+            }));
+            assert!(r_b.is_err());
+            assert_eq!(XAsyncGetStatus(&mut b_b, false), S_OK);
+            assert_eq!(drops_b.load(Ordering::SeqCst), 1, "Payload must be dropped exactly once");
+
+            // (c) Unwind during XAsyncSchedule before OP_CLEANUP runs must reclaim Payload and
+            // remove `b` from `ACTIVE` without leaking.
+            let mut mon_tok = taskqueue::RegistrationToken { token: 0 };
+            assert_eq!(taskqueue::XTaskQueueRegisterMonitor(q, std::ptr::null_mut(), throwing_monitor as usize, &mut mon_tok), S_OK);
+            let drops_c = Arc::new(AtomicU32::new(0));
+            let probe_c = DropCount(Arc::clone(&drops_c));
+            let mut b_c: XAsyncBlock = std::mem::zeroed();
+            b_c.queue = q;
+            let r_c = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                begin_with(&mut b_c, 0xC3, move || {
+                    let _keep = &probe_c;
+                    Ok(b"never".to_vec())
+                })
+            }));
+            assert!(r_c.is_err());
+            assert_eq!(drops_c.load(Ordering::SeqCst), 1, "PayloadGuard must reclaim Payload when OP_BEGIN unwinds before OP_CLEANUP");
+            assert!(!active_map().lock().unwrap().contains_key(&(&mut b_c as *mut XAsyncBlock as usize)));
+            assert_eq!(XAsyncGetStatus(&mut b_c, false), E_ABORT);
+            taskqueue::XTaskQueueUnregisterMonitor(q, mon_tok);
+
+            assert_eq!(taskqueue::XTaskQueueTerminate(q, true, std::ptr::null_mut(), 0), S_OK);
+            taskqueue::XTaskQueueCloseHandle(q);
+        }
+    }
+
+    #[test]
+    fn complete_and_get_result_and_run_unwinds_finalize_state() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let _g = crate::hle::xgameruntime::xasync::ASYNC_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        unsafe extern "system-unwind" fn cleanup_throws_provider(op: u32, _data: *const XAsyncProviderData) -> HRESULT {
+            if op == OP_CLEANUP {
+                panic!("guest OP_CLEANUP unwind");
+            }
+            S_OK
+        }
+        unsafe extern "system-unwind" fn get_result_throws_provider(op: u32, data: *const XAsyncProviderData) -> HRESULT {
+            let cleanups = &*((*data).context as *const AtomicU32);
+            match op {
+                OP_GET_RESULT => panic!("guest OP_GET_RESULT unwind"),
+                OP_CLEANUP => {
+                    cleanups.fetch_add(1, Ordering::SeqCst);
+                    S_OK
+                }
+                _ => S_OK,
+            }
+        }
+        unsafe extern "system-unwind" fn get_result_ok_cleanup_throws_provider(op: u32, data: *const XAsyncProviderData) -> HRESULT {
+            match op {
+                OP_GET_RESULT => {
+                    std::ptr::copy_nonoverlapping(b"abcd".as_ptr(), (*data).buffer as *mut u8, 4);
+                    S_OK
+                }
+                OP_CLEANUP => panic!("guest OP_CLEANUP unwind in GetResult"),
+                _ => S_OK,
+            }
+        }
+        unsafe extern "system-unwind" fn throwing_monitor(_ctx: *mut c_void, _q: *mut c_void, _port: u32) {
+            panic!("XAsyncRun schedule monitor unwind");
+        }
+        unsafe extern "system-unwind" fn dummy_work(_b: *mut XAsyncBlock) -> HRESULT {
+            S_OK
+        }
+
+        unsafe {
+            // (a) XAsyncComplete OP_CLEANUP unwind: finalizes state, removes from ACTIVE, and wakes waiter.
+            let mut b1 = Box::new(std::mem::zeroed::<XAsyncBlock>());
+            assert_eq!(XAsyncBegin(&mut *b1, std::ptr::null_mut(), std::ptr::null(), std::ptr::null(), cleanup_throws_provider as usize), S_OK);
+            let b1_addr = &mut *b1 as *mut XAsyncBlock as usize;
+            let (tx, rx) = mpsc::channel();
+            let waiter = std::thread::spawn(move || {
+                let hr = XAsyncGetStatus(b1_addr as *mut XAsyncBlock, true);
+                let _ = tx.send(hr);
+            });
+            std::thread::sleep(Duration::from_millis(10));
+            let r1 = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                XAsyncComplete(&mut *b1, S_OK, 0);
+            }));
+            assert!(r1.is_err());
+            let waited_hr = rx.recv_timeout(Duration::from_secs(2)).expect("XAsyncGetStatus(wait=true) hung after OP_CLEANUP unwind");
+            waiter.join().unwrap();
+            assert_eq!(waited_hr, S_OK);
+            assert!(!active_map().lock().unwrap().contains_key(&b1_addr));
+
+            // (b) XAsyncGetResult OP_GET_RESULT unwind: marks Consumed, removes from ACTIVE, does NOT run OP_CLEANUP in Drop.
+            let cleanups = AtomicU32::new(0);
+            let mut b2: XAsyncBlock = std::mem::zeroed();
+            assert_eq!(XAsyncBegin(&mut b2, &cleanups as *const AtomicU32 as *mut c_void, std::ptr::null(), std::ptr::null(), get_result_throws_provider as usize), S_OK);
+            XAsyncComplete(&mut b2, S_OK, 4);
+            let mut out = [0u8; 4];
+            let r2 = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                XAsyncGetResult(&mut b2, std::ptr::null(), 4, out.as_mut_ptr() as *mut c_void, std::ptr::null_mut())
+            }));
+            assert!(r2.is_err());
+            assert_eq!(cleanups.load(Ordering::SeqCst), 0, "ConsumeCleanup must not call guest OP_CLEANUP during unwind");
+            assert!(!active_map().lock().unwrap().contains_key(&(&mut b2 as *mut XAsyncBlock as usize)));
+            assert_eq!(XAsyncGetResult(&mut b2, std::ptr::null(), 4, out.as_mut_ptr() as *mut c_void, std::ptr::null_mut()), E_ILLEGAL_METHOD_CALL);
+
+            // (c) XAsyncGetResult OP_CLEANUP unwind: also marks Consumed and removes from ACTIVE.
+            let mut b3: XAsyncBlock = std::mem::zeroed();
+            assert_eq!(XAsyncBegin(&mut b3, std::ptr::null_mut(), std::ptr::null(), std::ptr::null(), get_result_ok_cleanup_throws_provider as usize), S_OK);
+            XAsyncComplete(&mut b3, S_OK, 4);
+            let r3 = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                XAsyncGetResult(&mut b3, std::ptr::null(), 4, out.as_mut_ptr() as *mut c_void, std::ptr::null_mut())
+            }));
+            assert!(r3.is_err());
+            assert!(!active_map().lock().unwrap().contains_key(&(&mut b3 as *mut XAsyncBlock as usize)));
+            assert_eq!(XAsyncGetResult(&mut b3, std::ptr::null(), 4, out.as_mut_ptr() as *mut c_void, std::ptr::null_mut()), E_ILLEGAL_METHOD_CALL);
+
+            // (d) XAsyncRun schedule unwind: BeginCleanup removes pending block from ACTIVE and marks E_ABORT.
+            let mut q = std::ptr::null_mut();
+            assert_eq!(taskqueue::XTaskQueueCreate(taskqueue::MODE_IMMEDIATE, taskqueue::MODE_IMMEDIATE, &mut q), S_OK);
+            let mut mon_tok = taskqueue::RegistrationToken { token: 0 };
+            assert_eq!(taskqueue::XTaskQueueRegisterMonitor(q, std::ptr::null_mut(), throwing_monitor as usize, &mut mon_tok), S_OK);
+            let mut b4: XAsyncBlock = std::mem::zeroed();
+            b4.queue = q;
+            let r4 = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                XAsyncRun(&mut b4, dummy_work as usize)
+            }));
+            assert!(r4.is_err());
+            assert!(!active_map().lock().unwrap().contains_key(&(&mut b4 as *mut XAsyncBlock as usize)));
+            assert_eq!(XAsyncGetStatus(&mut b4, false), E_ABORT);
+            taskqueue::XTaskQueueUnregisterMonitor(q, mon_tok);
+            assert_eq!(taskqueue::XTaskQueueTerminate(q, true, std::ptr::null_mut(), 0), S_OK);
             taskqueue::XTaskQueueCloseHandle(q);
         }
     }

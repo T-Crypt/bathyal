@@ -69,7 +69,7 @@ fn launcher_uses_configured_exe_in_an_ambiguous_folder() {
     .unwrap();
     std::fs::write(title.join("xcl.toml"), "exe = 'game.exe'\n").unwrap();
 
-    let output = Command::new(env!("CARGO_BIN_EXE_xcl"))
+    let output = Command::new(env!("CARGO_BIN_EXE_bathyal"))
         .arg("run")
         .arg(&game)
         .env("XCL_DATA_ROOT", &data)
@@ -86,7 +86,7 @@ fn launcher_uses_configured_exe_in_an_ambiguous_folder() {
 
 #[test]
 fn test_title_runs_and_game_folder_is_untouched() {
-    let xcl = PathBuf::from(env!("CARGO_BIN_EXE_xcl"));
+    let xcl = PathBuf::from(env!("CARGO_BIN_EXE_bathyal"));
     let bin_dir = xcl.parent().unwrap();
     let title = bin_dir.join("xcl_testtitle.exe");
     let dll = bin_dir.join("testgame_mw.dll");
@@ -252,7 +252,7 @@ fn test_title_draws_with_a_root_signature_under_the_debug_layer() {
             return;
         }
     }
-    let xcl = PathBuf::from(env!("CARGO_BIN_EXE_xcl"));
+    let xcl = PathBuf::from(env!("CARGO_BIN_EXE_bathyal"));
     let bin_dir = xcl.parent().unwrap();
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
     let root = manifest.join("..").join("..").join("target").join("e2e-debug-layer");

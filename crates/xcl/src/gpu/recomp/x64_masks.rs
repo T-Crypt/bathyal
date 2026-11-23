@@ -7,6 +7,8 @@
 //! over the SGPRs: a register is *whole-live* after an instruction when some path may read
 //! its whole value (any SALU / SMEM / VALU scalar operand, a branch on VCCZ, …) before it is
 //! written again. A mask write whose destination is not whole-live needs no exchange.
+//! Pixel shaders use the same analysis: such a mask needs only the reading lane's own bit, not
+//! the quad reads that give every helper lane's bit (`ballot_px_local` / `ballot_px`, emit.rs).
 //!
 //! After a mask stays in its half the two halves hold different values in its registers, so a
 //! whole read that is missed here – or a write taken for a full overwrite that is not one –

@@ -66,8 +66,8 @@ pub struct Blob {
     pub data: *mut u8,
 }
 
-type ContainerCb = unsafe extern "system" fn(*const ContainerInfo, *mut c_void) -> bool;
-type BlobCb = unsafe extern "system" fn(*const BlobInfo, *mut c_void) -> bool;
+type ContainerCb = unsafe extern "system-unwind" fn(*const ContainerInfo, *mut c_void) -> bool;
+type BlobCb = unsafe extern "system-unwind" fn(*const BlobInfo, *mut c_void) -> bool;
 
 /// File-name form of a container / blob name: unusual characters as %XX.
 fn enc(name: &str) -> String {
@@ -198,12 +198,12 @@ pub unsafe extern "system" fn XGameSaveInitializeProvider(_user: *mut c_void, co
 
 static INIT_ID: u8 = 0;
 
-pub unsafe extern "system" fn XGameSaveInitializeProviderAsync(_user: *mut c_void, config: *const u8, _sync: bool, b: *mut XAsyncBlock) -> HRESULT {
+pub unsafe extern "system-unwind" fn XGameSaveInitializeProviderAsync(_user: *mut c_void, config: *const u8, _sync: bool, b: *mut XAsyncBlock) -> HRESULT {
     let config = from_cstr_ptr(config);
     begin_with(b, &INIT_ID as *const u8 as usize, move || Ok((open_provider(config) as usize).to_le_bytes().to_vec()))
 }
 
-pub unsafe extern "system" fn XGameSaveInitializeProviderResult(b: *mut XAsyncBlock, out: *mut *mut Provider) -> HRESULT {
+pub unsafe extern "system-unwind" fn XGameSaveInitializeProviderResult(b: *mut XAsyncBlock, out: *mut *mut Provider) -> HRESULT {
     if out.is_null() {
         return E_INVALIDARG;
     }
@@ -241,13 +241,13 @@ pub unsafe extern "system" fn XGameSaveGetRemainingQuota(p: *mut Provider, quota
 
 static QUOTA_ID: u8 = 0;
 
-pub unsafe extern "system" fn XGameSaveGetRemainingQuotaAsync(p: *mut Provider, b: *mut XAsyncBlock) -> HRESULT {
+pub unsafe extern "system-unwind" fn XGameSaveGetRemainingQuotaAsync(p: *mut Provider, b: *mut XAsyncBlock) -> HRESULT {
     let mut q = 0i64;
     let hr = XGameSaveGetRemainingQuota(p, &mut q);
     begin_with(b, &QUOTA_ID as *const u8 as usize, move || if hr < 0 { Err(hr) } else { Ok(q.to_le_bytes().to_vec()) })
 }
 
-pub unsafe extern "system" fn XGameSaveGetRemainingQuotaResult(b: *mut XAsyncBlock, quota: *mut i64) -> HRESULT {
+pub unsafe extern "system-unwind" fn XGameSaveGetRemainingQuotaResult(b: *mut XAsyncBlock, quota: *mut i64) -> HRESULT {
     XAsyncGetResult(b, &QUOTA_ID as *const u8 as *const c_void, 8, quota as *mut c_void, std::ptr::null_mut())
 }
 
@@ -284,7 +284,7 @@ pub unsafe extern "system" fn XGameSaveDeleteContainer(p: *mut Provider, name: *
 
 static DELETE_ID: u8 = 0;
 
-pub unsafe extern "system" fn XGameSaveDeleteContainerAsync(p: *mut Provider, name: *const u8, b: *mut XAsyncBlock) -> HRESULT {
+pub unsafe extern "system-unwind" fn XGameSaveDeleteContainerAsync(p: *mut Provider, name: *const u8, b: *mut XAsyncBlock) -> HRESULT {
     if b.is_null() {
         return E_INVALIDARG;
     }
@@ -360,7 +360,7 @@ unsafe fn each_container(pr: &Provider, prefix: &str, exact: bool, ctx: *mut c_v
     n
 }
 
-pub unsafe extern "system" fn XGameSaveGetContainerInfo(p: *mut Provider, name: *const u8, ctx: *mut c_void, cb: Option<ContainerCb>) -> HRESULT {
+pub unsafe extern "system-unwind" fn XGameSaveGetContainerInfo(p: *mut Provider, name: *const u8, ctx: *mut c_void, cb: Option<ContainerCb>) -> HRESULT {
     let (Some(pr), Some(n), Some(cb)) = (provider(p), from_cstr_ptr(name), cb) else { return E_INVALIDARG };
     if each_container(pr, &n, true, ctx, cb) == 0 {
         return E_GS_CONTAINER_NOT_FOUND;
@@ -368,13 +368,13 @@ pub unsafe extern "system" fn XGameSaveGetContainerInfo(p: *mut Provider, name: 
     S_OK
 }
 
-pub unsafe extern "system" fn XGameSaveEnumerateContainerInfo(p: *mut Provider, ctx: *mut c_void, cb: Option<ContainerCb>) -> HRESULT {
+pub unsafe extern "system-unwind" fn XGameSaveEnumerateContainerInfo(p: *mut Provider, ctx: *mut c_void, cb: Option<ContainerCb>) -> HRESULT {
     let (Some(pr), Some(cb)) = (provider(p), cb) else { return E_INVALIDARG };
     each_container(pr, "", false, ctx, cb);
     S_OK
 }
 
-pub unsafe extern "system" fn XGameSaveEnumerateContainerInfoByName(p: *mut Provider, prefix: *const u8, ctx: *mut c_void, cb: Option<ContainerCb>) -> HRESULT {
+pub unsafe extern "system-unwind" fn XGameSaveEnumerateContainerInfoByName(p: *mut Provider, prefix: *const u8, ctx: *mut c_void, cb: Option<ContainerCb>) -> HRESULT {
     let (Some(pr), Some(cb)) = (provider(p), cb) else { return E_INVALIDARG };
     each_container(pr, &from_cstr_ptr(prefix).unwrap_or_default(), false, ctx, cb);
     S_OK
@@ -392,13 +392,13 @@ unsafe fn each_blob(c: &Container, prefix: &str, ctx: *mut c_void, cb: BlobCb) {
     }
 }
 
-pub unsafe extern "system" fn XGameSaveEnumerateBlobInfo(c: *mut Container, ctx: *mut c_void, cb: Option<BlobCb>) -> HRESULT {
+pub unsafe extern "system-unwind" fn XGameSaveEnumerateBlobInfo(c: *mut Container, ctx: *mut c_void, cb: Option<BlobCb>) -> HRESULT {
     let (Some(c), Some(cb)) = (container(c), cb) else { return E_INVALIDARG };
     each_blob(c, "", ctx, cb);
     S_OK
 }
 
-pub unsafe extern "system" fn XGameSaveEnumerateBlobInfoByName(c: *mut Container, prefix: *const u8, ctx: *mut c_void, cb: Option<BlobCb>) -> HRESULT {
+pub unsafe extern "system-unwind" fn XGameSaveEnumerateBlobInfoByName(c: *mut Container, prefix: *const u8, ctx: *mut c_void, cb: Option<BlobCb>) -> HRESULT {
     let (Some(c), Some(cb)) = (container(c), cb) else { return E_INVALIDARG };
     each_blob(c, &from_cstr_ptr(prefix).unwrap_or_default(), ctx, cb);
     S_OK
@@ -482,7 +482,7 @@ pub unsafe extern "system" fn XGameSaveReadBlobData(c: *mut Container, names: *c
 
 static READ_ID: u8 = 0;
 
-pub unsafe extern "system" fn XGameSaveReadBlobDataAsync(c: *mut Container, names: *const *const u8, count: u32, b: *mut XAsyncBlock) -> HRESULT {
+pub unsafe extern "system-unwind" fn XGameSaveReadBlobDataAsync(c: *mut Container, names: *const *const u8, count: u32, b: *mut XAsyncBlock) -> HRESULT {
     let Some(c) = container(c) else { return E_INVALIDARG };
     let Ok(list) = names_of(names, count) else { return E_INVALIDARG };
     let dir = c.dir.clone();
@@ -493,7 +493,7 @@ pub unsafe extern "system" fn XGameSaveReadBlobDataAsync(c: *mut Container, name
     })
 }
 
-pub unsafe extern "system" fn XGameSaveReadBlobDataResult(b: *mut XAsyncBlock, size: usize, out: *mut Blob, count: *mut u32) -> HRESULT {
+pub unsafe extern "system-unwind" fn XGameSaveReadBlobDataResult(b: *mut XAsyncBlock, size: usize, out: *mut Blob, count: *mut u32) -> HRESULT {
     let mut need = 0usize;
     let hr = XAsyncGetResultSize(b, &mut need);
     if hr < 0 {
@@ -596,7 +596,7 @@ pub unsafe extern "system" fn XGameSaveSubmitUpdate(u: *mut Update) -> HRESULT {
 
 static SUBMIT_ID: u8 = 0;
 
-pub unsafe extern "system" fn XGameSaveSubmitUpdateAsync(u: *mut Update, b: *mut XAsyncBlock) -> HRESULT {
+pub unsafe extern "system-unwind" fn XGameSaveSubmitUpdateAsync(u: *mut Update, b: *mut XAsyncBlock) -> HRESULT {
     let Some(u) = update(u) else { return E_INVALIDARG };
     let (dir, display, ops) = (u.dir.clone(), u.display.clone(), u.ops.clone());
     begin_with(b, &SUBMIT_ID as *const u8 as usize, move || match apply(&dir, display.as_deref(), &ops) {
@@ -605,7 +605,7 @@ pub unsafe extern "system" fn XGameSaveSubmitUpdateAsync(u: *mut Update, b: *mut
     })
 }
 
-pub unsafe extern "system" fn XGameSaveSubmitUpdateResult(b: *mut XAsyncBlock) -> HRESULT {
+pub unsafe extern "system-unwind" fn XGameSaveSubmitUpdateResult(b: *mut XAsyncBlock) -> HRESULT {
     XAsyncGetResult(b, &SUBMIT_ID as *const u8 as *const c_void, 0, std::ptr::null_mut(), std::ptr::null_mut())
 }
 
@@ -745,7 +745,7 @@ mod tests {
         assert!(fixture.root.is_dir());
     }
 
-    unsafe extern "system" fn count_containers(i: *const ContainerInfo, ctx: *mut c_void) -> bool {
+    unsafe extern "system-unwind" fn count_containers(i: *const ContainerInfo, ctx: *mut c_void) -> bool {
         let v = &mut *(ctx as *mut Vec<(String, String, u32, u64)>);
         let i = &*i;
         v.push((from_cstr_ptr(i.name).unwrap(), from_cstr_ptr(i.display_name).unwrap(), i.blob_count, i.total_size));
@@ -812,7 +812,7 @@ mod tests {
         }
     }
 
-    unsafe extern "system" fn blob_names(i: *const BlobInfo, ctx: *mut c_void) -> bool {
+    unsafe extern "system-unwind" fn blob_names(i: *const BlobInfo, ctx: *mut c_void) -> bool {
         (*(ctx as *mut Vec<(String, u32)>)).push((from_cstr_ptr((*i).name).unwrap(), (*i).size));
         true
     }

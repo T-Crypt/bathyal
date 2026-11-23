@@ -61,7 +61,7 @@ pub fn set_title_filter(f: usize) -> usize {
     TITLE_FILTER.swap(f, Ordering::AcqRel)
 }
 
-unsafe extern "system" fn unhandled_filter(info: *const EXCEPTION_POINTERS) -> i32 {
+unsafe extern "system-unwind" fn unhandled_filter(info: *const EXCEPTION_POINTERS) -> i32 {
     crate::hle::d3d12x::real::log_device_removed();
     if !info.is_null() && !(*info).ExceptionRecord.is_null() {
         let rec = &*(*info).ExceptionRecord;
@@ -76,9 +76,9 @@ unsafe extern "system" fn unhandled_filter(info: *const EXCEPTION_POINTERS) -> i
             };
             extra = format!(" ({op} at address {:#x})", rec.ExceptionInformation[1]);
         }
-        if rec.ExceptionCode as u32 == ILLEGAL_INSTRUCTION {
-            extra = format!(" (code bytes: {})", code_at(addr));
-        }
+        // the faulting instruction, for any exception: the registers alone rarely say what was
+        // dereferenced (an access violation in a title's thread start-up: which field of what)
+        extra.push_str(&format!(" (code bytes: {})", code_at(addr)));
         let ctx = (*info).ContextRecord;
         let regs = if ctx.is_null() {
             String::new()
@@ -109,12 +109,19 @@ unsafe extern "system" fn unhandled_filter(info: *const EXCEPTION_POINTERS) -> i
             modules::describe_address(addr)
         );
         crate::xlog_error!("{msg}");
+        crate::memstat::log();
         crate::report::write_final(Some(msg));
+        // the other threads now: a title crash handler (Breakpad) can keep the process for
+        // minutes before it ends (the retail title's watchdog: what was its silent thread doing?)
+        static DUMPED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !DUMPED.swap(true, Ordering::AcqRel) {
+            dump_threads();
+        }
         crate::log::flush();
     }
     match TITLE_FILTER.load(Ordering::Acquire) {
         0 => 0, // EXCEPTION_CONTINUE_SEARCH
-        f => std::mem::transmute::<usize, unsafe extern "system" fn(*const EXCEPTION_POINTERS) -> i32>(f)(info),
+        f => std::mem::transmute::<usize, unsafe extern "system-unwind" fn(*const EXCEPTION_POINTERS) -> i32>(f)(info),
     }
 }
 
@@ -131,6 +138,7 @@ unsafe extern "system" fn hk_nt_terminate_process(h: isize, status: i32) -> i32 
         let (tid, stack) = (windows_sys::Win32::System::Threading::GetCurrentThreadId(), stack_callers_n(&probe as *const usize as usize, 16));
         if status != 0 {
             crate::xlog_error!("process ends with status {status:#x} (thread {tid}); on the stack: {stack}");
+            crate::memstat::log();
             dump_threads();
         } else {
             crate::xlog_info!("process ends (thread {tid}); on the stack: {stack}");
@@ -146,7 +154,11 @@ pub fn install_crash_handler() {
         if let Err(e) = hooks::hook("ntdll.dll", "NtTerminateProcess", hk_nt_terminate_process as usize, &ORIG_NT_TERMINATE) {
             crate::xlog_warn!("{e}");
         }
-        SetUnhandledExceptionFilter(Some(unhandled_filter));
+        // SAFETY: `extern "system-unwind"` and `extern "system"` share the identical Win64 ABI;
+        // Windows `UnhandledExceptionFilter` guards the filter call with SEH.
+        let filter: unsafe extern "system" fn(*const EXCEPTION_POINTERS) -> i32 =
+            std::mem::transmute::<unsafe extern "system-unwind" fn(*const EXCEPTION_POINTERS) -> i32, _>(unhandled_filter);
+        SetUnhandledExceptionFilter(Some(filter));
         install_invalid_parameter_handler();
         windows_sys::Win32::System::Diagnostics::Debug::AddVectoredExceptionHandler(0, Some(cpp_exception_logger));
     }
@@ -370,6 +382,22 @@ unsafe fn emulate_console_only(ctx: &mut windows_sys::Win32::System::Diagnostics
             d.Low = crate::insn::insertq(d.Low, s.Low, len, idx);
             d.High = 0;
         }
+        ConsoleOnly::Movnts { bytes, src, mem } => {
+            let regs = [
+                ctx.Rax, ctx.Rcx, ctx.Rdx, ctx.Rbx, ctx.Rsp, ctx.Rbp, ctx.Rsi, ctx.Rdi,
+                ctx.R8, ctx.R9, ctx.R10, ctx.R11, ctx.R12, ctx.R13, ctx.R14, ctx.R15,
+            ];
+            let at = crate::insn::address(&mem, &regs, ctx.Rip + len as u64) as usize;
+            if !crate::gpu::shader::readable(at, bytes as usize) {
+                return 0; // the real store faults there too
+            }
+            let v = ctx.Anonymous.FltSave.XmmRegisters[src as usize & 15].Low;
+            if bytes == 8 {
+                (at as *mut u64).write_unaligned(v);
+            } else {
+                (at as *mut u32).write_unaligned(v as u32);
+            }
+        }
     }
     ctx.Rip += len as u64;
     -1 // EXCEPTION_CONTINUE_EXECUTION
@@ -556,14 +584,46 @@ unsafe fn name_thread(tid: u32, name: &[u16]) {
     }
 }
 
+/// Bytes of a thread's stack (from RSP up) a thread dump keeps
+const DUMP_STACK: usize = 0x4_0000;
+
+/// The stack from `rsp` up (to the end of its region, at most `buf.len()` bytes) copied to
+/// `buf`: its length. Only system calls – no lock a suspended thread may hold.
+unsafe fn copy_stack(rsp: u64, buf: &mut [u8]) -> Option<usize> {
+    use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
+    use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT};
+    let mut mbi: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+    if VirtualQuery(rsp as *const c_void, &mut mbi, std::mem::size_of::<MEMORY_BASIC_INFORMATION>()) == 0 || mbi.State != MEM_COMMIT {
+        return None;
+    }
+    let n = (mbi.BaseAddress as usize + mbi.RegionSize).saturating_sub(rsp as usize).min(buf.len());
+    let mut read = 0usize;
+    let cur = windows_sys::Win32::System::Threading::GetCurrentProcess();
+    (n >= 8 && ReadProcessMemory(cur, rsp as *const c_void, buf.as_mut_ptr() as *mut c_void, n, &mut read) != 0 && read == n).then_some(n)
+}
+
 /// The return addresses of the frames from `ctx` on (its RIP first), unwound with the
-/// functions' unwind data (registered for the title's images too); up to `n`.
-unsafe fn unwind(ctx: &mut windows_sys::Win32::System::Diagnostics::Debug::CONTEXT, n: usize) -> Vec<usize> {
+/// functions' unwind data (registered for the title's images too); up to `n`. `stack` is the
+/// thread's stack from `ctx.Rsp` on, copied while it was stopped: the thread has gone on (or
+/// ended) since, so the unwinding reads the copy – addresses into the stack are moved to it –
+/// and ends where a frame would leave it.
+unsafe fn unwind(ctx: &mut windows_sys::Win32::System::Diagnostics::Debug::CONTEXT, n: usize, stack: &[u8]) -> Vec<usize> {
     use windows_sys::Win32::System::Diagnostics::Debug::{RtlLookupFunctionEntry, RtlVirtualUnwind, UNW_FLAG_NHANDLER};
+    let (orig, copy, len) = (ctx.Rsp, stack.as_ptr() as u64, stack.len() as u64);
+    let in_copy = |v: u64| v >= copy && v < copy + len;
+    let to_copy = |ctx: &mut windows_sys::Win32::System::Diagnostics::Debug::CONTEXT| {
+        for r in [&mut ctx.Rax, &mut ctx.Rcx, &mut ctx.Rdx, &mut ctx.Rbx, &mut ctx.Rsp, &mut ctx.Rbp, &mut ctx.Rsi, &mut ctx.Rdi,
+                  &mut ctx.R8, &mut ctx.R9, &mut ctx.R10, &mut ctx.R11, &mut ctx.R12, &mut ctx.R13, &mut ctx.R14, &mut ctx.R15] {
+            if *r >= orig && *r < orig + len {
+                *r = *r - orig + copy;
+            }
+        }
+    };
+    to_copy(ctx);
     let mut out = Vec::new();
     for _ in 0..n {
         let rip = ctx.Rip;
-        if rip == 0 {
+        if rip == 0 || !in_copy(ctx.Rsp) || ctx.Rsp + 8 > copy + len {
             break;
         }
         out.push(rip as usize);
@@ -571,16 +631,22 @@ unsafe fn unwind(ctx: &mut windows_sys::Win32::System::Diagnostics::Debug::CONTE
         let f = RtlLookupFunctionEntry(rip, &mut base, std::ptr::null_mut());
         if f.is_null() {
             // a leaf function: the return address is at RSP
-            if !crate::gpu::shader::readable(ctx.Rsp as usize, 8) {
-                break;
-            }
             ctx.Rip = (ctx.Rsp as *const u64).read_unaligned();
             ctx.Rsp += 8;
         } else {
+            // a frame register (UNWIND_INFO byte 3, low nibble) has to point into the copy too
+            let info = (base + (*f).Anonymous.UnwindData as u64) as *const u8;
+            let fp = (*info.add(3) & 0xF) as usize;
+            let regs = [ctx.Rax, ctx.Rcx, ctx.Rdx, ctx.Rbx, ctx.Rsp, ctx.Rbp, ctx.Rsi, ctx.Rdi, ctx.R8, ctx.R9, ctx.R10, ctx.R11, ctx.R12, ctx.R13, ctx.R14, ctx.R15];
+            if fp != 0 && !in_copy(regs[fp]) {
+                break;
+            }
             let mut data = std::ptr::null_mut();
             let mut frame = 0u64;
             RtlVirtualUnwind(UNW_FLAG_NHANDLER, base, rip, f, ctx, &mut data, &mut frame, std::ptr::null_mut());
         }
+        // registers restored from the copy hold addresses into the stack
+        to_copy(ctx);
     }
     out
 }
@@ -599,6 +665,9 @@ pub fn dump_threads() {
             return;
         }
         let mut lines = Vec::new();
+        // allocated before any thread is stopped: it may hold the heap's lock. (The slack past
+        // the copy: a frame's unwinding may read a little beyond where the copy ends.)
+        let mut stack = vec![0u8; DUMP_STACK + 0x1_0000];
         let mut te: THREADENTRY32 = std::mem::zeroed();
         te.dwSize = std::mem::size_of::<THREADENTRY32>() as u32;
         let mut ok = Thread32First(snap, &mut te) != 0;
@@ -611,16 +680,18 @@ pub fn dump_threads() {
                     struct Aligned(CONTEXT);
                     let mut c: Aligned = std::mem::zeroed();
                     c.0.ContextFlags = CONTEXT_CONTROL_AMD64 | CONTEXT_INTEGER_AMD64;
-                    // only the context is taken while the thread is suspended: the unwinding
-                    // (RtlLookupFunctionEntry), the module lookup (loader lock), the name and the
-                    // formatting (heap) take locks the suspended thread may hold (#106)
+                    // only the context and a copy of the stack are taken while the thread is
+                    // suspended: the unwinding (RtlLookupFunctionEntry), the module lookup (loader
+                    // lock), the name and the formatting (heap) take locks the suspended thread
+                    // may hold (#106). The unwinding reads the copy: the thread goes on, or ends.
+                    let mut len = 0;
                     let got = SuspendThread(h) != u32::MAX && {
-                        let ok = GetThreadContext(h, &mut c.0) != 0;
+                        let ok = GetThreadContext(h, &mut c.0) != 0 && copy_stack(c.0.Rsp, &mut stack[..DUMP_STACK]).inspect(|&n| len = n).is_some();
                         ResumeThread(h);
                         ok
                     };
                     if got {
-                        let frames: Vec<String> = unwind(&mut c.0, 14).into_iter().map(modules::describe_address).collect();
+                        let frames: Vec<String> = unwind(&mut c.0, 14, &stack[..len]).into_iter().map(modules::describe_address).collect();
                         lines.push(format!("thread {} '{}': {}", te.th32ThreadID, thread_name(h), frames.join(" < ")));
                     }
                     CloseHandle(h);
@@ -912,6 +983,47 @@ pub fn start_probes() {
 mod tests {
     use super::*;
 
+    /// recursion whose frames hold return addresses and saved registers that change as it runs
+    #[inline(never)]
+    fn churn_stack(depth: u32, seed: u64) -> u64 {
+        let local = std::hint::black_box([seed; 8]);
+        if depth == 0 {
+            return local.iter().fold(0u64, |a, &x| a.wrapping_add(x));
+        }
+        churn_stack(depth - 1, seed.wrapping_mul(6364136223846793005).wrapping_add(depth as u64)) ^ local[depth as usize % 8]
+    }
+
+    /// Thread dumps while threads run, start and end around them (#106: a dump read a near-null
+    /// address inside RtlVirtualUnwind).
+    #[test]
+    fn thread_dumps_while_threads_run_and_exit() {
+        use std::sync::atomic::AtomicBool;
+        static STOP: AtomicBool = AtomicBool::new(false);
+        let busy: Vec<_> = (0..4u64)
+            .map(|i| std::thread::spawn(move || {
+                let mut n = 0u64;
+                while !STOP.load(Ordering::Relaxed) {
+                    n = n.wrapping_add(churn_stack((n % 40) as u32 + 1, n ^ i));
+                }
+                n
+            }))
+            .collect();
+        let churn: Vec<_> = (0..4u64)
+            .map(|i| std::thread::spawn(move || {
+                let mut n = 0u64;
+                while !STOP.load(Ordering::Relaxed) {
+                    n = std::thread::spawn(move || churn_stack((n % 24) as u32 + 1, n ^ i)).join().unwrap();
+                }
+            }))
+            .collect();
+        for _ in 0..40 {
+            dump_threads();
+        }
+        STOP.store(true, Ordering::Relaxed);
+        churn.into_iter().for_each(|t| t.join().unwrap());
+        busy.into_iter().for_each(|t| { t.join().unwrap(); });
+    }
+
     #[test]
     fn bounded_cstr_stops_at_nul_limit_and_unreadable_memory() {
         unsafe {
@@ -970,5 +1082,81 @@ mod tests {
             }
         }
         modules::unregister_mapped(code);
+    }
+
+    /// MOVNTSS / MOVNTSD in a title image: on a CPU without SSE4a (any Intel) they raise
+    /// STATUS_ILLEGAL_INSTRUCTION and the handler does the store; on an AMD CPU they run
+    /// natively. Either way the memory holds the same values.
+    #[test]
+    fn sse4a_streaming_stores_run_in_a_title_image() {
+        use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_EXECUTE_READWRITE};
+        // s(p, v): movq xmm0, rdx; movntsd [rcx], xmm0; ret
+        // t(p, v): movq xmm1, rdx; movntss [rcx+4], xmm1 (a SIB without an index); ret
+        // u(p, v): movq xmm2, rdx; movntsd [rip+disp32], xmm2 (into the page's last 8 bytes); ret
+        let s_code: &[u8] = &[0x66, 0x48, 0x0F, 0x6E, 0xC2, 0xF2, 0x0F, 0x2B, 0x01, 0xC3];
+        let t_code: &[u8] = &[0x66, 0x48, 0x0F, 0x6E, 0xCA, 0xF3, 0x0F, 0x2B, 0x4C, 0x21, 0x04, 0xC3];
+        unsafe {
+            let page = VirtualAlloc(std::ptr::null(), 4096, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE) as *mut u8;
+            assert!(!page.is_null());
+            std::ptr::write_bytes(page, 0xCC, 4096);
+            std::ptr::copy_nonoverlapping(s_code.as_ptr(), page, s_code.len());
+            std::ptr::copy_nonoverlapping(t_code.as_ptr(), page.add(32), t_code.len());
+            // u at 64: the store's disp32 is relative to the end of the movntsd (64 + 5 + 8)
+            let disp = (4096 - 8 - (64 + 5 + 8)) as u32;
+            let mut u_code = vec![0x66, 0x48, 0x0F, 0x6E, 0xD2, 0xF2, 0x0F, 0x2B, 0x15];
+            u_code.extend_from_slice(&disp.to_le_bytes());
+            u_code.push(0xC3);
+            std::ptr::copy_nonoverlapping(u_code.as_ptr(), page.add(64), u_code.len());
+            modules::register_mapped(std::sync::Arc::new(modules::MappedModule {
+                name: "sse4a_test.exe".into(),
+                path: "sse4a_test.exe".into(),
+                base: page as usize,
+                size: 4096,
+                entry_rva: 0,
+                is_dll: false,
+                exports: Default::default(),
+                tls_callbacks: Default::default(),
+                no_thread_calls: Default::default(),
+                initialized: Default::default(),
+                stack_reserve: 0,
+            }));
+            let veh = windows_sys::Win32::System::Diagnostics::Debug::AddVectoredExceptionHandler(1, Some(cpp_exception_logger));
+            let s: extern "system" fn(*mut u64, u64) = std::mem::transmute(page);
+            let t: extern "system" fn(*mut u32, u64) = std::mem::transmute(page.add(32));
+            let u: extern "system" fn(*mut u64, u64) = std::mem::transmute(page.add(64));
+            let mut out = [0u64; 2];
+            s(out.as_mut_ptr(), 0x0123_4567_89AB_CDEF);
+            assert_eq!(out[0], 0x0123_4567_89AB_CDEF, "movntsd stores the low quadword");
+            let mut words = [0u32; 3];
+            t(words.as_mut_ptr(), 0xFFFF_FFFF_DEAD_BEEF);
+            assert_eq!(words, [0, 0xDEAD_BEEF, 0], "movntss stores the low dword at [rcx+4] and nothing else");
+            u(std::ptr::null_mut(), 0x1122_3344_5566_7788);
+            assert_eq!((page.add(4096 - 8) as *const u64).read_unaligned(), 0x1122_3344_5566_7788, "rip-relative movntsd");
+            windows_sys::Win32::System::Diagnostics::Debug::RemoveVectoredExceptionHandler(veh);
+            modules::unregister_mapped(page as usize);
+            VirtualFree(page as _, 0, MEM_RELEASE);
+        }
+    }
+
+    static TITLE_FILTER_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn unhandled_filter_unwinds_cleanly_from_title_filter() {
+        let _serial = TITLE_FILTER_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        struct ResetFilter(usize);
+        impl Drop for ResetFilter {
+            fn drop(&mut self) {
+                set_title_filter(self.0);
+            }
+        }
+
+        unsafe extern "system-unwind" fn throwing_title_filter(_info: *const EXCEPTION_POINTERS) -> i32 {
+            panic!("guest unhandled exception filter unwind");
+        }
+
+        let prev = set_title_filter(throwing_title_filter as usize);
+        let _reset = ResetFilter(prev);
+        let r = std::panic::catch_unwind(|| unsafe { unhandled_filter(std::ptr::null()) });
+        assert!(r.is_err(), "unhandled_filter must propagate unwind from guest title filter");
     }
 }

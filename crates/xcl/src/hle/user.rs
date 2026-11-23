@@ -27,6 +27,10 @@ use crate::util::{from_ansi_ptr, wide};
 extern "system" {
     fn RegisterClassExW(c: *const WndClassEx<u16>) -> u16;
     fn SetWindowLongPtrW(hwnd: *mut c_void, index: i32, value: isize) -> isize;
+}
+
+#[link(name = "user32")]
+extern "system-unwind" {
     fn CallWindowProcW(proc_: isize, hwnd: *mut c_void, msg: u32, wp: usize, lp: isize) -> isize;
     fn SetWindowPos(hwnd: *mut c_void, after: *mut c_void, x: i32, y: i32, w: i32, h: i32, flags: u32) -> i32;
     #[allow(clippy::too_many_arguments)]
@@ -95,7 +99,7 @@ pub unsafe extern "system" fn RegisterClassExA(c: *const WndClassEx<u8>) -> u16 
 }
 
 #[allow(clippy::too_many_arguments)]
-pub unsafe extern "system" fn CreateWindowExA(ex_style: u32, class: *const u8, title: *const u8, style: u32, x: i32, y: i32, w: i32, h: i32, parent: *mut c_void, menu: *mut c_void, instance: *mut c_void, param: *const c_void) -> *mut c_void {
+pub unsafe extern "system-unwind" fn CreateWindowExA(ex_style: u32, class: *const u8, title: *const u8, style: u32, x: i32, y: i32, w: i32, h: i32, parent: *mut c_void, menu: *mut c_void, instance: *mut c_void, param: *const c_void) -> *mut c_void {
     let mut keep = Vec::new();
     let class = name(class, &mut keep);
     let title = if title.is_null() { std::ptr::null() } else { name(title, &mut keep) };
@@ -105,7 +109,7 @@ pub unsafe extern "system" fn CreateWindowExA(ex_style: u32, class: *const u8, t
 /// CreateWindowExW of the console's ntuser API set: as `CreateWindowExA`, without the text
 /// conversion.
 #[allow(clippy::too_many_arguments)]
-unsafe extern "system" fn create_window_ex_w(ex_style: u32, class: *const u16, title: *const u16, style: u32, x: i32, y: i32, w: i32, h: i32, parent: *mut c_void, menu: *mut c_void, instance: *mut c_void, param: *const c_void) -> *mut c_void {
+unsafe extern "system-unwind" fn create_window_ex_w(ex_style: u32, class: *const u16, title: *const u16, style: u32, x: i32, y: i32, w: i32, h: i32, parent: *mut c_void, menu: *mut c_void, instance: *mut c_void, param: *const c_void) -> *mut c_void {
     console_window(ex_style, class, title, style, x, y, w, h, parent, menu, instance, param)
 }
 
@@ -162,7 +166,7 @@ unsafe fn console_window(ex_style: u32, class: *const u16, title: *const u16, st
 
 /// A console window has no non-client area whatever its style, and may be the screen's size
 /// on a smaller PC monitor.
-unsafe extern "system" fn console_wndproc(hwnd: *mut c_void, msg: u32, wp: usize, lp: isize) -> isize {
+unsafe extern "system-unwind" fn console_wndproc(hwnd: *mut c_void, msg: u32, wp: usize, lp: isize) -> isize {
     let orig = PROCS.lock().unwrap().iter().find(|e| e.0 == hwnd as usize).map(|e| e.1);
     let Some(orig) = orig else { return 0 };
     match msg {
@@ -291,5 +295,38 @@ mod tests {
             assert_eq!(atom, 0);
             assert_eq!(error, windows_sys::Win32::Foundation::ERROR_INVALID_PARAMETER);
         }
+    }
+
+    #[test]
+    fn console_wndproc_unwinds_cleanly_from_guest_wndproc() {
+        const FAKE_HWND: usize = 0x5843_4C01;
+        const WM_APP_TEST: u32 = 0x8001;
+
+        struct ProcCleanup(usize);
+        impl Drop for ProcCleanup {
+            fn drop(&mut self) {
+                PROCS.lock().unwrap_or_else(|e| e.into_inner()).retain(|e| e.0 != self.0);
+            }
+        }
+
+        unsafe extern "system-unwind" fn throwing_wndproc(_hwnd: *mut c_void, _msg: u32, _wp: usize, _lp: isize) -> isize {
+            panic!("guest wndproc unwind");
+        }
+
+        let _cleanup = ProcCleanup(FAKE_HWND);
+        PROCS.lock().unwrap().push((FAKE_HWND, throwing_wndproc as usize as isize));
+
+        let r = std::panic::catch_unwind(|| unsafe {
+            console_wndproc(FAKE_HWND as *mut c_void, WM_APP_TEST, 0, 0)
+        });
+        assert!(r.is_err(), "console_wndproc should propagate unwind from guest wndproc through CallWindowProcW");
+        assert!(PROCS.lock().is_ok(), "PROCS mutex must remain unpoisoned after unwind");
+
+        // WM_NCDESTROY removes the entry before delegating to the guest wndproc.
+        let r2 = std::panic::catch_unwind(|| unsafe {
+            console_wndproc(FAKE_HWND as *mut c_void, WM_NCDESTROY, 0, 0)
+        });
+        assert!(r2.is_err(), "console_wndproc(WM_NCDESTROY) should propagate unwind cleanly");
+        assert!(!PROCS.lock().unwrap().iter().any(|e| e.0 == FAKE_HWND));
     }
 }

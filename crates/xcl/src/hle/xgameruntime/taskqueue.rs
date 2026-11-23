@@ -29,9 +29,9 @@ pub const PORT_WORK: u32 = 0;
 pub const PORT_COMPLETION: u32 = 1;
 pub const E_NO_TASK_QUEUE: HRESULT = 0x8007_01ABu32 as i32;
 
-pub type XTaskQueueCallback = unsafe extern "system" fn(*mut c_void, bool);
-pub type XTaskQueueTerminatedCallback = unsafe extern "system" fn(*mut c_void);
-pub type XTaskQueueMonitorCallback = unsafe extern "system" fn(*mut c_void, *mut c_void, u32);
+pub type XTaskQueueCallback = unsafe extern "system-unwind" fn(*mut c_void, bool);
+pub type XTaskQueueTerminatedCallback = unsafe extern "system-unwind" fn(*mut c_void);
+pub type XTaskQueueMonitorCallback = unsafe extern "system-unwind" fn(*mut c_void, *mut c_void, u32);
 
 #[derive(Clone, Copy)]
 pub struct Item {
@@ -223,7 +223,7 @@ impl Queue {
     }
 
     fn done_one(&self, port: u32) {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         state.inflight[port as usize] -= 1;
         if state.inflight[0] == 0 && state.inflight[1] == 0 {
             self.idle_cv.notify_all();
@@ -231,9 +231,15 @@ impl Queue {
     }
 
     unsafe fn execute(self: &Arc<Queue>, port: u32, item: Item) {
+        struct InflightGuard<'a>(&'a Queue, u32);
+        impl Drop for InflightGuard<'_> {
+            fn drop(&mut self) {
+                self.0.done_one(self.1);
+            }
+        }
+        let _done = InflightGuard(self, port);
         let canceled = self.is_terminated();
         item.run(canceled);
-        self.done_one(port);
     }
 
     fn notify_monitors(&self, port: u32) {
@@ -248,20 +254,34 @@ impl Queue {
 }
 
 fn drain_serialized(p: Arc<Port>) {
-    loop {
-        let next = p.items.lock().unwrap().pop_front();
-        match next {
-            Some(qi) => unsafe { qi.queue.execute(qi.port, qi.item) },
-            None => {
-                p.running.store(false, Ordering::Release);
-                // re-check: an item may have arrived after pop but before the store
-                let more = !p.items.lock().unwrap().is_empty();
-                if more && !p.running.swap(true, Ordering::AcqRel) {
-                    continue;
-                }
-                break;
+    struct RunningGuard(Arc<Port>);
+    impl Drop for RunningGuard {
+        fn drop(&mut self) {
+            self.0.running.store(false, Ordering::Release);
+            // Re-check: an item may have arrived after pop (or remain after an unwind)
+            // before `running` cleared.
+            let more = !self.0.items.lock().unwrap_or_else(|e| e.into_inner()).is_empty();
+            if more && !self.0.running.swap(true, Ordering::AcqRel) {
+                let p2 = self.0.clone();
+                spawn(Box::new(move || drain_serialized(p2)));
             }
         }
+    }
+    let _running = RunningGuard(p.clone());
+    loop {
+        let next = p.items.lock().unwrap_or_else(|e| e.into_inner()).pop_front();
+        match next {
+            Some(qi) => unsafe { qi.queue.execute(qi.port, qi.item) },
+            None => break,
+        }
+    }
+}
+
+/// Decrements `inflight` if a monitor callback unwinds before execution/spawning claims it.
+struct CancelInflight<'a>(&'a Queue, u32);
+impl Drop for CancelInflight<'_> {
+    fn drop(&mut self) {
+        self.0.done_one(self.1);
     }
 }
 
@@ -280,7 +300,9 @@ pub fn submit_now(q: &Arc<Queue>, port: u32, item: Item) -> bool {
                 }
                 state.inflight[port as usize] += 1;
             }
+            let inflight = CancelInflight(q, port);
             q.notify_monitors(port);
+            std::mem::forget(inflight);
             // SAFETY: Caller guarantees `item.cb` is a valid `XTaskQueueCallback` for `item.ctx`.
             unsafe { q.execute(port, item) };
         }
@@ -292,9 +314,11 @@ pub fn submit_now(q: &Arc<Queue>, port: u32, item: Item) -> bool {
                 }
                 state.inflight[port as usize] += 1;
             }
+            let inflight = CancelInflight(q, port);
             q.notify_monitors(port);
             let q2 = q.clone();
             spawn(Box::new(move || unsafe { q2.execute(port, item) }));
+            std::mem::forget(inflight);
         }
         MODE_SERIALIZED_THREAD_POOL => {
             {
@@ -308,11 +332,11 @@ pub fn submit_now(q: &Arc<Queue>, port: u32, item: Item) -> bool {
                 }
                 items.push_back(QueuedItem { item, queue: q.clone(), port });
             }
-            q.notify_monitors(port);
             if !p.running.swap(true, Ordering::AcqRel) {
                 let p2 = p.clone();
                 spawn(Box::new(move || drain_serialized(p2)));
             }
+            q.notify_monitors(port);
         }
         _ => {
             {
@@ -519,7 +543,7 @@ pub unsafe extern "system" fn XTaskQueueCloseHandle(h: *mut c_void) {
     }
 }
 
-pub unsafe extern "system" fn XTaskQueueSubmitCallback(h: *mut c_void, port: u32, ctx: *mut c_void, cb: usize) -> HRESULT {
+pub unsafe extern "system-unwind" fn XTaskQueueSubmitCallback(h: *mut c_void, port: u32, ctx: *mut c_void, cb: usize) -> HRESULT {
     if cb == 0 || port > 1 {
         return E_INVALIDARG;
     }
@@ -530,7 +554,7 @@ pub unsafe extern "system" fn XTaskQueueSubmitCallback(h: *mut c_void, port: u32
     S_OK
 }
 
-pub unsafe extern "system" fn XTaskQueueSubmitDelayedCallback(h: *mut c_void, port: u32, delay: u32, ctx: *mut c_void, cb: usize) -> HRESULT {
+pub unsafe extern "system-unwind" fn XTaskQueueSubmitDelayedCallback(h: *mut c_void, port: u32, delay: u32, ctx: *mut c_void, cb: usize) -> HRESULT {
     if cb == 0 || port > 1 {
         return E_INVALIDARG;
     }
@@ -543,7 +567,7 @@ pub unsafe extern "system" fn XTaskQueueSubmitDelayedCallback(h: *mut c_void, po
     S_OK
 }
 
-pub unsafe extern "system" fn XTaskQueueDispatch(h: *mut c_void, port: u32, timeout: u32) -> bool {
+pub unsafe extern "system-unwind" fn XTaskQueueDispatch(h: *mut c_void, port: u32, timeout: u32) -> bool {
     if port > 1 {
         return false;
     }
@@ -564,30 +588,39 @@ pub unsafe extern "system" fn XTaskQueueIsEmpty(h: *mut c_void, port: u32) -> bo
     }
 }
 
-pub unsafe extern "system" fn XTaskQueueTerminate(h: *mut c_void, wait: bool, ctx: *mut c_void, cb: usize) -> HRESULT {
+pub unsafe extern "system-unwind" fn XTaskQueueTerminate(h: *mut c_void, wait: bool, ctx: *mut c_void, cb: usize) -> HRESULT {
     let Some(q) = queue_from(h) else { return E_INVALIDARG };
     q.state.lock().unwrap().terminated = true;
     // Cancel only queued items submitted through `q`; sibling queues sharing a composite port
-    // keep their pending work untouched. Wake any manual-port dispatchers waiting on this port.
+    // keep their pending work untouched. Drain both ports and wake any manual-port dispatchers
+    // on both ports before running any canceled callback so an unwind during a `PORT_WORK`
+    // callback still drains `PORT_COMPLETION` and never strands `PORT_COMPLETION` waiters.
+    struct Remaining(VecDeque<QueuedItem>);
+    impl Drop for Remaining {
+        fn drop(&mut self) {
+            for qi in self.0.drain(..) {
+                qi.queue.done_one(qi.port);
+            }
+        }
+    }
+    let mut mine = Remaining(VecDeque::new());
     for port in 0..2 {
-        let mine = {
+        {
             let mut items = q.ports[port].items.lock().unwrap();
-            let mut mine = Vec::new();
             let mut keep = VecDeque::with_capacity(items.len());
             while let Some(qi) = items.pop_front() {
                 if Arc::ptr_eq(&qi.queue, &q) {
-                    mine.push(qi);
+                    mine.0.push_back(qi);
                 } else {
                     keep.push_back(qi);
                 }
             }
             *items = keep;
-            mine
-        };
-        q.ports[port].cv.notify_all();
-        for qi in mine {
-            qi.queue.execute(qi.port, qi.item);
         }
+        q.ports[port].cv.notify_all();
+    }
+    while let Some(qi) = mine.0.pop_front() {
+        qi.queue.execute(qi.port, qi.item);
     }
     // Delayed callbacks of `q` still waiting for their time are canceled too, before the
     // termination callback (libHttpClient: CancelPendingEntries when a port terminates). They
@@ -1099,6 +1132,104 @@ mod tests {
 
             CloseHandle(event);
             XTaskQueueCloseHandle(h);
+        }
+    }
+
+    #[test]
+    fn callbacks_unwind_cleanly_and_release_inflight_count() {
+        unsafe extern "system-unwind" fn throwing_cb(_ctx: *mut c_void, _canceled: bool) {
+            panic!("guest XTaskQueue callback unwind");
+        }
+        unsafe extern "system-unwind" fn throwing_monitor(_ctx: *mut c_void, _q: *mut c_void, _port: u32) {
+            panic!("guest XTaskQueue monitor unwind");
+        }
+        unsafe extern "system-unwind" fn throwing_term(_ctx: *mut c_void) {
+            panic!("guest XTaskQueue terminated callback unwind");
+        }
+        unsafe extern "system-unwind" fn noop(_ctx: *mut c_void, _canceled: bool) {}
+
+        unsafe {
+            // (a) MODE_MANUAL: unwind through XTaskQueueDispatch drops InflightGuard so Terminate doesn't deadlock.
+            let mut h = std::ptr::null_mut();
+            assert_eq!(XTaskQueueCreate(MODE_MANUAL, MODE_MANUAL, &mut h), S_OK);
+            assert_eq!(XTaskQueueSubmitCallback(h, PORT_WORK, std::ptr::null_mut(), throwing_cb as usize), S_OK);
+            assert!(!XTaskQueueIsEmpty(h, PORT_WORK));
+            let r = std::panic::catch_unwind(|| XTaskQueueDispatch(h, PORT_WORK, 0));
+            assert!(r.is_err(), "XTaskQueueDispatch must propagate unwind from guest callback");
+            assert!(XTaskQueueIsEmpty(h, PORT_WORK), "InflightGuard must decrement inflight count on unwind");
+            assert_eq!(XTaskQueueTerminate(h, true, std::ptr::null_mut(), 0), S_OK);
+            XTaskQueueCloseHandle(h);
+
+            // (b) MODE_IMMEDIATE: unwind through XTaskQueueSubmitCallback releases inflight count.
+            let mut h2 = std::ptr::null_mut();
+            assert_eq!(XTaskQueueCreate(MODE_IMMEDIATE, MODE_IMMEDIATE, &mut h2), S_OK);
+            let r2 = std::panic::catch_unwind(|| {
+                XTaskQueueSubmitCallback(h2, PORT_WORK, std::ptr::null_mut(), throwing_cb as usize)
+            });
+            assert!(r2.is_err(), "XTaskQueueSubmitCallback(MODE_IMMEDIATE) must propagate unwind");
+            assert!(XTaskQueueIsEmpty(h2, PORT_WORK));
+            // Monitor callback unwinding on MODE_IMMEDIATE must also release the inflight reservation.
+            let mut mon_tok = RegistrationToken { token: 0 };
+            assert_eq!(XTaskQueueRegisterMonitor(h2, std::ptr::null_mut(), throwing_monitor as usize, &mut mon_tok), S_OK);
+            let r3 = std::panic::catch_unwind(|| {
+                XTaskQueueSubmitCallback(h2, PORT_WORK, std::ptr::null_mut(), noop as usize)
+            });
+            assert!(r3.is_err(), "XTaskQueueMonitorCallback unwind must propagate cleanly");
+            assert!(XTaskQueueIsEmpty(h2, PORT_WORK), "CancelInflight must decrement inflight count when monitor unwinds");
+            XTaskQueueUnregisterMonitor(h2, mon_tok);
+            // Terminated callback unwinding through XTaskQueueTerminate(wait=true) must also propagate cleanly.
+            let r4 = std::panic::catch_unwind(|| {
+                XTaskQueueTerminate(h2, true, std::ptr::null_mut(), throwing_term as usize)
+            });
+            assert!(r4.is_err(), "XTaskQueueTerminate(wait=true) must propagate unwind from terminated callback");
+            XTaskQueueCloseHandle(h2);
+        }
+    }
+
+    #[test]
+    fn terminate_work_unwind_still_drains_completion_and_wakes_waiters() {
+        use std::sync::mpsc;
+
+        unsafe extern "system-unwind" fn throwing_cb(_ctx: *mut c_void, _canceled: bool) {
+            panic!("guest canceled PORT_WORK unwind");
+        }
+        unsafe extern "system-unwind" fn noop(_ctx: *mut c_void, _canceled: bool) {}
+
+        unsafe {
+            // (a) Unwind during a canceled PORT_WORK callback still drains PORT_COMPLETION and
+            // releases inflight counts for both ports.
+            let mut h1 = std::ptr::null_mut();
+            assert_eq!(XTaskQueueCreate(MODE_MANUAL, MODE_MANUAL, &mut h1), S_OK);
+            assert_eq!(XTaskQueueSubmitCallback(h1, PORT_WORK, std::ptr::null_mut(), throwing_cb as usize), S_OK);
+            assert_eq!(XTaskQueueSubmitCallback(h1, PORT_COMPLETION, std::ptr::null_mut(), noop as usize), S_OK);
+            let r1 = std::panic::catch_unwind(|| XTaskQueueTerminate(h1, true, std::ptr::null_mut(), 0));
+            assert!(r1.is_err());
+            assert!(XTaskQueueIsEmpty(h1, PORT_WORK), "PORT_WORK must be empty after terminate unwind");
+            assert!(XTaskQueueIsEmpty(h1, PORT_COMPLETION), "PORT_COMPLETION must be drained even when PORT_WORK unwinds");
+            XTaskQueueCloseHandle(h1);
+
+            // (b) A manual dispatcher blocked in XTaskQueueDispatch(PORT_COMPLETION, INFINITE)
+            // must still be woken even when a canceled PORT_WORK callback unwinds.
+            let mut h2 = std::ptr::null_mut();
+            assert_eq!(XTaskQueueCreate(MODE_MANUAL, MODE_MANUAL, &mut h2), S_OK);
+            assert_eq!(XTaskQueueSubmitCallback(h2, PORT_WORK, std::ptr::null_mut(), throwing_cb as usize), S_OK);
+            let h2_addr = h2 as usize;
+            let (tx, rx) = mpsc::channel();
+            let dispatcher = std::thread::spawn(move || {
+                let ran = XTaskQueueDispatch(h2_addr as *mut c_void, PORT_COMPLETION, u32::MAX);
+                let _ = tx.send(ran);
+            });
+            std::thread::sleep(Duration::from_millis(10));
+            let r2 = std::panic::catch_unwind(|| XTaskQueueTerminate(h2, true, std::ptr::null_mut(), 0));
+            assert!(r2.is_err());
+            let ran = rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("PORT_COMPLETION dispatcher hung after PORT_WORK unwind in XTaskQueueTerminate");
+            dispatcher.join().unwrap();
+            assert!(!ran);
+            assert!(XTaskQueueIsEmpty(h2, PORT_WORK));
+            assert!(XTaskQueueIsEmpty(h2, PORT_COMPLETION));
+            XTaskQueueCloseHandle(h2);
         }
     }
 }

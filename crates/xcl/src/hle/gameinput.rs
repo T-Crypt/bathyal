@@ -647,8 +647,8 @@ unsafe extern "system" fn get_temporal_reading(this: *mut Object, _timestamp: u6
 
 static TOKENS: AtomicU64 = AtomicU64::new(0);
 
-type ReadingCallback = unsafe extern "system" fn(u64, *mut c_void, *mut Reading, bool);
-type DeviceCallback = unsafe extern "system" fn(u64, *mut c_void, *mut Object, u64, u32, u32);
+type ReadingCallback = unsafe extern "system-unwind" fn(u64, *mut c_void, *mut Reading, bool);
+type DeviceCallback = unsafe extern "system-unwind" fn(u64, *mut c_void, *mut Object, u64, u32, u32);
 
 enum CallbackKind {
     Reading { ctx: usize, cb: ReadingCallback },
@@ -779,12 +779,17 @@ fn dispatch_reading_callbacks(s: GamepadState) {
     for entry in cbs {
         let CallbackKind::Reading { ctx, cb } = entry.kind else { continue };
         let Some(_guard) = entry.try_enter() else { continue };
-        let r = new_reading(s);
+        struct ReadingGuard(*mut Reading);
+        impl Drop for ReadingGuard {
+            fn drop(&mut self) {
+                unsafe { reading_release(self.0) };
+            }
+        }
+        let r = ReadingGuard(new_reading(s));
         // SAFETY: `cb` and `ctx` were registered by the caller; `_guard` keeps
         // `UnregisterCallback` blocked until `cb` returns so `ctx` stays valid.
         unsafe {
-            cb(entry.token, ctx as *mut c_void, r, false);
-            reading_release(r);
+            cb(entry.token, ctx as *mut c_void, r.0, false);
         }
     }
 }
@@ -812,7 +817,7 @@ fn start_poller() {
 /// RegisterDeviceCallback(device, kind, status filter, enumeration kind, context, callback,
 /// &token): the gamepad, connected – at once for a blocking enumeration, from another
 /// thread for an asynchronous one, not at all without enumeration (it never comes or goes)
-unsafe extern "system" fn register_device_callback(_this: *mut Object, dev: *mut c_void, kind: u32, _filter: u32, enumeration: u32, context: *mut c_void, cb: Option<DeviceCallback>, token: *mut u64) -> HRESULT {
+unsafe extern "system-unwind" fn register_device_callback(_this: *mut Object, dev: *mut c_void, kind: u32, _filter: u32, enumeration: u32, context: *mut c_void, cb: Option<DeviceCallback>, token: *mut u64) -> HRESULT {
     let t = TOKENS.fetch_add(1, Ordering::Relaxed) + 1;
     if !token.is_null() {
         *token = t;
@@ -826,13 +831,19 @@ unsafe extern "system" fn register_device_callback(_this: *mut Object, dev: *mut
         CALLBACKS.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::clone(&entry));
         let ctx = context as usize;
         let spawned = std::thread::Builder::new().name("xcl-gameinput-enum".into()).spawn(move || {
+            struct EntryCleanup(u64);
+            impl Drop for EntryCleanup {
+                fn drop(&mut self) {
+                    CALLBACKS.lock().unwrap_or_else(|e| e.into_inner()).retain(|c| c.token != self.0);
+                }
+            }
+            let _cleanup = EntryCleanup(t);
             crate::eh::arm_current_thread();
             if let Some(_guard) = entry.try_enter() {
                 // SAFETY: `cb` and `ctx` were registered by the caller; `_guard` keeps
                 // `UnregisterCallback` blocked until `cb` returns so `ctx` stays valid.
                 unsafe { cb(t, ctx as *mut c_void, device(), now_us(), STATUS, 0) };
             }
-            CALLBACKS.lock().unwrap_or_else(|e| e.into_inner()).retain(|c| c.token != t);
         });
         if spawned.is_err() {
             CALLBACKS.lock().unwrap_or_else(|e| e.into_inner()).retain(|c| c.token != t);
@@ -1206,12 +1217,12 @@ mod tests {
         }
     }
 
-    unsafe extern "system" fn gated_reading_cb(_token: u64, ctx: *mut c_void, _reading: *mut Reading, _overflow: bool) {
+    unsafe extern "system-unwind" fn gated_reading_cb(_token: u64, ctx: *mut c_void, _reading: *mut Reading, _overflow: bool) {
         let gate = &*(ctx as *const CallbackGate);
         gate.on_callback();
     }
 
-    unsafe extern "system" fn gated_device_cb(_token: u64, ctx: *mut c_void, _dev: *mut Object, _ts: u64, _cur: u32, _prev: u32) {
+    unsafe extern "system-unwind" fn gated_device_cb(_token: u64, ctx: *mut c_void, _dev: *mut Object, _ts: u64, _cur: u32, _prev: u32) {
         let gate = &*(ctx as *const CallbackGate);
         gate.on_callback();
     }
@@ -1304,7 +1315,7 @@ mod tests {
             calls: AtomicU32,
             unreg_ok: std::sync::atomic::AtomicBool,
         }
-        unsafe extern "system" fn self_unreg_cb(token: u64, ctx: *mut c_void, _reading: *mut Reading, _overflow: bool) {
+        unsafe extern "system-unwind" fn self_unreg_cb(token: u64, ctx: *mut c_void, _reading: *mut Reading, _overflow: bool) {
             let c = &*(ctx as *const SelfCtx);
             c.calls.fetch_add(1, Ordering::AcqRel);
             let ok = unregister_callback(input(), token, u64::MAX);
@@ -1358,5 +1369,127 @@ mod tests {
         assert!(unsafe { unregister_callback(g, token, 5_000_000) });
         assert!(gate.finished.load(Ordering::Acquire));
         releaser.join().unwrap();
+    }
+
+    #[test]
+    fn blocking_device_callback_unwinds_cleanly() {
+        unsafe extern "system-unwind" fn throwing_device_cb(
+            _token: u64,
+            _ctx: *mut c_void,
+            _dev: *mut Object,
+            _ts: u64,
+            _cur: u32,
+            _prev: u32,
+        ) {
+            panic!("guest GameInput DeviceCallback unwind");
+        }
+
+        let g = input();
+        let mut token = 0u64;
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+            register_device_callback(g, std::ptr::null_mut(), KIND_GAMEPAD, STATUS, ENUM_BLOCKING, std::ptr::null_mut(), Some(throwing_device_cb), &mut token)
+        }));
+        assert!(r.is_err(), "RegisterDeviceCallback(ENUM_BLOCKING) must propagate unwind from guest callback");
+        assert_ne!(token, 0);
+    }
+
+    #[test]
+    fn reading_callback_unwind_releases_guard_and_unblocks_unregister() {
+        let _serial = READING_CB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        use std::sync::atomic::AtomicUsize;
+
+        struct ThrowCtx {
+            test_tid: ThreadId,
+            held_reading: AtomicUsize,
+        }
+
+        struct UnregGuard {
+            g: *mut Object,
+            token: u64,
+        }
+        impl Drop for UnregGuard {
+            fn drop(&mut self) {
+                if self.token != 0 {
+                    unsafe { unregister_callback(self.g, self.token, u64::MAX) };
+                }
+            }
+        }
+
+        struct HeldReadingGuard(usize);
+        impl Drop for HeldReadingGuard {
+            fn drop(&mut self) {
+                if self.0 != 0 {
+                    unsafe { reading_release(self.0 as *mut Reading) };
+                }
+            }
+        }
+
+        unsafe extern "system-unwind" fn throwing_reading_cb(
+            _token: u64,
+            ctx: *mut c_void,
+            reading: *mut Reading,
+            _overflow: bool,
+        ) {
+            let c = &*(ctx as *const ThrowCtx);
+            // Only throw on the test thread so the background poller thread never panics.
+            if std::thread::current().id() == c.test_tid {
+                // Take a temporary extra ref so we can safely verify after unwind that
+                // ReadingGuard released dispatch_reading_callbacks’s reference.
+                reading_add_ref(reading);
+                c.held_reading.store(reading as usize, Ordering::Release);
+                panic!("guest GameInput ReadingCallback unwind");
+            }
+        }
+
+        let test_tid = std::thread::current().id();
+        let ctx = Box::new(ThrowCtx { test_tid, held_reading: AtomicUsize::new(0) });
+        let g = input();
+        // Declared after `ctx` so Drop always unregisters and waits for the poller before `ctx` frees.
+        let mut unreg = UnregGuard { g, token: 0 };
+        let mut token = 0u64;
+        unsafe {
+            assert_eq!(
+                register_reading_callback(g, std::ptr::null_mut(), KIND_GAMEPAD, 0.0, &*ctx as *const ThrowCtx as *mut c_void, Some(throwing_reading_cb), &mut token),
+                S_OK
+            );
+        }
+        unreg.token = token;
+        let entry = CALLBACKS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .find(|c| c.token == token)
+            .cloned()
+            .expect("registered reading callback entry");
+
+        let r = std::panic::catch_unwind(|| {
+            dispatch_reading_callbacks(GamepadState { buttons: A, ..Default::default() });
+        });
+        assert!(r.is_err(), "dispatch_reading_callbacks must propagate unwind from guest ReadingCallback");
+
+        // Verify ReadingGuard::drop released the dispatcher’s ref (refs went 2 -> 1).
+        let held = HeldReadingGuard(ctx.held_reading.swap(0, Ordering::AcqRel));
+        assert_ne!(held.0, 0, "callback must have received a Reading");
+        let refs_after_unwind = unsafe { (*(held.0 as *const Reading)).refs.load(Ordering::Acquire) };
+        assert_eq!(refs_after_unwind, 1, "ReadingGuard did not release Reading on unwind");
+        drop(held);
+
+        // Verify CallbackGuard::drop cleared this thread from running_threads and decremented in_flight.
+        {
+            let st = entry.state.lock().unwrap_or_else(|e| e.into_inner());
+            assert!(!st.running_threads.contains(&test_tid), "CallbackGuard did not clear test_tid from running_threads on unwind");
+            assert_eq!(st.in_flight, st.running_threads.len(), "CallbackGuard did not decrement in_flight on unwind");
+        }
+
+        // Also verify from a DIFFERENT thread that zero-timeout unregister does not see test_tid as in-flight.
+        let g_addr = g as usize;
+        let ok = std::thread::spawn(move || unsafe { unregister_callback(g_addr as *mut Object, token, 0) })
+            .join()
+            .unwrap();
+        if ok {
+            unreg.token = 0;
+        }
+        assert!(ok, "other-thread unregister_callback(0) saw stale in-flight tracking after unwind");
     }
 }

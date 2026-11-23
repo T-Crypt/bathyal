@@ -226,6 +226,31 @@ pub fn swap_format(f: DXGI_FORMAT) -> Option<DXGI_FORMAT> {
     })
 }
 
+/// HDR color space for a swap chain format (None = SDR or default color space).
+pub fn hdr_color_space(fmt: DXGI_FORMAT) -> Option<DXGI_COLOR_SPACE_TYPE> {
+    match fmt {
+        DXGI_FORMAT_R10G10B10A2_UNORM => Some(DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020),
+        DXGI_FORMAT_R16G16B16A16_FLOAT => Some(DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709),
+        _ => None,
+    }
+}
+
+/// Configures HDR color space on the swap chain for HDR formats (Issue #103 Item 3).
+/// Logs a warning if unsupported on the display instead of failing presentation.
+pub unsafe fn configure_color_space(sc: &IDXGISwapChain3, fmt: DXGI_FORMAT) -> Result<(), windows::core::Error> {
+    if let Some(cs) = hdr_color_space(fmt) {
+        let res = sc.SetColorSpace1(cs);
+        if let Err(ref e) = res {
+            crate::xlog_warn!("present: HDR color space {cs:?} unsupported on display: {e}");
+        } else {
+            crate::xlog_info!("present: HDR color space {cs:?} configured for {fmt:?}");
+        }
+        res
+    } else {
+        Ok(())
+    }
+}
+
 unsafe fn backbuffer_like(res: usize) -> Option<D3D12_RESOURCE_DESC> {
     let raw = res as *mut c_void;
     let r = ID3D12Resource::from_raw_borrowed(&raw)?;
@@ -347,15 +372,15 @@ const COMPILE_TIMER: usize = 0x5C0;
 /// While XCL compiles shaders (DXC, programs the disk cache did not have – the title draws
 /// nothing with those pipelines meanwhile: after an XCL update the screen stays black while
 /// thousands recompile), the window's title says so:
-/// "XCL – <game> | compiling shaders: N running, M done[, Q pipelines queued][, F failed]".
+/// "XCL – <game> | compiling shaders: N running, M done[, Q pipelines active][, F failed]".
 /// It stays 2 s after the last compile (compiles in the title's own calls come one by one),
 /// then the plain title comes back.
 unsafe fn show_compiling(hwnd: HWND) {
     static SHOWN: Mutex<Option<String>> = Mutex::new(None);
     static LAST_ACTIVE: Mutex<Option<Instant>> = Mutex::new(None);
-    let (_, failed, queued) = super::pso_async::counts();
+    let (failed, pipelines) = super::pso_async::activity();
     let (running, done) = crate::gpu::recomp::dxc::compile_counts();
-    let active = running > 0 || queued > 0;
+    let active = running > 0 || pipelines > 0;
     let recent = {
         let mut last = LAST_ACTIVE.lock().unwrap();
         if active {
@@ -365,7 +390,7 @@ unsafe fn show_compiling(hwnd: HWND) {
     };
     let title = window_name();
     let text = if recent {
-        let queued = if queued > 0 { format!(", {queued} pipelines queued") } else { String::new() };
+        let queued = if pipelines > 0 { format!(", {pipelines} pipelines active") } else { String::new() };
         let failed = if failed > 0 { format!(", {failed} failed") } else { String::new() };
         format!("XCL – {title} | compiling shaders: {running} running, {done} done{queued}{failed}")
     } else {
@@ -554,6 +579,7 @@ unsafe fn ensure_swapchain(p: &mut Presenter, hwnd: HWND, w: u32, h: u32, fmt: D
             p.h = h;
             p.fmt = fmt;
             crate::xlog_info!("present: swap chain {w}x{h} {:?}", fmt);
+            let _ = configure_color_space(sc, fmt);
             return true;
         }
         return false;
@@ -576,7 +602,11 @@ unsafe fn ensure_swapchain(p: &mut Presenter, hwnd: HWND, w: u32, h: u32, fmt: D
     match factory.CreateSwapChainForHwnd(queue, hwnd, &desc, None, None) {
         Ok(sc1) => {
             let _ = factory.MakeWindowAssociation(hwnd, DXGI_MWA_NO_ALT_ENTER);
-            p.sc = sc1.cast::<IDXGISwapChain3>().ok();
+            let sc3 = sc1.cast::<IDXGISwapChain3>().ok();
+            if let Some(sc) = &sc3 {
+                let _ = configure_color_space(sc, fmt);
+            }
+            p.sc = sc3;
             p.w = w;
             p.h = h;
             p.fmt = fmt;
@@ -967,6 +997,7 @@ impl Drop for Presenter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
 
     // XCL_WINDOW_POS is process-global; one test covers all modes in sequence.
     #[test]
@@ -1000,6 +1031,53 @@ mod tests {
             std::env::set_var("XCL_WINDOW_POS", "center");
             assert_eq!(window_position("auto", 1280, 720), window_position("center", 1280, 720));
             std::env::remove_var("XCL_WINDOW_POS");
+        }
+    }
+
+    #[test]
+    fn hdr_color_space_format_matching() {
+        assert_eq!(hdr_color_space(DXGI_FORMAT_R10G10B10A2_UNORM), Some(DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020));
+        assert_eq!(hdr_color_space(DXGI_FORMAT_R16G16B16A16_FLOAT), Some(DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709));
+        assert_eq!(hdr_color_space(DXGI_FORMAT_R8G8B8A8_UNORM), None);
+        assert_eq!(hdr_color_space(DXGI_FORMAT_B8G8R8A8_UNORM), None);
+        assert_eq!(hdr_color_space(DXGI_FORMAT_UNKNOWN), None);
+    }
+
+    #[test]
+    fn hdr_color_space_configuration() {
+        unsafe {
+            let Ok(factory) = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0)) else { return };
+            let Ok(adapter) = factory.EnumWarpAdapter::<IDXGIAdapter>() else { return };
+            let mut dev: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                return;
+            }
+            let Some(dev) = dev else { return };
+            let Ok(queue) = dev.CreateCommandQueue::<ID3D12CommandQueue>(&D3D12_COMMAND_QUEUE_DESC {
+                Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
+                ..Default::default()
+            }) else { return };
+            let desc = DXGI_SWAP_CHAIN_DESC1 {
+                Width: 64,
+                Height: 64,
+                Format: DXGI_FORMAT_R10G10B10A2_UNORM,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
+                BufferCount: 2,
+                Scaling: DXGI_SCALING_STRETCH,
+                SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
+                AlphaMode: DXGI_ALPHA_MODE_IGNORE,
+                ..Default::default()
+            };
+            if let Ok(sc1) = factory.CreateSwapChainForComposition(&queue, &desc, None) {
+                if let Ok(sc3) = sc1.cast::<IDXGISwapChain3>() {
+                    // SDR format does nothing and returns Ok
+                    assert!(configure_color_space(&sc3, DXGI_FORMAT_R8G8B8A8_UNORM).is_ok());
+                    // HDR formats invoke SetColorSpace1 without panic (returns Ok or display unsupported error)
+                    let _ = configure_color_space(&sc3, DXGI_FORMAT_R10G10B10A2_UNORM);
+                    let _ = configure_color_space(&sc3, DXGI_FORMAT_R16G16B16A16_FLOAT);
+                }
+            }
         }
     }
 }

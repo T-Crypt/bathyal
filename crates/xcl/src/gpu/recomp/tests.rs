@@ -4,7 +4,7 @@
 //! as wave32 programs, and only need a GPU and DXC.
 
 use super::runner::{self, KernelState};
-use super::{translate, Mode, Options};
+use super::{translate, Mode, Options, PadWaves};
 use crate::gpu::rdna2::encode;
 
 /// A GPU and DXC for the instruction tests. Wave64 programs run natively where the adapter
@@ -1097,6 +1097,529 @@ fn gpu_clamp_and_omod_per_instruction() {
     }
 }
 
+/// 16-bit VALU integer CLAMP=1 saturation vs CLAMP=0 wrapping, plus OP_SEL half selection and
+/// preservation of the untouched half of the destination VGPR.
+#[test]
+fn gpu_int_clamp_16bit() {
+    let v = |name: &'static str, f: &'static [(&'static str, u64)]| (name, "ENC_VOP3", f, None);
+    let code = prog(&[
+        // v_add_nc_u16
+        v("V_ADD_NC_U16", &[("VDST", 10), ("SRC0", V + 0), ("SRC1", V + 1), ("CLAMP", 1)]),
+        v("V_ADD_NC_U16", &[("VDST", 11), ("SRC0", V + 0), ("SRC1", V + 1)]),
+        v("V_ADD_NC_U16", &[("VDST", 12), ("SRC0", V + 0), ("SRC1", V + 1), ("OP_SEL", 0b1011), ("CLAMP", 1)]),
+        v("V_ADD_NC_U16", &[("VDST", 13), ("SRC0", V + 0), ("SRC1", V + 1), ("OP_SEL", 0b1000), ("CLAMP", 1)]),
+        // v_sub_nc_u16
+        v("V_SUB_NC_U16", &[("VDST", 14), ("SRC0", V + 1), ("SRC1", V + 0), ("CLAMP", 1)]),
+        v("V_SUB_NC_U16", &[("VDST", 15), ("SRC0", V + 1), ("SRC1", V + 0)]),
+        v("V_SUB_NC_U16", &[("VDST", 16), ("SRC0", V + 0), ("SRC1", V + 1), ("OP_SEL", 0b0011), ("CLAMP", 1)]),
+        v("V_SUB_NC_U16", &[("VDST", 17), ("SRC0", V + 1), ("SRC1", V + 1), ("CLAMP", 1)]),
+        // v_add_nc_i16
+        v("V_ADD_NC_I16", &[("VDST", 18), ("SRC0", V + 2), ("SRC1", V + 3), ("CLAMP", 1)]),
+        v("V_ADD_NC_I16", &[("VDST", 19), ("SRC0", V + 2), ("SRC1", V + 3)]),
+        v("V_ADD_NC_I16", &[("VDST", 20), ("SRC0", V + 2), ("SRC1", V + 3), ("OP_SEL", 0b0011), ("CLAMP", 1)]),
+        v("V_ADD_NC_I16", &[("VDST", 21), ("SRC0", V + 2), ("SRC1", V + 3), ("OP_SEL", 0b0011)]),
+        // v_sub_nc_i16
+        v("V_SUB_NC_I16", &[("VDST", 22), ("SRC0", V + 2), ("SRC1", V + 3), ("OP_SEL", 0b0010), ("CLAMP", 1)]),
+        v("V_SUB_NC_I16", &[("VDST", 23), ("SRC0", V + 2), ("SRC1", V + 3), ("OP_SEL", 0b0010)]),
+        v("V_SUB_NC_I16", &[("VDST", 24), ("SRC0", V + 2), ("SRC1", V + 3), ("OP_SEL", 0b0001), ("CLAMP", 1)]),
+        v("V_SUB_NC_I16", &[("VDST", 25), ("SRC0", V + 2), ("SRC1", V + 3), ("OP_SEL", 0b0001)]),
+        // v_mad_u16: max intermediate 65535*65535 + 65535 = 0xFFFF_0000 fits in u32
+        v("V_MAD_U16", &[("VDST", 26), ("SRC0", V + 4), ("SRC1", V + 4), ("SRC2", V + 4), ("CLAMP", 1)]),
+        v("V_MAD_U16", &[("VDST", 27), ("SRC0", V + 4), ("SRC1", V + 4), ("SRC2", V + 4)]),
+        v("V_MAD_U16", &[("VDST", 28), ("SRC0", V + 7), ("SRC1", V + 7), ("SRC2", V + 8), ("OP_SEL", 0b0010), ("CLAMP", 1)]),
+        // v_mad_i16: extreme positive (-32768)*(-32768)+1 and negative (-32768)*32767+(-32768)
+        v("V_MAD_I16", &[("VDST", 29), ("SRC0", V + 5), ("SRC1", V + 5), ("SRC2", V + 6), ("CLAMP", 1)]),
+        v("V_MAD_I16", &[("VDST", 30), ("SRC0", V + 5), ("SRC1", V + 5), ("SRC2", V + 6)]),
+        v("V_MAD_I16", &[("VDST", 31), ("SRC0", V + 5), ("SRC1", V + 6), ("SRC2", V + 5), ("OP_SEL", 0b0010), ("CLAMP", 1)]),
+        v("V_MAD_I16", &[("VDST", 32), ("SRC0", V + 5), ("SRC1", V + 6), ("SRC2", V + 5), ("OP_SEL", 0b0010)]),
+        v("V_MAD_I16", &[("VDST", 33), ("SRC0", V + 3), ("SRC1", V + 7), ("SRC2", V + 8), ("OP_SEL", 0b0001), ("CLAMP", 1)]),
+        // Regression check for negative-clamped low half preserving upper half on packed/cvt i16:
+        // v_pk_add_i16 with lo = hi(v2)+hi(v3) (-32752 + -32 -> 0x8000), hi = lo(v2)+lo(v3) (+32752 + 32 -> 0x7FFF)
+        ("V_PK_ADD_I16", "ENC_VOP3P", &[("VDST", 34), ("SRC0", V + 2), ("SRC1", V + 3), ("OP_SEL", 3), ("CLAMP", 1)], None),
+        // v_cvt_pk_i16_i32 with lo = -40000 -> 0x8000, hi = 1 -> 0x0001
+        v("V_CVT_PK_I16_I32", &[("VDST", 35), ("SRC0", V + 9), ("SRC1", 129)]),
+        // v_cvt_i16_f16 with -40000.0 (f16 = 0xF8E2), NaN (0x7E00), +inf (0x7C00), -inf (0xFC00)
+        v("V_CVT_I16_F16", &[("VDST", 36), ("SRC0", V + 37)]),
+        v("V_CVT_I16_F16", &[("VDST", 38), ("SRC0", V + 37), ("OP_SEL", 0b0001)]),
+        v("V_CVT_I16_F16", &[("VDST", 39), ("SRC0", V + 40)]),
+        v("V_CVT_I16_F16", &[("VDST", 41), ("SRC0", V + 40), ("OP_SEL", 0b0001)]),
+        // v_mul_lo_u16: 65535*65535 = 0xFFFE_0001 (overflow -> 0xFFFF / wrap -> 0x0001), 100*200 = 20000 (0x4E20)
+        v("V_MUL_LO_U16", &[("VDST", 42), ("SRC0", V + 4), ("SRC1", V + 4), ("CLAMP", 1)]),
+        v("V_MUL_LO_U16", &[("VDST", 43), ("SRC0", V + 4), ("SRC1", V + 4)]),
+        v("V_MUL_LO_U16", &[("VDST", 44), ("SRC0", V + 7), ("SRC1", V + 7), ("OP_SEL", 0b1010), ("CLAMP", 1)]),
+        // v_pk_mul_lo_u16: lo = 0xFFF0*0x0020 = 0x1F_FE00 (ov -> 0xFFFF / wrap -> 0xFE00), hi = 5*2 = 10 (in-range)
+        ("V_PK_MUL_LO_U16", "ENC_VOP3P", &[("VDST", 45), ("SRC0", V + 0), ("SRC1", V + 1), ("OP_SEL_HI", 3), ("CLAMP", 1)], None),
+        ("V_PK_MUL_LO_U16", "ENC_VOP3P", &[("VDST", 46), ("SRC0", V + 0), ("SRC1", V + 1), ("OP_SEL_HI", 3)], None),
+        // Negative-result i16 min/max/med3 sanity check (verifies upper half preservation on NVIDIA SPIR-V)
+        v("V_MIN_I16", &[("VDST", 47), ("SRC0", V + 2), ("SRC1", V + 3), ("OP_SEL", 0b0011)]),
+        v("V_MAX_I16", &[("VDST", 48), ("SRC0", V + 2), ("SRC1", V + 3), ("OP_SEL", 0b0011)]),
+        v("V_MED3_I16", &[("VDST", 49), ("SRC0", V + 2), ("SRC1", V + 3), ("SRC2", V + 5), ("OP_SEL", 0b0011)]),
+        v("V_MIN3_I16", &[("VDST", 50), ("SRC0", V + 2), ("SRC1", V + 3), ("SRC2", V + 5), ("OP_SEL", 0b0011)]),
+        v("V_MAX3_I16", &[("VDST", 51), ("SRC0", V + 2), ("SRC1", V + 3), ("SRC2", V + 5), ("OP_SEL", 0b0011)]),
+        ("V_PK_MIN_I16", "ENC_VOP3P", &[("VDST", 52), ("SRC0", V + 2), ("SRC1", V + 3), ("OP_SEL", 3)], None),
+        ("V_PK_MAX_I16", "ENC_VOP3P", &[("VDST", 53), ("SRC0", V + 2), ("SRC1", V + 3), ("OP_SEL", 3)], None),
+        // Exact boundary pairs: 0xFFFF + 0 vs +1, 32767 + 0 vs +1, -32768 - 0 vs -1
+        v("V_ADD_NC_U16", &[("VDST", 54), ("SRC0", V + 4), ("SRC1", 128), ("CLAMP", 1)]),
+        v("V_ADD_NC_U16", &[("VDST", 55), ("SRC0", V + 4), ("SRC1", 129), ("CLAMP", 1)]),
+        v("V_ADD_NC_U16", &[("VDST", 56), ("SRC0", V + 4), ("SRC1", 129)]),
+        v("V_ADD_NC_I16", &[("VDST", 57), ("SRC0", V + 6), ("SRC1", 128), ("OP_SEL", 0b0001), ("CLAMP", 1)]),
+        v("V_ADD_NC_I16", &[("VDST", 58), ("SRC0", V + 6), ("SRC1", 129), ("OP_SEL", 0b0001), ("CLAMP", 1)]),
+        v("V_ADD_NC_I16", &[("VDST", 59), ("SRC0", V + 6), ("SRC1", 129), ("OP_SEL", 0b0001)]),
+        v("V_SUB_NC_I16", &[("VDST", 60), ("SRC0", V + 5), ("SRC1", 128), ("CLAMP", 1)]),
+        v("V_SUB_NC_I16", &[("VDST", 61), ("SRC0", V + 5), ("SRC1", 129), ("CLAMP", 1)]),
+        v("V_SUB_NC_I16", &[("VDST", 62), ("SRC0", V + 5), ("SRC1", 129)]),
+    ]);
+    let mut st = KernelState::default();
+    for r in st.vgpr.iter_mut() {
+        r[0] = 0x0005_FFF0;
+        r[1] = 0x0002_0020;
+        r[2] = 0x8010_7FF0;
+        r[3] = 0xFFE0_0020;
+        r[4] = 0xFFFF_FFFF;
+        r[5] = 0x8000_8000;
+        r[6] = 0x7FFF_0001;
+        r[7] = 0x00C8_0064;
+        r[8] = 0x0000_0037;
+        r[9] = (-40_000i32) as u32;
+        r[37] = 0x7E00_F8E2; // hi: NaN, lo: -40000.0 in binary16
+        r[40] = 0xFC00_7C00; // hi: -inf, lo: +inf in binary16
+        for d in (10..=36).chain([38, 39]).chain(41..=62) {
+            r[d] = 0xDEAD_BEEF;
+        }
+    }
+    for wave64 in gpu_waves() {
+        let (r, lanes) = run_wave(&code, &st, wave64);
+        for (l, v) in r.vgpr.iter().take(lanes).enumerate() {
+            assert_eq!(v[10], 0xDEAD_FFFF, "wave{lanes} lane {l} v_add_nc_u16 clamp");
+            assert_eq!(v[11], 0xDEAD_0010, "wave{lanes} lane {l} v_add_nc_u16 wrap");
+            assert_eq!(v[12], 0x0007_BEEF, "wave{lanes} lane {l} v_add_nc_u16 clamp hi in-range");
+            assert_eq!(v[13], 0xFFFF_BEEF, "wave{lanes} lane {l} v_add_nc_u16 clamp dst hi");
+            assert_eq!(v[14], 0xDEAD_0000, "wave{lanes} lane {l} v_sub_nc_u16 clamp underflow");
+            assert_eq!(v[15], 0xDEAD_0030, "wave{lanes} lane {l} v_sub_nc_u16 wrap");
+            assert_eq!(v[16], 0xDEAD_0003, "wave{lanes} lane {l} v_sub_nc_u16 clamp in-range");
+            assert_eq!(v[17], 0xDEAD_0000, "wave{lanes} lane {l} v_sub_nc_u16 clamp zero");
+            assert_eq!(v[18], 0xDEAD_7FFF, "wave{lanes} lane {l} v_add_nc_i16 clamp +ov");
+            assert_eq!(v[19], 0xDEAD_8010, "wave{lanes} lane {l} v_add_nc_i16 wrap +ov");
+            assert_eq!(v[20], 0xDEAD_8000, "wave{lanes} lane {l} v_add_nc_i16 clamp -ov");
+            assert_eq!(v[21], 0xDEAD_7FF0, "wave{lanes} lane {l} v_add_nc_i16 wrap -ov");
+            assert_eq!(v[22], 0xDEAD_7FFF, "wave{lanes} lane {l} v_sub_nc_i16 clamp +ov");
+            assert_eq!(v[23], 0xDEAD_8010, "wave{lanes} lane {l} v_sub_nc_i16 wrap +ov");
+            assert_eq!(v[24], 0xDEAD_8000, "wave{lanes} lane {l} v_sub_nc_i16 clamp -ov");
+            assert_eq!(v[25], 0xDEAD_7FF0, "wave{lanes} lane {l} v_sub_nc_i16 wrap -ov");
+            assert_eq!(v[26], 0xDEAD_FFFF, "wave{lanes} lane {l} v_mad_u16 clamp max");
+            assert_eq!(v[27], 0xDEAD_0000, "wave{lanes} lane {l} v_mad_u16 wrap max");
+            assert_eq!(v[28], 0xDEAD_4E57, "wave{lanes} lane {l} v_mad_u16 clamp in-range");
+            assert_eq!(v[29], 0xDEAD_7FFF, "wave{lanes} lane {l} v_mad_i16 clamp +ov");
+            assert_eq!(v[30], 0xDEAD_0001, "wave{lanes} lane {l} v_mad_i16 wrap +ov");
+            assert_eq!(v[31], 0xDEAD_8000, "wave{lanes} lane {l} v_mad_i16 clamp -ov");
+            assert_eq!(v[32], 0xDEAD_0000, "wave{lanes} lane {l} v_mad_i16 wrap -ov");
+            assert_eq!(v[33], 0xDEAD_F3B7, "wave{lanes} lane {l} v_mad_i16 clamp in-range neg");
+            assert_eq!(v[34], 0x7FFF_8000, "wave{lanes} lane {l} v_pk_add_i16 clamp neg lo + pos hi");
+            assert_eq!(v[35], 0x0001_8000, "wave{lanes} lane {l} v_cvt_pk_i16_i32 neg lo + pos hi");
+            assert_eq!(v[36], 0xDEAD_8000, "wave{lanes} lane {l} v_cvt_i16_f16 neg clamp");
+            assert_eq!(v[38], 0xDEAD_0000, "wave{lanes} lane {l} v_cvt_i16_f16 NaN");
+            assert_eq!(v[39], 0xDEAD_7FFF, "wave{lanes} lane {l} v_cvt_i16_f16 +inf");
+            assert_eq!(v[41], 0xDEAD_8000, "wave{lanes} lane {l} v_cvt_i16_f16 -inf");
+            assert_eq!(v[42], 0xDEAD_FFFF, "wave{lanes} lane {l} v_mul_lo_u16 clamp");
+            assert_eq!(v[43], 0xDEAD_0001, "wave{lanes} lane {l} v_mul_lo_u16 wrap");
+            assert_eq!(v[44], 0x4E20_BEEF, "wave{lanes} lane {l} v_mul_lo_u16 clamp hi in-range");
+            assert_eq!(v[45], 0x000A_FFFF, "wave{lanes} lane {l} v_pk_mul_lo_u16 clamp");
+            assert_eq!(v[46], 0x000A_FE00, "wave{lanes} lane {l} v_pk_mul_lo_u16 wrap");
+            assert_eq!(v[47], 0xDEAD_8010, "wave{lanes} lane {l} v_min_i16 neg preserves hi");
+            assert_eq!(v[48], 0xDEAD_FFE0, "wave{lanes} lane {l} v_max_i16 neg preserves hi");
+            assert_eq!(v[49], 0xDEAD_8010, "wave{lanes} lane {l} v_med3_i16 neg preserves hi");
+            assert_eq!(v[50], 0xDEAD_8000, "wave{lanes} lane {l} v_min3_i16 neg preserves hi");
+            assert_eq!(v[51], 0xDEAD_FFE0, "wave{lanes} lane {l} v_max3_i16 neg preserves hi");
+            assert_eq!(v[52], 0x0020_8010, "wave{lanes} lane {l} v_pk_min_i16 neg lo + pos hi");
+            assert_eq!(v[53], 0x7FF0_FFE0, "wave{lanes} lane {l} v_pk_max_i16 neg lo + pos hi");
+            assert_eq!(v[54], 0xDEAD_FFFF, "wave{lanes} lane {l} v_add_nc_u16 0xFFFF + 0 clamp");
+            assert_eq!(v[55], 0xDEAD_FFFF, "wave{lanes} lane {l} v_add_nc_u16 0xFFFF + 1 clamp");
+            assert_eq!(v[56], 0xDEAD_0000, "wave{lanes} lane {l} v_add_nc_u16 0xFFFF + 1 wrap");
+            assert_eq!(v[57], 0xDEAD_7FFF, "wave{lanes} lane {l} v_add_nc_i16 32767 + 0 clamp");
+            assert_eq!(v[58], 0xDEAD_7FFF, "wave{lanes} lane {l} v_add_nc_i16 32767 + 1 clamp");
+            assert_eq!(v[59], 0xDEAD_8000, "wave{lanes} lane {l} v_add_nc_i16 32767 + 1 wrap");
+            assert_eq!(v[60], 0xDEAD_8000, "wave{lanes} lane {l} v_sub_nc_i16 -32768 - 0 clamp");
+            assert_eq!(v[61], 0xDEAD_8000, "wave{lanes} lane {l} v_sub_nc_i16 -32768 - 1 clamp");
+            assert_eq!(v[62], 0xDEAD_7FFF, "wave{lanes} lane {l} v_sub_nc_i16 -32768 - 1 wrap");
+        }
+    }
+}
+
+/// 32-bit integer CLAMP=1 saturation on MAD (u16/i16/u24/i24), MUL24 (u24/i24), SAD/MSAD,
+/// SDWA CLAMP=1 on MUL24, and V_CVT_PKRTZ_F16_F32 ignoring VOP3 OMOD/CLAMP.
+#[test]
+fn gpu_int_clamp_32bit_mad_mul_sad() {
+    let v = |name: &'static str, f: &'static [(&'static str, u64)]| (name, "ENC_VOP3", f, None);
+    let code = prog(&[
+        // v_mad_u32_u16: v0 = 0xFFFF_0003, v1 = 0xFFFF_0004, v2 = 0x0002_0000, v3 = 0x0001_FFFE
+        v("V_MAD_U32_U16", &[("VDST", 20), ("SRC0", V + 0), ("SRC1", V + 1), ("SRC2", V + 2), ("OP_SEL", 3), ("CLAMP", 1)]),
+        v("V_MAD_U32_U16", &[("VDST", 21), ("SRC0", V + 0), ("SRC1", V + 1), ("SRC2", V + 2), ("OP_SEL", 3)]),
+        v("V_MAD_U32_U16", &[("VDST", 22), ("SRC0", V + 0), ("SRC1", V + 1), ("SRC2", V + 3), ("OP_SEL", 3), ("CLAMP", 1)]),
+        // v_mad_i32_i16: v4 = 0x8000_7FFF, v5 = 0x7000_0000, v6 = 0x9000_0000 (-0x7000_0000)
+        // hi*hi + v5 = (-32768)*(-32768) + 0x7000_0000 = +0xB000_0000 -> +ov
+        v("V_MAD_I32_I16", &[("VDST", 23), ("SRC0", V + 4), ("SRC1", V + 4), ("SRC2", V + 5), ("OP_SEL", 3), ("CLAMP", 1)]),
+        v("V_MAD_I32_I16", &[("VDST", 24), ("SRC0", V + 4), ("SRC1", V + 4), ("SRC2", V + 5), ("OP_SEL", 3)]),
+        // hi*lo + v6 = (-32768)*32767 + (-0x7000_0000) -> -ov
+        v("V_MAD_I32_I16", &[("VDST", 25), ("SRC0", V + 4), ("SRC1", V + 4), ("SRC2", V + 6), ("OP_SEL", 1), ("CLAMP", 1)]),
+        v("V_MAD_I32_I16", &[("VDST", 26), ("SRC0", V + 4), ("SRC1", V + 4), ("SRC2", V + 6), ("OP_SEL", 1)]),
+        // v_mul_u32_u24: v7 = 0xABFF_FFFF (u24 = 0xFFFFFF), v8 = 0x0001_0000, v9 = 0x0000_FFFF
+        v("V_MUL_U32_U24", &[("VDST", 27), ("SRC0", V + 7), ("SRC1", V + 7), ("CLAMP", 1)]),
+        v("V_MUL_U32_U24", &[("VDST", 28), ("SRC0", V + 7), ("SRC1", V + 7)]),
+        v("V_MUL_U32_U24", &[("VDST", 29), ("SRC0", V + 8), ("SRC1", V + 9), ("CLAMP", 1)]),
+        // v_mul_i32_i24: v10 = 0x0080_0000 (i24 = -2^23), v11 = 0x007F_FFFF (i24 = 2^23 - 1)
+        v("V_MUL_I32_I24", &[("VDST", 30), ("SRC0", V + 10), ("SRC1", V + 10), ("CLAMP", 1)]),
+        v("V_MUL_I32_I24", &[("VDST", 31), ("SRC0", V + 10), ("SRC1", V + 10)]),
+        v("V_MUL_I32_I24", &[("VDST", 32), ("SRC0", V + 10), ("SRC1", V + 11), ("CLAMP", 1)]),
+        v("V_MUL_I32_I24", &[("VDST", 33), ("SRC0", V + 10), ("SRC1", V + 11)]),
+        // v_mad_u32_u24: product overflow and add-only overflow
+        v("V_MAD_U32_U24", &[("VDST", 34), ("SRC0", V + 7), ("SRC1", V + 7), ("SRC2", 133), ("CLAMP", 1)]),
+        v("V_MAD_U32_U24", &[("VDST", 35), ("SRC0", V + 7), ("SRC1", V + 7), ("SRC2", 133)]),
+        v("V_MAD_U32_U24", &[("VDST", 36), ("SRC0", V + 8), ("SRC1", V + 9), ("SRC2", V + 2), ("CLAMP", 1)]),
+        v("V_MAD_U32_U24", &[("VDST", 37), ("SRC0", V + 8), ("SRC1", V + 9), ("SRC2", V + 2)]),
+        // v_mad_i32_i24: positive overflow, negative underflow, and wrapping control
+        v("V_MAD_I32_I24", &[("VDST", 38), ("SRC0", V + 11), ("SRC1", V + 11), ("SRC2", 138), ("CLAMP", 1)]),
+        v("V_MAD_I32_I24", &[("VDST", 39), ("SRC0", V + 11), ("SRC1", V + 11), ("SRC2", 138)]),
+        v("V_MAD_I32_I24", &[("VDST", 40), ("SRC0", V + 10), ("SRC1", V + 11), ("SRC2", 198), ("CLAMP", 1)]),
+        v("V_MAD_I32_I24", &[("VDST", 41), ("SRC0", V + 10), ("SRC1", V + 11), ("SRC2", 198)]),
+        // v_sad_u32: v12 = 0xFFFF_FFF0, v13 = 0x0000_0010, v14 = 0x0000_0100
+        v("V_SAD_U32", &[("VDST", 42), ("SRC0", V + 12), ("SRC1", V + 13), ("SRC2", V + 14), ("CLAMP", 1)]),
+        v("V_SAD_U32", &[("VDST", 43), ("SRC0", V + 12), ("SRC1", V + 13), ("SRC2", V + 14)]),
+        v("V_SAD_U32", &[("VDST", 44), ("SRC0", V + 13), ("SRC1", V + 12), ("SRC2", V + 14), ("CLAMP", 1)]),
+        // v_sad_u8 / v_sad_hi_u8 / v_sad_u16 / v_msad_u8: v15 = 0xFFFF_FFFF, v16 = 0x0000_0000, v17 = 0x0001_0101
+        v("V_SAD_U8", &[("VDST", 45), ("SRC0", V + 15), ("SRC1", V + 16), ("SRC2", V + 12), ("CLAMP", 1)]),
+        v("V_SAD_U8", &[("VDST", 46), ("SRC0", V + 15), ("SRC1", V + 16), ("SRC2", V + 12)]),
+        v("V_SAD_HI_U8", &[("VDST", 47), ("SRC0", V + 15), ("SRC1", V + 16), ("SRC2", V + 18), ("CLAMP", 1)]),
+        v("V_SAD_HI_U8", &[("VDST", 48), ("SRC0", V + 15), ("SRC1", V + 16), ("SRC2", V + 18)]),
+        v("V_SAD_U16", &[("VDST", 49), ("SRC0", V + 15), ("SRC1", V + 16), ("SRC2", V + 19), ("CLAMP", 1)]),
+        v("V_SAD_U16", &[("VDST", 50), ("SRC0", V + 15), ("SRC1", V + 16), ("SRC2", V + 19)]),
+        v("V_MSAD_U8", &[("VDST", 51), ("SRC0", V + 15), ("SRC1", V + 17), ("SRC2", V + 12), ("CLAMP", 1)]),
+        v("V_MSAD_U8", &[("VDST", 52), ("SRC0", V + 15), ("SRC1", V + 17), ("SRC2", V + 12)]),
+        v("V_MSAD_U8", &[("VDST", 53), ("SRC0", V + 15), ("SRC1", V + 17), ("SRC2", 138), ("CLAMP", 1)]),
+        // v_cvt_pkrtz_f16_f32 ignores VOP3 OMOD and CLAMP on RDNA2 (ABS/NEG still apply):
+        // v54 = -2.0 (f16 0xC000), v55 = 3.0 (0x4200), v56 = 1.5 (0x3E00), v57 = -0.5 (0xB800)
+        v("V_CVT_PKRTZ_F16_F32", &[("VDST", 58), ("SRC0", V + 54), ("SRC1", V + 55), ("CLAMP", 1)]),
+        v("V_CVT_PKRTZ_F16_F32", &[("VDST", 59), ("SRC0", V + 56), ("SRC1", V + 57), ("OMOD", 1)]),
+        // SDWA CLAMP=1 path: v_mul_u32_u24_sdwa & v_mul_i32_i24_sdwa (+ov and -ov)
+        ("V_MUL_U32_U24", "VOP2_VOP_SDWA", &[("VDST", 60), ("SRC0", 0xF9), ("VSRC0", 7), ("VSRC1", 7), ("SRC0_SEL", 6), ("SRC1_SEL", 6), ("DST_SEL", 6), ("CLAMP", 1)], None),
+        ("V_MUL_I32_I24", "VOP2_VOP_SDWA", &[("VDST", 61), ("SRC0", 0xF9), ("VSRC0", 10), ("VSRC1", 10), ("SRC0_SEL", 6), ("SRC1_SEL", 6), ("DST_SEL", 6), ("CLAMP", 1)], None),
+        ("V_MUL_I32_I24", "VOP2_VOP_SDWA", &[("VDST", 62), ("SRC0", 0xF9), ("VSRC0", 10), ("VSRC1", 11), ("SRC0_SEL", 6), ("SRC1_SEL", 6), ("DST_SEL", 6), ("CLAMP", 1)], None),
+    ]);
+    let mut st = KernelState::default();
+    for r in st.vgpr.iter_mut() {
+        r[0] = 0xFFFF_0003;
+        r[1] = 0xFFFF_0004;
+        r[2] = 0x0002_0000;
+        r[3] = 0x0001_FFFE;
+        r[4] = 0x8000_7FFF;
+        r[5] = 0x7000_0000;
+        r[6] = 0x9000_0000;
+        r[7] = 0xABFF_FFFF;
+        r[8] = 0x0001_0000;
+        r[9] = 0x0000_FFFF;
+        r[10] = 0x0080_0000;
+        r[11] = 0x007F_FFFF;
+        r[12] = 0xFFFF_FFF0;
+        r[13] = 0x0000_0010;
+        r[14] = 0x0000_0100;
+        r[15] = 0xFFFF_FFFF;
+        r[16] = 0x0000_0000;
+        r[17] = 0x0001_0101;
+        r[18] = 0xFF00_0000;
+        r[19] = 0xFFFF_0000;
+        r[54] = f(-2.0);
+        r[55] = f(3.0);
+        r[56] = f(1.5);
+        r[57] = f(-0.5);
+    }
+    for wave64 in gpu_waves() {
+        let (r, lanes) = run_wave(&code, &st, wave64);
+        for (l, v) in r.vgpr.iter().take(lanes).enumerate() {
+            assert_eq!(v[20], 0xFFFF_FFFF, "wave{lanes} lane {l} v_mad_u32_u16 clamp");
+            assert_eq!(v[21], 0x0000_0001, "wave{lanes} lane {l} v_mad_u32_u16 wrap");
+            assert_eq!(v[22], 0xFFFF_FFFF, "wave{lanes} lane {l} v_mad_u32_u16 exact max");
+            assert_eq!(v[23], 0x7FFF_FFFF, "wave{lanes} lane {l} v_mad_i32_i16 clamp +ov");
+            assert_eq!(v[24], 0xB000_0000, "wave{lanes} lane {l} v_mad_i32_i16 wrap +ov");
+            assert_eq!(v[25], 0x8000_0000, "wave{lanes} lane {l} v_mad_i32_i16 clamp -ov");
+            assert_eq!(
+                v[26],
+                ((-32768i32).wrapping_mul(32767).wrapping_add(-0x7000_0000i32)) as u32,
+                "wave{lanes} lane {l} v_mad_i32_i16 wrap -ov"
+            );
+            assert_eq!(v[27], 0xFFFF_FFFF, "wave{lanes} lane {l} v_mul_u32_u24 clamp");
+            assert_eq!(v[28], 0xFE00_0001, "wave{lanes} lane {l} v_mul_u32_u24 wrap");
+            assert_eq!(v[29], 0xFFFF_0000, "wave{lanes} lane {l} v_mul_u32_u24 clamp in-range");
+            assert_eq!(v[30], 0x7FFF_FFFF, "wave{lanes} lane {l} v_mul_i32_i24 clamp +ov");
+            assert_eq!(v[31], 0x0000_0000, "wave{lanes} lane {l} v_mul_i32_i24 wrap +ov");
+            assert_eq!(v[32], 0x8000_0000, "wave{lanes} lane {l} v_mul_i32_i24 clamp -ov");
+            assert_eq!(v[33], 0x0080_0000, "wave{lanes} lane {l} v_mul_i32_i24 wrap -ov");
+            assert_eq!(v[34], 0xFFFF_FFFF, "wave{lanes} lane {l} v_mad_u32_u24 clamp prod ov");
+            assert_eq!(v[35], 0xFE00_0006, "wave{lanes} lane {l} v_mad_u32_u24 wrap prod ov");
+            assert_eq!(v[36], 0xFFFF_FFFF, "wave{lanes} lane {l} v_mad_u32_u24 clamp add ov");
+            assert_eq!(v[37], 0x0001_0000, "wave{lanes} lane {l} v_mad_u32_u24 wrap add ov");
+            assert_eq!(v[38], 0x7FFF_FFFF, "wave{lanes} lane {l} v_mad_i32_i24 clamp +ov");
+            assert_eq!(
+                v[39],
+                ((0x007F_FFFFi32).wrapping_mul(0x007F_FFFF).wrapping_add(10)) as u32,
+                "wave{lanes} lane {l} v_mad_i32_i24 wrap +ov"
+            );
+            assert_eq!(v[40], 0x8000_0000, "wave{lanes} lane {l} v_mad_i32_i24 clamp -ov");
+            assert_eq!(
+                v[41],
+                ((-0x0080_0000i32).wrapping_mul(0x007F_FFFF).wrapping_add(-6)) as u32,
+                "wave{lanes} lane {l} v_mad_i32_i24 wrap -ov"
+            );
+            assert_eq!(v[42], 0xFFFF_FFFF, "wave{lanes} lane {l} v_sad_u32 clamp a>b");
+            assert_eq!(v[43], 0x0000_00E0, "wave{lanes} lane {l} v_sad_u32 wrap");
+            assert_eq!(v[44], 0xFFFF_FFFF, "wave{lanes} lane {l} v_sad_u32 clamp a<b");
+            assert_eq!(v[45], 0xFFFF_FFFF, "wave{lanes} lane {l} v_sad_u8 clamp");
+            assert_eq!(v[46], 0xFFFF_FFF0u32.wrapping_add(1020), "wave{lanes} lane {l} v_sad_u8 wrap");
+            assert_eq!(v[47], 0xFFFF_FFFF, "wave{lanes} lane {l} v_sad_hi_u8 clamp");
+            assert_eq!(v[48], 0xFF00_0000u32.wrapping_add(1020 << 16), "wave{lanes} lane {l} v_sad_hi_u8 wrap");
+            assert_eq!(v[49], 0xFFFF_FFFF, "wave{lanes} lane {l} v_sad_u16 clamp");
+            assert_eq!(v[50], 0xFFFF_0000u32.wrapping_add(131070), "wave{lanes} lane {l} v_sad_u16 wrap");
+            assert_eq!(v[51], 0xFFFF_FFFF, "wave{lanes} lane {l} v_msad_u8 clamp");
+            assert_eq!(v[52], 0xFFFF_FFF0u32.wrapping_add(3 * 254), "wave{lanes} lane {l} v_msad_u8 wrap");
+            assert_eq!(v[53], 3 * 254 + 10, "wave{lanes} lane {l} v_msad_u8 clamp in-range");
+            assert_eq!(v[58], 0x4200_C000, "wave{lanes} lane {l} v_cvt_pkrtz_f16_f32 ignores VOP3 clamp");
+            assert_eq!(v[59], 0xB800_3E00, "wave{lanes} lane {l} v_cvt_pkrtz_f16_f32 ignores VOP3 omod");
+            assert_eq!(v[60], 0xFFFF_FFFF, "wave{lanes} lane {l} v_mul_u32_u24 sdwa clamp");
+            assert_eq!(v[61], 0x7FFF_FFFF, "wave{lanes} lane {l} v_mul_i32_i24 sdwa clamp +ov");
+            assert_eq!(v[62], 0x8000_0000, "wave{lanes} lane {l} v_mul_i32_i24 sdwa clamp -ov");
+        }
+    }
+}
+
+/// Carry-out/carry-in 32-bit add/sub (VOP3 + SDWA) and 64-bit integer MAD with CLAMP=1 vs CLAMP=0:
+/// destination saturates while SDST/VCC still reports the unclamped carry/borrow/sign mask per lane.
+#[test]
+fn gpu_int_clamp_carry_and_64bit() {
+    let vs = |name: &'static str, f: &'static [(&'static str, u64)]| (name, "VOP3_SDST_ENC", f, None);
+    let code = prog(&[
+        // v_add_co_u32: even lanes (0xFFFF_FFF0 + 0x20) overflow, odd lanes (10 + 20) do not
+        vs("V_ADD_CO_U32", &[("VDST", 10), ("SDST", 0), ("SRC0", V + 0), ("SRC1", V + 1), ("CLAMP", 1)]),
+        vs("V_ADD_CO_U32", &[("VDST", 11), ("SDST", 2), ("SRC0", V + 0), ("SRC1", V + 1)]),
+        // v_sub_co_u32 / v_subrev_co_u32: even lanes (0x10 - 0x20) borrow, odd lanes (0x30 - 0x20) do not
+        vs("V_SUB_CO_U32", &[("VDST", 12), ("SDST", 4), ("SRC0", V + 2), ("SRC1", V + 1), ("CLAMP", 1)]),
+        vs("V_SUB_CO_U32", &[("VDST", 13), ("SDST", 6), ("SRC0", V + 2), ("SRC1", V + 1)]),
+        vs("V_SUBREV_CO_U32", &[("VDST", 14), ("SDST", 8), ("SRC0", V + 1), ("SRC1", V + 2), ("CLAMP", 1)]),
+        vs("V_SUBREV_CO_U32", &[("VDST", 15), ("SDST", 10), ("SRC0", V + 1), ("SRC1", V + 2)]),
+        // carry-in = s[20:21] (all 1s):
+        // v_add_co_ci_u32: even (0xFFFF_FFFF + 0 + 1) overflows, odd (0xFFFF_FFFE + 0 + 1) = 0xFFFF_FFFF no carry
+        vs("V_ADD_CO_CI_U32", &[("VDST", 16), ("SDST", 12), ("SRC0", V + 3), ("SRC1", 128), ("SRC2", 20), ("CLAMP", 1)]),
+        vs("V_ADD_CO_CI_U32", &[("VDST", 17), ("SDST", 14), ("SRC0", V + 3), ("SRC1", 128), ("SRC2", 20)]),
+        // v_sub_co_ci_u32 / v_subrev_co_ci_u32: even (0 - 0 - 1) borrows, odd (1 - 0 - 1) = 0 no borrow
+        vs("V_SUB_CO_CI_U32", &[("VDST", 18), ("SDST", 16), ("SRC0", V + 4), ("SRC1", 128), ("SRC2", 20), ("CLAMP", 1)]),
+        vs("V_SUB_CO_CI_U32", &[("VDST", 19), ("SDST", 18), ("SRC0", V + 4), ("SRC1", 128), ("SRC2", 20)]),
+        vs("V_SUBREV_CO_CI_U32", &[("VDST", 20), ("SDST", 22), ("SRC0", 128), ("SRC1", V + 4), ("SRC2", 20), ("CLAMP", 1)]),
+        vs("V_SUBREV_CO_CI_U32", &[("VDST", 21), ("SDST", 24), ("SRC0", 128), ("SRC1", V + 4), ("SRC2", 20)]),
+        // Corner cases with b = 0xFFFF_FFFF (v44) and alternating carry-in s[34:35] (even=1, odd=0):
+        // v_add_co_ci_u32: 0xFFFF_FFFF + 0xFFFF_FFFF + cin (all lanes carry; clamp=0xFFFF_FFFF, wrap=0xFFFF_FFFF/0xFFFF_FFFE)
+        vs("V_ADD_CO_CI_U32", &[("VDST", 22), ("SDST", 36), ("SRC0", V + 44), ("SRC1", V + 44), ("SRC2", 34), ("CLAMP", 1)]),
+        vs("V_ADD_CO_CI_U32", &[("VDST", 23), ("SDST", 38), ("SRC0", V + 44), ("SRC1", V + 44), ("SRC2", 34)]),
+        // v_sub_co_ci_u32 & v_subrev_co_ci_u32 with b+cin 32-bit wraparound (b = 0xFFFF_FFFF, cin = 1 on even):
+        // v45 = even: 0, odd: 0xFFFF_FFFF; cin = s[20:21] (all 1s) -> even: 0 - 0xFFFF_FFFF - 1 (-2^32, borrow=1),
+        // odd: 0xFFFF_FFFF - 0xFFFF_FFFF - 1 (-1, borrow=1, wrap=0xFFFF_FFFF, clamp=0)
+        vs("V_SUB_CO_CI_U32", &[("VDST", 24), ("SDST", 40), ("SRC0", V + 45), ("SRC1", V + 44), ("SRC2", 20), ("CLAMP", 1)]),
+        vs("V_SUB_CO_CI_U32", &[("VDST", 25), ("SDST", 42), ("SRC0", V + 45), ("SRC1", V + 44), ("SRC2", 20)]),
+        vs("V_SUBREV_CO_CI_U32", &[("VDST", 26), ("SDST", 44), ("SRC0", V + 44), ("SRC1", V + 45), ("SRC2", 20), ("CLAMP", 1)]),
+        vs("V_SUBREV_CO_CI_U32", &[("VDST", 27), ("SDST", 46), ("SRC0", V + 44), ("SRC1", V + 45), ("SRC2", 20)]),
+        // SDWA CLAMP=1 on V_ADD_CO_CI_U32 & V_SUB_CO_CI_U32 (reads/writes VCC = s[106:107]):
+        ("S_MOV_B64", "ENC_SOP1", &[("SDST", 106), ("SSRC0", 20)], None),
+        ("V_ADD_CO_CI_U32", "VOP2_VOP_SDWA", &[("VDST", 28), ("SRC0", 0xF9), ("VSRC0", 3), ("VSRC1", 46), ("SRC0_SEL", 6), ("SRC1_SEL", 6), ("DST_SEL", 6), ("CLAMP", 1)], None),
+        ("S_MOV_B64", "ENC_SOP1", &[("SDST", 48), ("SSRC0", 106)], None),
+        ("S_MOV_B64", "ENC_SOP1", &[("SDST", 106), ("SSRC0", 20)], None),
+        ("V_SUB_CO_CI_U32", "VOP2_VOP_SDWA", &[("VDST", 29), ("SRC0", 0xF9), ("VSRC0", 4), ("VSRC1", 46), ("SRC0_SEL", 6), ("SRC1_SEL", 6), ("DST_SEL", 6), ("CLAMP", 1)], None),
+        ("S_MOV_B64", "ENC_SOP1", &[("SDST", 50), ("SSRC0", 106)], None),
+        // v_mad_u64_u32: even lanes overflow, odd lanes hit exact u64::MAX without carry
+        vs("V_MAD_U64_U32", &[("VDST", 30), ("SDST", 26), ("SRC0", V + 5), ("SRC1", V + 6), ("SRC2", V + 7), ("CLAMP", 1)]),
+        vs("V_MAD_U64_U32", &[("VDST", 32), ("SDST", 28), ("SRC0", V + 5), ("SRC1", V + 6), ("SRC2", V + 7)]),
+        // v_mad_i64_i32: 8 cases across lanes (l % 8) covering +ov, -ov, exact bounds, opposite signs
+        vs("V_MAD_I64_I32", &[("VDST", 34), ("SDST", 30), ("SRC0", V + 40), ("SRC1", V + 41), ("SRC2", V + 42), ("CLAMP", 1)]),
+        vs("V_MAD_I64_I32", &[("VDST", 36), ("SDST", 32), ("SRC0", V + 40), ("SRC1", V + 41), ("SRC2", V + 42)]),
+    ]);
+    let set64 = |r: &mut [u32], idx: usize, val: u64| {
+        r[idx] = val as u32;
+        r[idx + 1] = (val >> 32) as u32;
+    };
+    let get64 = |v: &[u32], idx: usize| v[idx] as u64 | ((v[idx + 1] as u64) << 32);
+    let mut st = KernelState::default();
+    st.sgpr[20] = u32::MAX;
+    st.sgpr[21] = u32::MAX;
+    st.sgpr[34] = 0x5555_5555;
+    st.sgpr[35] = 0x5555_5555;
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        let even = l & 1 == 0;
+        r[0] = if even { 0xFFFF_FFF0 } else { 10 };
+        r[1] = 0x20;
+        r[2] = if even { 0x10 } else { 0x30 };
+        r[3] = if even { 0xFFFF_FFFF } else { 0xFFFF_FFFE };
+        r[4] = if even { 0 } else { 1 };
+        r[5] = if even { 0xFFFF_FFFF } else { 0x0001_0000 };
+        r[6] = if even { 0xFFFF_FFFF } else { 0x0001_0000 };
+        set64(r, 7, if even { u64::MAX } else { 0xFFFF_FFFE_FFFF_FFFF });
+        r[44] = 0xFFFF_FFFF;
+        r[45] = if even { 0 } else { 0xFFFF_FFFF };
+        r[46] = 0;
+        match l % 8 {
+            0 => {
+                // (-2^31)*(-2^31) + 2^62 = +2^63 > i64::MAX (bit64 = 0)
+                r[40] = i32::MIN as u32;
+                r[41] = i32::MIN as u32;
+                set64(r, 42, 0x4000_0000_0000_0000);
+            }
+            1 => {
+                // (-2^31)*(2^31-1) + i64::MIN < i64::MIN (bit64 = 1)
+                r[40] = i32::MIN as u32;
+                r[41] = i32::MAX as u32;
+                set64(r, 42, i64::MIN as u64);
+            }
+            2 => {
+                // 1*(-1) + i64::MIN = i64::MIN - 1 < i64::MIN (bit64 = 1)
+                r[40] = 1;
+                r[41] = (-1i32) as u32;
+                set64(r, 42, i64::MIN as u64);
+            }
+            3 => {
+                // (-1)*1 + (i64::MIN + 1) = exact i64::MIN (bit64 = 1)
+                r[40] = (-1i32) as u32;
+                r[41] = 1;
+                set64(r, 42, (i64::MIN + 1) as u64);
+            }
+            4 => {
+                // 1*1 + (i64::MAX - 1) = exact i64::MAX (bit64 = 0)
+                r[40] = 1;
+                r[41] = 1;
+                set64(r, 42, (i64::MAX - 1) as u64);
+            }
+            5 => {
+                // 1*1 + i64::MAX = i64::MAX + 1 > i64::MAX (bit64 = 0)
+                r[40] = 1;
+                r[41] = 1;
+                set64(r, 42, i64::MAX as u64);
+            }
+            6 => {
+                // (-2^31)*(2^31-1) + i64::MAX: opposite signs, > 0 (bit64 = 0)
+                r[40] = i32::MIN as u32;
+                r[41] = i32::MAX as u32;
+                set64(r, 42, i64::MAX as u64);
+            }
+            _ => {
+                // (-2^31)*(-2^31) + i64::MIN: opposite signs, -2^62 < 0 (bit64 = 1)
+                r[40] = i32::MIN as u32;
+                r[41] = i32::MIN as u32;
+                set64(r, 42, i64::MIN as u64);
+            }
+        }
+    }
+    for wave64 in gpu_waves() {
+        let (r, lanes) = run_wave(&code, &st, wave64);
+        let even_mask = (0x5555_5555u32, if wave64 { 0x5555_5555u32 } else { 0 });
+        let sdwa_vcc_mask = (0x5555_5555u32, if wave64 { 0x5555_5555u32 } else { u32::MAX });
+        let all_mask = (u32::MAX, if wave64 { u32::MAX } else { 0 });
+        let mad_i64_mask = (0x8E8E_8E8Eu32, if wave64 { 0x8E8E_8E8Eu32 } else { 0 });
+        for (slot, want, label) in [
+            (0, even_mask, "v_add_co_u32 clamp sdst"),
+            (2, even_mask, "v_add_co_u32 wrap sdst"),
+            (4, even_mask, "v_sub_co_u32 clamp sdst"),
+            (6, even_mask, "v_sub_co_u32 wrap sdst"),
+            (8, even_mask, "v_subrev_co_u32 clamp sdst"),
+            (10, even_mask, "v_subrev_co_u32 wrap sdst"),
+            (12, even_mask, "v_add_co_ci_u32 clamp sdst"),
+            (14, even_mask, "v_add_co_ci_u32 wrap sdst"),
+            (16, even_mask, "v_sub_co_ci_u32 clamp sdst"),
+            (18, even_mask, "v_sub_co_ci_u32 wrap sdst"),
+            (22, even_mask, "v_subrev_co_ci_u32 clamp sdst"),
+            (24, even_mask, "v_subrev_co_ci_u32 wrap sdst"),
+            (36, all_mask, "v_add_co_ci_u32 max+max+cin clamp sdst"),
+            (38, all_mask, "v_add_co_ci_u32 max+max+cin wrap sdst"),
+            (40, all_mask, "v_sub_co_ci_u32 b+cin wraparound clamp sdst"),
+            (42, all_mask, "v_sub_co_ci_u32 b+cin wraparound wrap sdst"),
+            (44, all_mask, "v_subrev_co_ci_u32 b+cin wraparound clamp sdst"),
+            (46, all_mask, "v_subrev_co_ci_u32 b+cin wraparound wrap sdst"),
+            (48, sdwa_vcc_mask, "v_add_co_ci_u32 sdwa clamp vcc"),
+            (50, sdwa_vcc_mask, "v_sub_co_ci_u32 sdwa clamp vcc"),
+            (26, even_mask, "v_mad_u64_u32 clamp sdst"),
+            (28, even_mask, "v_mad_u64_u32 wrap sdst"),
+            (30, mad_i64_mask, "v_mad_i64_i32 clamp sdst (65-bit sign)"),
+            (32, mad_i64_mask, "v_mad_i64_i32 wrap sdst (65-bit sign)"),
+        ] {
+            assert_eq!((r.sgpr[slot], r.sgpr[slot + 1]), want, "wave{lanes} {label}");
+        }
+        for (l, v) in r.vgpr.iter().take(lanes).enumerate() {
+            let even = l & 1 == 0;
+            assert_eq!(v[10], if even { 0xFFFF_FFFF } else { 10 + 0x20 }, "wave{lanes} lane {l} v_add_co_u32 clamp");
+            assert_eq!(v[11], if even { 0x10 } else { 10 + 0x20 }, "wave{lanes} lane {l} v_add_co_u32 wrap");
+            assert_eq!(v[12], if even { 0 } else { 0x10 }, "wave{lanes} lane {l} v_sub_co_u32 clamp");
+            assert_eq!(v[13], if even { 0xFFFF_FFF0 } else { 0x10 }, "wave{lanes} lane {l} v_sub_co_u32 wrap");
+            assert_eq!(v[14], if even { 0 } else { 0x10 }, "wave{lanes} lane {l} v_subrev_co_u32 clamp");
+            assert_eq!(v[15], if even { 0xFFFF_FFF0 } else { 0x10 }, "wave{lanes} lane {l} v_subrev_co_u32 wrap");
+            assert_eq!(v[16], 0xFFFF_FFFF, "wave{lanes} lane {l} v_add_co_ci_u32 clamp");
+            assert_eq!(v[17], if even { 0 } else { 0xFFFF_FFFF }, "wave{lanes} lane {l} v_add_co_ci_u32 wrap");
+            assert_eq!(v[18], 0, "wave{lanes} lane {l} v_sub_co_ci_u32 clamp");
+            assert_eq!(v[19], if even { 0xFFFF_FFFF } else { 0 }, "wave{lanes} lane {l} v_sub_co_ci_u32 wrap");
+            assert_eq!(v[20], 0, "wave{lanes} lane {l} v_subrev_co_ci_u32 clamp");
+            assert_eq!(v[21], if even { 0xFFFF_FFFF } else { 0 }, "wave{lanes} lane {l} v_subrev_co_ci_u32 wrap");
+            assert_eq!(v[22], 0xFFFF_FFFF, "wave{lanes} lane {l} v_add_co_ci_u32 max+max+cin clamp");
+            assert_eq!(v[23], if even { 0xFFFF_FFFF } else { 0xFFFF_FFFE }, "wave{lanes} lane {l} v_add_co_ci_u32 max+max+cin wrap");
+            assert_eq!(v[24], 0, "wave{lanes} lane {l} v_sub_co_ci_u32 b+cin wraparound clamp");
+            assert_eq!(v[25], if even { 0 } else { 0xFFFF_FFFF }, "wave{lanes} lane {l} v_sub_co_ci_u32 b+cin wraparound wrap");
+            assert_eq!(v[26], 0, "wave{lanes} lane {l} v_subrev_co_ci_u32 b+cin wraparound clamp");
+            assert_eq!(v[27], if even { 0 } else { 0xFFFF_FFFF }, "wave{lanes} lane {l} v_subrev_co_ci_u32 b+cin wraparound wrap");
+            assert_eq!(v[28], 0xFFFF_FFFF, "wave{lanes} lane {l} v_add_co_ci_u32 sdwa clamp");
+            assert_eq!(v[29], 0, "wave{lanes} lane {l} v_sub_co_ci_u32 sdwa clamp");
+            assert_eq!(get64(v, 30), u64::MAX, "wave{lanes} lane {l} v_mad_u64_u32 clamp");
+            assert_eq!(
+                get64(v, 32),
+                if even { 0xFFFF_FFFE_0000_0000 } else { u64::MAX },
+                "wave{lanes} lane {l} v_mad_u64_u32 wrap"
+            );
+            let (want_clamp, want_wrap) = match l % 8 {
+                0 => (i64::MAX as u64, i64::MIN as u64),
+                1 => (i64::MIN as u64, 0x4000_0000_8000_0000u64),
+                2 => (i64::MIN as u64, i64::MAX as u64),
+                3 => (i64::MIN as u64, i64::MIN as u64),
+                4 => (i64::MAX as u64, i64::MAX as u64),
+                5 => (i64::MAX as u64, i64::MIN as u64),
+                6 => (0x4000_0000_7FFF_FFFFu64, 0x4000_0000_7FFF_FFFFu64),
+                _ => (0xC000_0000_0000_0000u64, 0xC000_0000_0000_0000u64),
+            };
+            assert_eq!(get64(v, 34), want_clamp, "wave{lanes} lane {l} v_mad_i64_i32 clamp");
+            assert_eq!(get64(v, 36), want_wrap, "wave{lanes} lane {l} v_mad_i64_i32 wrap");
+        }
+    }
+}
+
+/// CPU-only codegen test so GPU-less CI exercises the integer CLAMP=1 HLSL emission paths
+/// and verifies V_CVT_PKRTZ_F16_F32 ignores VOP3 OMOD/CLAMP.
+#[test]
+fn int_clamp_hlsl_codegen() {
+    let v = |name: &'static str, f: &'static [(&'static str, u64)]| (name, "ENC_VOP3", f, None);
+    let vs = |name: &'static str, f: &'static [(&'static str, u64)]| (name, "VOP3_SDST_ENC", f, None);
+    let code = prog(&[
+        v("V_ADD_NC_U16", &[("VDST", 10), ("SRC0", V + 0), ("SRC1", V + 1), ("CLAMP", 1)]),
+        v("V_ADD_NC_I16", &[("VDST", 11), ("SRC0", V + 0), ("SRC1", V + 1), ("CLAMP", 1)]),
+        v("V_MUL_LO_U16", &[("VDST", 12), ("SRC0", V + 0), ("SRC1", V + 1), ("CLAMP", 1)]),
+        ("V_PK_MUL_LO_U16", "ENC_VOP3P", &[("VDST", 13), ("SRC0", V + 0), ("SRC1", V + 1), ("OP_SEL_HI", 3), ("CLAMP", 1)], None),
+        v("V_MAD_U32_U16", &[("VDST", 14), ("SRC0", V + 0), ("SRC1", V + 1), ("SRC2", V + 2), ("CLAMP", 1)]),
+        v("V_MAD_I32_I24", &[("VDST", 15), ("SRC0", V + 0), ("SRC1", V + 1), ("SRC2", V + 2), ("CLAMP", 1)]),
+        v("V_SAD_U32", &[("VDST", 16), ("SRC0", V + 0), ("SRC1", V + 1), ("SRC2", V + 2), ("CLAMP", 1)]),
+        vs("V_ADD_CO_U32", &[("VDST", 17), ("SDST", 0), ("SRC0", V + 0), ("SRC1", V + 1), ("CLAMP", 1)]),
+        vs("V_SUB_CO_CI_U32", &[("VDST", 18), ("SDST", 2), ("SRC0", V + 0), ("SRC1", V + 1), ("SRC2", 0), ("CLAMP", 1)]),
+        vs("V_MAD_U64_U32", &[("VDST", 20), ("SDST", 4), ("SRC0", V + 0), ("SRC1", V + 1), ("SRC2", V + 2), ("CLAMP", 1)]),
+        vs("V_MAD_I64_I32", &[("VDST", 22), ("SDST", 6), ("SRC0", V + 0), ("SRC1", V + 1), ("SRC2", V + 2), ("CLAMP", 1)]),
+        v("V_CVT_PKRTZ_F16_F32", &[("VDST", 24), ("SRC0", V + 0), ("SRC1", V + 1), ("OMOD", 1), ("CLAMP", 1)]),
+    ]);
+    let t = translate(&code, &Options::default()).unwrap();
+    assert!(t.complete(), "{:?}", t.unsupported_why);
+    assert!(t.hlsl.contains("0u - min((uint)(r >> 32), 1u)"), "expected branchless DXC-safe sat_u32");
+    assert!(t.hlsl.contains("sat_i16("), "expected sat_i16 helper call");
+    assert!(t.hlsl.contains("sat_u32("), "expected sat_u32 helper call");
+    assert!(t.hlsl.contains("sat_i32("), "expected sat_i32 helper call");
+    assert!(t.hlsl.contains("0xFFFFu)"), "expected 16-bit unsigned saturation");
+    assert!(t.hlsl.contains("_s64 ="), "expected 65-bit signed carry-out for v_mad_i64_i32");
+    assert!(t.hlsl.contains("f16_rtz(asfloat(v0)) | (f16_rtz(asfloat(v1)) << 16)"), "v_cvt_pkrtz_f16_f32 must ignore VOP3 omod/clamp");
+}
+
 #[test]
 fn gpu_bench_really_runs() {
     if !gpu_ready() {
@@ -1845,6 +2368,11 @@ fn draw_console(vs: Option<&[u8]>, ps: Option<&[u8]>, tris_px: &[[f32; 2]]) -> V
     draw_console_views(vs, ps, tris_px, &[], &[], &[])
 }
 
+/// `draw_console` with the programs translated as wave64 or wave32 programs.
+fn draw_console_as(vs: Option<&[u8]>, ps: Option<&[u8]>, tris_px: &[[f32; 2]], wave64: bool) -> Vec<[f32; 4]> {
+    draw_console_views_as(vs, ps, tris_px, &[], &[], &[], wave64)
+}
+
 /// `draw_console` with initial SGPRs and textures / samplers (see `runner::ViewTexture`).
 fn draw_console_views(
     vs: Option<&[u8]>,
@@ -1853,6 +2381,20 @@ fn draw_console_views(
     sgprs: &[u32],
     textures: &[runner::ViewTexture],
     samplers: &[windows::Win32::Graphics::Direct3D12::D3D12_SAMPLER_DESC],
+) -> Vec<[f32; 4]> {
+    draw_console_views_as(vs, ps, tris_px, sgprs, textures, samplers, true)
+}
+
+/// `draw_console_views` with the programs translated for a stated wave size.
+#[allow(clippy::too_many_arguments)]
+fn draw_console_views_as(
+    vs: Option<&[u8]>,
+    ps: Option<&[u8]>,
+    tris_px: &[[f32; 2]],
+    sgprs: &[u32],
+    textures: &[runner::ViewTexture],
+    samplers: &[windows::Win32::Graphics::Direct3D12::D3D12_SAMPLER_DESC],
+    wave64: bool,
 ) -> Vec<[f32; 4]> {
     use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R32G32B32A32_FLOAT, DXGI_FORMAT_R32G32_FLOAT};
     let pass_vs = prog(&[
@@ -1875,7 +2417,7 @@ fn draw_console_views(
         ("EXP", "ENC_EXP", &[("TGT", 0), ("EN", 0xF), ("VSRC0", 4), ("VSRC1", 5), ("VSRC2", 6), ("VSRC3", 7), ("DONE", 1), ("VM", 1)], None),
     ]);
     let compile = |code: &[u8], mode: Mode, profile: &str| {
-        let t = translate(code, &runner::options(mode)).unwrap();
+        let t = translate(code, &Options { wave64, ..runner::options(mode) }).unwrap();
         assert!(t.complete(), "{:?}", t.unsupported_why);
         super::dxc::compile(&t.hlsl, "main", profile, &[]).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl))
     };
@@ -1953,6 +2495,156 @@ fn gpu_ps_image_sample_offset_implicit_lod_between_mips() {
     }
 }
 
+/// A 2-level texture (8², 4²; level k texel x holds 100·k + x); `r32`: one channel, else four.
+fn two_mip_texture(r32: bool) -> runner::ViewTexture {
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R32G32B32A32_FLOAT, DXGI_FORMAT_R32_FLOAT, DXGI_SAMPLE_DESC};
+    let format = if r32 { DXGI_FORMAT_R32_FLOAT } else { DXGI_FORMAT_R32G32B32A32_FLOAT };
+    let mut data = Vec::new();
+    for k in 0..2u32 {
+        let n = 8 >> k;
+        for _y in 0..n {
+            for x in 0..n {
+                let v = (100 * k + x) as f32;
+                data.extend_from_slice(&if r32 { v.to_le_bytes().to_vec() } else { [v; 4].map(f32::to_le_bytes).concat() });
+            }
+        }
+    }
+    let res = D3D12_RESOURCE_DESC {
+        Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+        Width: 8,
+        Height: 8,
+        DepthOrArraySize: 1,
+        MipLevels: 2,
+        Format: format,
+        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        ..Default::default()
+    };
+    let mut srv = D3D12_SHADER_RESOURCE_VIEW_DESC {
+        Format: format,
+        ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+        Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+        ..Default::default()
+    };
+    srv.Anonymous.Texture2D = D3D12_TEX2D_SRV { MipLevels: 2, ..Default::default() };
+    runner::ViewTexture { res, srv, data, row_bytes: 8 * if r32 { 4 } else { 16 } }
+}
+
+/// Draws `ps` (its sample's VDATA in v20) with `two_mip_texture`, point min / mag / mip, clamp
+/// (`cmp`: one channel and a LESS_EQUAL comparison sampler); every pixel's red is `want(u)`,
+/// u = v = pixel centre · `scale`.
+fn assert_two_mip_sample(name: &str, ps: &[u8], cmp: bool, scale: f32, want: &dyn Fn(f32) -> f32) {
+    // S#: clamp u / v / w, point min / mag (0), MIP_FILTER point (1), DEPTH_COMPARE LESS_EQUAL (3 + 1)
+    let s_sharp = [2 | 2 << 3 | 2 << 6 | if cmp { 3 << 12 } else { 0 }, 0xFFF << 12, 1 << 26, 0];
+    let mut sgprs = vec![0u32; 32];
+    sgprs[16..24].copy_from_slice(&tsharp(0, 77, 9));
+    sgprs[24..28].copy_from_slice(&s_sharp);
+    let px = draw_console_views(None, Some(ps), &[[0.0, 0.0], [0.0, 32.0], [32.0, 0.0]], &sgprs, &[two_mip_texture(cmp)], &[crate::gpu::desc::sampler_d3d12(&s_sharp, cmp)]);
+    for y in 0..16 {
+        for x in 0..16 {
+            let u = (x as f32 + 0.5) * scale;
+            let (got, w) = (px[y * 16 + x][0], want(u));
+            assert!((got - w).abs() < 0.02, "{name}: pixel ({x},{y}) = {got}, expected {w}");
+        }
+    }
+}
+
+/// The texel of mip `k` (point filter) at u, moved by one of that mip's texels (offset +1, clamp).
+fn texel_moved(k: u32, u: f32) -> f32 {
+    let size = (8 >> k) as f32;
+    100.0 * k as f32 + ((u * size).floor() + 1.0).clamp(0.0, size - 1.0)
+}
+
+const EXP_V20: (&str, &str, &[(&str, u64)], Option<u32>) =
+    ("EXP", "ENC_EXP", &[("TGT", 0), ("EN", 0xF), ("VSRC0", 20), ("VSRC1", 20), ("VSRC2", 20), ("VSRC3", 20), ("DONE", 1), ("VM", 1)], None);
+
+/// Control for the tests below: `image_sample_o` at implicit LOD 0.75 with a point mip filter
+/// reads mip 1 alone, moved by one of its texels (right on main since #229).
+#[test]
+fn gpu_ps_image_sample_offset_point_mip() {
+    if !gpu_ready() {
+        return;
+    }
+    let s = 2f32.powf(0.75) / 8.0;
+    let ps = prog(&[
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 4), ("SRC0", 129)], None), // offset x +1, y 0
+        ("V_MUL_F32", "ENC_VOP2", &[("VDST", 5), ("SRC0", 255), ("VSRC1", 2)], Some(s.to_bits())),
+        ("V_MUL_F32", "ENC_VOP2", &[("VDST", 6), ("SRC0", 255), ("VSRC1", 3)], Some(s.to_bits())),
+        ("IMAGE_SAMPLE_O", "ENC_MIMG", &[("VDATA", 20), ("VADDR", 4), ("SRSRC", 4), ("SSAMP", 6), ("DMASK", 0x1), ("DIM", 1)], None),
+        EXP_V20,
+    ]);
+    assert_two_mip_sample("sample_o", &ps, false, s, &|u| texel_moved(1, u));
+}
+
+/// `image_sample_b_o`: implicit LOD 0 + bias 1 reads mip 1, so the offset is one of mip 1's texels.
+#[test]
+fn gpu_ps_image_sample_offset_bias_lod() {
+    if !gpu_ready() {
+        return;
+    }
+    let s = 1f32 / 8.0;
+    let ps = prog(&[
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 4), ("SRC0", 129)], None), // offset x +1, y 0
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 5), ("SRC0", 242)], None), // bias 1.0
+        ("V_MUL_F32", "ENC_VOP2", &[("VDST", 6), ("SRC0", 255), ("VSRC1", 2)], Some(s.to_bits())),
+        ("V_MUL_F32", "ENC_VOP2", &[("VDST", 7), ("SRC0", 255), ("VSRC1", 3)], Some(s.to_bits())),
+        ("IMAGE_SAMPLE_B_O", "ENC_MIMG", &[("VDATA", 20), ("VADDR", 4), ("SRSRC", 4), ("SSAMP", 6), ("DMASK", 0x1), ("DIM", 1)], None),
+        EXP_V20,
+    ]);
+    assert_two_mip_sample("sample_b_o", &ps, false, s, &|u| texel_moved(1, u));
+}
+
+/// `image_sample_d_o` / `image_sample_cd_o`: gradients of 2 mip-0 texels per pixel (LOD 1) read
+/// mip 1, so the offset is one of mip 1's texels.
+#[test]
+fn gpu_ps_image_sample_offset_gradient_lod() {
+    if !gpu_ready() {
+        return;
+    }
+    let (s, g) = (1f32 / 8.0, 2f32 / 8.0);
+    for op in ["IMAGE_SAMPLE_D_O", "IMAGE_SAMPLE_CD_O"] {
+        let ps = prog(&[
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 4), ("SRC0", 129)], None), // offset x +1, y 0
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 5), ("SRC0", 255)], Some(g.to_bits())), // du/dx
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 6), ("SRC0", 128)], None),
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 7), ("SRC0", 128)], None),
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 8), ("SRC0", 255)], Some(g.to_bits())), // dv/dy
+            ("V_MUL_F32", "ENC_VOP2", &[("VDST", 9), ("SRC0", 255), ("VSRC1", 2)], Some(s.to_bits())),
+            ("V_MUL_F32", "ENC_VOP2", &[("VDST", 10), ("SRC0", 255), ("VSRC1", 3)], Some(s.to_bits())),
+            (op, "ENC_MIMG", &[("VDATA", 20), ("VADDR", 4), ("SRSRC", 4), ("SSAMP", 6), ("DMASK", 0x1), ("DIM", 1)], None),
+            EXP_V20,
+        ]);
+        assert_two_mip_sample(op, &ps, false, s, &|u| texel_moved(1, u));
+    }
+}
+
+/// `image_sample_c_o` at implicit LOD 1, LESS_EQUAL: z is the moved mip-1 texel - 0.5, so each
+/// pixel passes (1) only if the offset was one of mip 1's texels; u = v = pixel centre / 4 - 1/16
+/// puts mip 0's single texel (half of mip 1's) short of the next mip-1 texel.
+#[test]
+fn gpu_ps_image_sample_offset_compare_lod() {
+    if !gpu_ready() {
+        return;
+    }
+    let s = 2f32 / 8.0;
+    let ps = prog(&[
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 4), ("SRC0", 129)], None), // offset x +1, y 0
+        ("V_MUL_F32", "ENC_VOP2", &[("VDST", 6), ("SRC0", 255), ("VSRC1", 2)], Some(s.to_bits())),
+        ("V_MUL_F32", "ENC_VOP2", &[("VDST", 7), ("SRC0", 255), ("VSRC1", 3)], Some(s.to_bits())),
+        ("V_ADD_F32", "ENC_VOP2", &[("VDST", 6), ("SRC0", 255), ("VSRC1", 6)], Some((-1f32 / 16.0).to_bits())),
+        ("V_ADD_F32", "ENC_VOP2", &[("VDST", 7), ("SRC0", 255), ("VSRC1", 7)], Some((-1f32 / 16.0).to_bits())),
+        // z = 100 + min(floor(4u) + 1, 3) - 0.5
+        ("V_MUL_F32", "ENC_VOP2", &[("VDST", 5), ("SRC0", 246), ("VSRC1", 6)], None),
+        ("V_FLOOR_F32", "ENC_VOP1", &[("VDST", 5), ("SRC0", V + 5)], None),
+        ("V_ADD_F32", "ENC_VOP2", &[("VDST", 5), ("SRC0", 242), ("VSRC1", 5)], None),
+        ("V_MIN_F32", "ENC_VOP2", &[("VDST", 5), ("SRC0", 255), ("VSRC1", 5)], Some(3f32.to_bits())),
+        ("V_ADD_F32", "ENC_VOP2", &[("VDST", 5), ("SRC0", 255), ("VSRC1", 5)], Some(99.5f32.to_bits())),
+        ("IMAGE_SAMPLE_C_O", "ENC_MIMG", &[("VDATA", 20), ("VADDR", 4), ("SRSRC", 4), ("SSAMP", 6), ("DMASK", 0x1), ("DIM", 1)], None),
+        EXP_V20,
+    ]);
+    assert_two_mip_sample("sample_c_o", &ps, true, s, &|_| 1.0);
+}
+
 /// 48 SGPR spill slots in lanes 0..47 of v30 (`v_writelane` / `v_readlane`, as 287 retail
 /// pixel shaders do – 11 up to lane 47): slot k = `slot(k)`, then s44 = the sum of slots
 /// 0..31, s45 = the sum of slots 32..47.
@@ -1972,44 +2664,62 @@ fn spill_slots(slot: fn(u32) -> u32) -> Vec<u8> {
     code
 }
 
-/// The whole-wave reduction of the retail pixel shaders (`upper_lanes`), run as a wave64 PS:
-/// identity into the lanes outside the mask, DPP8 xor 1 / 2 / 4, row_mirror, the other row
-/// through `v_permlanex16`, `v_readlane` 32 for the upper half's result, `v_readlane` 0 for
-/// the total – as min (identity -1, as in the pack) and as a sum (identity 0: wrong if lane
-/// 32 is read as anything but the identity, e.g. as lane 0, where a 32-lane GPU's wave read
-/// wraps). Over the odd pixels of each wave; also the waterfall read of the pack
-/// (`v_readlane` of the lane `s_ff1` picks from mask & EXEC). The waves are found from the
-/// pixels: each exports its wave's `v_readfirstlane` of the pixel number and its lane
-/// (`v_mbcnt`), and the CPU computes what a console wave of those lanes gives.
+/// The whole-wave reduction of the retail pixel shaders as the console's compiler emits it
+/// (`reductions`): EXEC saved in s[30:31]; `op` over vX in the lanes of the saved EXEC – and of
+/// s[and_with:+1], given – with `identity` elsewhere (v_cndmask), three DPP8 steps (the other
+/// lane of the pair, a lane of the other pair, of the other quad: the pack's selects),
+/// row_mirror, the other row through `v_permlanex16` (v7), `v_readlane` 32 for the upper
+/// half's (s[half]), `v_readlane` 0 for the wave's (s[total]); v6 the steps' register.
+fn whole_wave_reduction(op: &str, identity: u64, x: u64, and_with: Option<u64>, half: u64, total: u64) -> Vec<u8> {
+    whole_wave_reduction_as(true, op, identity, x, and_with, half, total)
+}
+
+/// `whole_wave_reduction` in a wave64 program, or in a wave32 one: the 32-bit forms, no
+/// upper half (s30 the saved EXEC, s[and_with] the mask, `half` unused).
+fn whole_wave_reduction_as(wave64: bool, op: &str, identity: u64, x: u64, and_with: Option<u64>, half: u64, total: u64) -> Vec<u8> {
+    let w = |b64: &'static str, b32: &'static str| if wave64 { b64 } else { b32 };
+    let mut c = vec![ins(w("S_OR_SAVEEXEC_B64", "S_OR_SAVEEXEC_B32"), "ENC_SOP1", &[("SDST", 30), ("SSRC0", 193)], None)];
+    if let Some(s) = and_with {
+        c.push(ins(w("S_AND_B64", "S_AND_B32"), "ENC_SOP2", &[("SDST", 10), ("SSRC0", s), ("SSRC1", 30)], None));
+    }
+    let mask = if and_with.is_some() { 10 } else { 30 };
+    c.push(ins("V_CNDMASK_B32", "ENC_VOP3", &[("VDST", 6), ("SRC0", identity), ("SRC1", V + x), ("SRC2", mask)], None));
+    let names = ["LANE_SEL_0", "LANE_SEL_1", "LANE_SEL_2", "LANE_SEL_3", "LANE_SEL_4", "LANE_SEL_5", "LANE_SEL_6", "LANE_SEL_7"];
+    for sel in [[1u64, 0, 3, 2, 5, 4, 7, 6], [2, 2, 0, 0, 6, 6, 4, 4], [4, 4, 4, 4, 0, 0, 0, 0]] {
+        let mut f = vec![("VDST", 6u64), ("SRC0", 0xE9), ("VSRC0", 6), ("VSRC1", 6)];
+        f.extend(names.iter().copied().zip(sel));
+        c.push(ins(op, "VOP2_VOP_DPP8", &f, None));
+    }
+    c.extend([
+        ins(op, "VOP2_VOP_DPP16", &[("VDST", 6), ("SRC0", 0xFA), ("VSRC0", 6), ("VSRC1", 6), ("DPP_CTRL", 0x140), ("ROW_MASK", 0xF), ("BANK_MASK", 0xF)], None),
+        ins("V_PERMLANEX16_B32", "ENC_VOP3", &[("VDST", 7), ("SRC0", V + 6), ("SRC1", 128), ("SRC2", 128)], None),
+        ins(op, "ENC_VOP2", &[("VDST", 6), ("SRC0", V + 7), ("VSRC1", 6)], None),
+    ]);
+    if wave64 {
+        c.push(ins("V_READLANE_B32", "ENC_VOP3", &[("VDST", half), ("SRC0", V + 6), ("SRC1", 128 + 32)], None));
+        c.push(ins(op, "ENC_VOP2", &[("VDST", 6), ("SRC0", half), ("VSRC1", 6)], None));
+    }
+    c.push(ins("V_READLANE_B32", "ENC_VOP3", &[("VDST", total), ("SRC0", V + 6), ("SRC1", 128)], None));
+    c.push(ins(w("S_MOV_B64", "S_MOV_B32"), "ENC_SOP1", &[("SDST", 126), ("SSRC0", 30)], None));
+    c.concat()
+}
+
+/// The whole-wave reduction of the retail pixel shaders (`whole_wave_reduction`), run as a
+/// wave64 PS in full waves – as min (identity -1, as in the pack: replaced with wave
+/// operations, `reductions`) and as a sum (identity 0: its steps stay, and lane 32 is read as
+/// the identity in a 32-lane wave, `upper_lanes`; wrong if it were read as anything else, e.g.
+/// as lane 0, where a 32-lane GPU's wave read wraps). Over the odd pixels of each wave; also
+/// the waterfall read of the pack (`v_readlane` of the lane `s_ff1` picks from mask & EXEC).
+/// The waves are found from the pixels: each exports its wave's `v_readfirstlane` of the pixel
+/// number and its lane (`v_mbcnt`), and the CPU computes what a console wave of those lanes
+/// gives.
 #[test]
 fn gpu_wave64_ps_whole_wave_reductions() {
     use std::collections::{BTreeMap, BTreeSet};
     if !gpu_ready() {
         return;
     }
-    let reduce = |op: &str, identity: u64, out: u64| -> Vec<u8> {
-        let mut c = vec![
-            ins("S_OR_SAVEEXEC_B64", "ENC_SOP1", &[("SDST", 30), ("SSRC0", 193)], None),
-            ins("S_AND_B64", "ENC_SOP2", &[("SDST", 10), ("SSRC0", 18), ("SSRC1", 30)], None),
-            ins("V_CNDMASK_B32", "ENC_VOP3", &[("VDST", 6), ("SRC0", identity), ("SRC1", V + 13), ("SRC2", 10)], None),
-        ];
-        let names = ["LANE_SEL_0", "LANE_SEL_1", "LANE_SEL_2", "LANE_SEL_3", "LANE_SEL_4", "LANE_SEL_5", "LANE_SEL_6", "LANE_SEL_7"];
-        for sel in [[1u64, 0, 3, 2, 5, 4, 7, 6], [2, 3, 0, 1, 6, 7, 4, 5], [4, 5, 6, 7, 0, 1, 2, 3]] {
-            let mut f = vec![("VDST", 6u64), ("SRC0", 0xE9), ("VSRC0", 6), ("VSRC1", 6)];
-            f.extend(names.iter().copied().zip(sel));
-            c.push(ins(op, "VOP2_VOP_DPP8", &f, None));
-        }
-        c.extend([
-            ins(op, "VOP2_VOP_DPP16", &[("VDST", 6), ("SRC0", 0xFA), ("VSRC0", 6), ("VSRC1", 6), ("DPP_CTRL", 0x140), ("ROW_MASK", 0xF), ("BANK_MASK", 0xF)], None),
-            ins("V_PERMLANEX16_B32", "ENC_VOP3", &[("VDST", 7), ("SRC0", V + 6), ("SRC1", 128), ("SRC2", 128)], None),
-            ins(op, "ENC_VOP2", &[("VDST", 6), ("SRC0", V + 7), ("VSRC1", 6)], None),
-            ins("V_READLANE_B32", "ENC_VOP3", &[("VDST", 10), ("SRC0", V + 6), ("SRC1", 128 + 32)], None),
-            ins(op, "ENC_VOP2", &[("VDST", 6), ("SRC0", 10), ("VSRC1", 6)], None),
-            ins("V_READLANE_B32", "ENC_VOP3", &[("VDST", out), ("SRC0", V + 6), ("SRC1", 128)], None),
-            ins("S_MOV_B64", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 30)], None),
-        ]);
-        c.concat()
-    };
+    let reduce = |op: &str, identity: u64, out: u64| whole_wave_reduction(op, identity, 13, Some(18), 10, out);
     let code = program_of(&[
         // v12 = pixel number y·16 + x, v13 = v12 + 1, s[18:19] = the odd pixels
         ins("V_CVT_U32_F32", "ENC_VOP1", &[("VDST", 10), ("SRC0", V + 2)], None),
@@ -2140,6 +2850,385 @@ fn gpu_wave64_vs_spill_slots_and_identity() {
         }
         if hi {
             assert_eq!(&p[1..], &want[1..], "pixel {i}: slots 32..47, lane 32");
+        }
+    }
+}
+
+/// Masks in whole-quad mode hold the helper lanes (#105): after `s_wqm` the helper pixels of a
+/// quad a primitive's edge splits are in EXEC, and the console's `v_cmp` sets their bits like
+/// any other lane's. Wave ops leave helper lanes out before SM 6.7, so a mask taken with
+/// `WaveActiveBallot` alone had them 0: `v_cndmask` gave them the false value, `s_and_saveexec`
+/// dropped them, and a derivative taken across the quad by hand (DPP) was wrong along the
+/// diagonal of two triangles. A waterfall loop over `v_readfirstlane` never removed a helper
+/// lane from EXEC and ran into the loop budget. The target is two triangles sharing the
+/// diagonal; per pixel: |ddx| of a value picked by `v_cndmask`, |ddy| of a value written
+/// under `s_and_saveexec` (both 1 everywhere), and the waterfall loop's iteration count.
+#[test]
+fn gpu_ps_masks_hold_helper_lanes_on_triangle_edges() {
+    if !gpu_ready() {
+        return;
+    }
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32G32_FLOAT;
+    let vs = super::dxc::compile("float4 main(float2 p : POSITION) : SV_Position { return float4(p, 0.5, 1.0); }\n", "main", "vs_6_6", &[]).unwrap();
+    for wave64 in [true, false] {
+        let pt = helper_lane_masks_ps(wave64);
+        assert!(pt.complete(), "{:?}\n{}", pt.unsupported_why, pt.hlsl);
+        let ps = super::dxc::compile(&pt.hlsl, "main", "ps_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", pt.hlsl));
+        // the whole target as two triangles sharing the diagonal x = y
+        let quad = [-1.0f32, -1.0, 1.0, -1.0, -1.0, 1.0, 1.0, -1.0, 1.0, 1.0, -1.0, 1.0];
+        let layout = [runner::VertexElement { semantic: "POSITION", index: 0, format: DXGI_FORMAT_R32G32_FLOAT, offset: 0 }];
+        let size = 32usize;
+        let px = runner::draw(&vs, &ps, &layout, &quad, 8, &[], &[], size as u32, [9.0; 4]).unwrap();
+        let lanes = if wave64 { 64.0 } else { 32.0 };
+        let bad: Vec<(usize, usize, [f32; 4])> = (0..size * size)
+            .filter(|&i| {
+                let p = px[i];
+                p[0].abs() != 1.0 || p[1].abs() != 1.0 || !(1.0..=lanes).contains(&p[2]) || p[3] != 1.0
+            })
+            .map(|i| (i % size, i / size, px[i]))
+            .collect();
+        let count = |k: usize, ok: &dyn Fn(f32) -> bool| px.iter().filter(|p| !ok(p[k])).count();
+        let (dx, dy, it) = (count(0, &|v| v.abs() == 1.0), count(1, &|v| v.abs() == 1.0), count(2, &|v| (1.0..=lanes).contains(&v)));
+        println!("wave64 {wave64}: {} of {} pixels wrong (ddx {dx}, ddy {dy}, loop {it}), first: {:?}", bad.len(), size * size, bad.iter().take(6).collect::<Vec<_>>());
+        assert!(bad.is_empty(), "wave64 {wave64}: {} pixels wrong (ddx {dx}, ddy {dy}, loop {it}; |ddx|, |ddy|, loop iterations, 1), first {:?}", bad.len(), &bad[..bad.len().min(6)]);
+    }
+}
+
+/// The masks of a waterfall loop in a pixel shader take the helper lanes' bits from quad reads
+/// of the compare's vector operand, not of the compare (#134): AMD's RDNA2 compiler crashed in
+/// `CreateGraphicsPipelineState` on quad reads of a value computed from a `WaveReadLaneAt` in a
+/// loop (WarmMilkCodes, RX 6600 XT), which `ballot_px` gave the loop's `v_cmp`. Outside loops the
+/// masks keep `ballot_px`. CPU only: what the GPU sees is `gpu_ps_masks_hold_helper_lanes_on_triangle_edges`.
+#[test]
+fn ps_masks_in_loops_quad_read_the_operands_not_the_compare() {
+    for wave64 in [true, false] {
+        let pt = helper_lane_masks_ps(wave64);
+        assert!(pt.complete(), "{:?}\n{}", pt.unsupported_why, pt.hlsl);
+        let (before, rest) = pt.hlsl.split_once("[loop] for (;;) {").unwrap_or_else(|| panic!("no loop\n{}", pt.hlsl));
+        let body = &rest[..rest.find("\n    }\n").unwrap_or_else(|| panic!("no loop end\n{}", pt.hlsl))];
+        assert!(!body.contains("ballot_px(") && !body.contains("QuadReadAcross"), "wave64 {wave64}: a quad read of a compare in the loop\n{body}");
+        assert!(body.contains("ballot_px_quad(") && body.contains("QuadReadLaneAt(v2, 3u)"), "wave64 {wave64}: the loop's v_cmp without its operand's quad reads\n{body}");
+        // one read per register and member, though the float compare names v2 twice (NaN test, ==)
+        assert_eq!(body.matches("QuadReadLaneAt(v2, ").count(), 4, "wave64 {wave64}\n{body}");
+        assert!(before.contains("= ballot_px(and("), "wave64 {wave64}: the masks before the loop lost ballot_px\n{before}");
+    }
+}
+
+/// The pixel shader of the two tests above, translated: after `s_wqm`, a mask read by
+/// `v_cndmask` (A), one for `s_and_saveexec` (B) and a waterfall loop over `v_readfirstlane` of
+/// pos.x (C); exports |ddx| of A, |ddy| of B, C's iteration count and 1.
+fn helper_lane_masks_ps(wave64: bool) -> super::Translation {
+    use super::PsInterface;
+    {
+        // the wave-size forms of the scalar mask instructions; EXEC / VCC = their low words in wave32
+        let (mov, wqm, and_save, xor) = if wave64 {
+            ("S_MOV_B64", "S_WQM_B64", "S_AND_SAVEEXEC_B64", "S_XOR_B64")
+        } else {
+            ("S_MOV_B32", "S_WQM_B32", "S_AND_SAVEEXEC_B32", "S_XOR_B32")
+        };
+        let sop1 = |n: &'static str, d: u64, s: u64| (n, "ENC_SOP1", vec![("SDST", d), ("SSRC0", s)], None);
+        type I = (&'static str, &'static str, Vec<(&'static str, u64)>, Option<u32>);
+        let head: Vec<I> = vec![
+            sop1(mov, 20, 126), // s[20:21] = the live lanes
+            sop1(wqm, 126, 126),
+            // A: v4 = v_cndmask(0, pos.x, 0 < pos.x) – pos.x in every lane; v6 = v4 of the quad's
+            // other column (quad_perm [1,0,3,2]) - v4
+            ("V_CMP_LT_F32", "ENC_VOPC", vec![("SRC0", 128), ("VSRC1", 2)], None),
+            ("V_CNDMASK_B32", "ENC_VOP2", vec![("VDST", 4), ("SRC0", 128), ("VSRC1", 2)], None),
+            ("V_MOV_B32", "VOP1_VOP_DPP16", vec![("VDST", 5), ("SRC0", 0xFA), ("VSRC0", 4), ("DPP_CTRL", 0xB1), ("ROW_MASK", 0xF), ("BANK_MASK", 0xF)], None),
+            ("V_SUB_F32", "ENC_VOP2", vec![("VDST", 6), ("SRC0", V + 5), ("VSRC1", 4)], None),
+            // B: v7 = pos.y under s_and_saveexec(0 < pos.y); v9 = v7 of the quad's other row
+            // (quad_perm [2,3,0,1]) - v7
+            ("V_CMP_LT_F32", "ENC_VOPC", vec![("SRC0", 128), ("VSRC1", 3)], None),
+            sop1(and_save, 22, 106),
+            ("V_MOV_B32", "ENC_VOP1", vec![("VDST", 7), ("SRC0", V + 3)], None),
+            sop1(mov, 126, 22),
+            ("V_MOV_B32", "VOP1_VOP_DPP16", vec![("VDST", 8), ("SRC0", 0xFA), ("VSRC0", 7), ("DPP_CTRL", 0x4E), ("ROW_MASK", 0xF), ("BANK_MASK", 0xF)], None),
+            ("V_SUB_F32", "ENC_VOP2", vec![("VDST", 9), ("SRC0", V + 8), ("VSRC1", 7)], None),
+            // C: a waterfall loop over pos.x, s8 = its iterations
+            ("S_MOV_B32", "ENC_SOP1", vec![("SDST", 8), ("SSRC0", 128)], None),
+            sop1(mov, 24, 126),
+        ];
+        let body: Vec<I> = vec![
+            ("V_READFIRSTLANE_B32", "ENC_VOP1", vec![("VDST", 4), ("SRC0", V + 2)], None),
+            ("V_CMP_EQ_F32", "ENC_VOPC", vec![("SRC0", 4), ("VSRC1", 2)], None),
+            sop1(and_save, 26, 106),
+            ("S_ADD_U32", "ENC_SOP2", vec![("SDST", 8), ("SSRC0", 8), ("SSRC1", 129)], None),
+            (xor, "ENC_SOP2", vec![("SDST", 126), ("SSRC0", 26), ("SSRC1", 126)], None),
+        ];
+        let tail: Vec<I> = vec![
+            sop1(mov, 126, 24),
+            ("V_CVT_F32_U32", "ENC_VOP1", vec![("VDST", 10), ("SRC0", 8)], None),
+            ("V_MOV_B32", "ENC_VOP1", vec![("VDST", 11), ("SRC0", 242)], None),
+            sop1(mov, 126, 20), // back to the live lanes for the export
+            ("EXP", "ENC_EXP", vec![("TGT", 0), ("EN", 0xF), ("VSRC0", 6), ("VSRC1", 9), ("VSRC2", 10), ("VSRC3", 11), ("DONE", 1), ("VM", 1)], None),
+        ];
+        let enc = |l: &[I]| -> Vec<u8> { l.iter().flat_map(|(n, e, f, x)| encode(n, e, f, *x).unwrap_or_else(|err| panic!("{n}: {err}"))).collect() };
+        let body_code = enc(&body);
+        let back = (-((body_code.len() as i64 + 4) / 4)) as u16 as u64;
+        let mut ps_code = enc(&head);
+        ps_code.extend(&body_code);
+        ps_code.extend(encode("S_CBRANCH_EXECNZ", "ENC_SOPP", &[("SIMM16", back)], None).unwrap());
+        ps_code.extend(enc(&tail));
+        ps_code.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+        let psi = PsInterface { inputs: vec![el("SV_Position", 0, 1, 3, 0, 0xF)], outputs: vec![el("SV_Target", 0, 64, 3, 0, 0xF)], input_ena: 0x302, attrs: None };
+        translate(&ps_code, &Options { mode: Mode::Pixel(psi), wave64, ..Default::default() }).unwrap()
+    }
+}
+
+/// What the pixel shaders' masks (`ballot_px`) and lane reads (`rla`) rely on, checked on the
+/// adapter with native HLSL on the same two triangles: a quad is hardware lanes 4k..4k+3 (X = ^1,
+/// Y = ^2, diagonal = ^3), and a helper lane gets the wave's result of a `WaveActiveBallot` –
+/// each lane holds its own copy of EXEC, a helper lane's included. Not every wave op does that:
+/// `WaveActiveBitOr` gave helper lanes another value on an RTX 5070 Ti (printed, not checked).
+#[test]
+fn gpu_ps_helper_lanes_see_ballots_and_quads_are_lanes_4k() {
+    if !gpu_ready() {
+        return;
+    }
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32G32_FLOAT;
+    let vs = super::dxc::compile("float4 main(float2 p : POSITION) : SV_Position { return float4(p, 0.5, 1.0); }\n", "main", "vs_6_6", &[]).unwrap();
+    // per pixel: is the quad's other column a helper lane; does it see this lane's ballot and
+    // bit-or; are this lane and that one at lanes 4k..4k+3
+    let src = "float4 main(float4 p : SV_Position) : SV_Target {\n\
+        uint l = WaveGetLaneIndex();\n\
+        uint hl = IsHelperLane() ? 1u : 0u;\n\
+        uint b = WaveActiveBallot(((uint)p.x & 3u) == 1u).x;\n\
+        uint o = WaveActiveBitOr(1u << (l & 31u));\n\
+        bool lay = QuadReadAcrossX(l) == (l ^ 1u) && QuadReadAcrossY(l) == (l ^ 2u) && QuadReadAcrossDiagonal(l) == (l ^ 3u) && QuadReadLaneAt(l, 0u) == (l & ~3u);\n\
+        bool both = lay && QuadReadAcrossX((uint)lay) != 0u;\n\
+        return float4(QuadReadAcrossX(hl), QuadReadAcrossX(b) == b ? 1.0 : 0.0, QuadReadAcrossX(o) == o ? 1.0 : 0.0, both ? 1.0 : 0.0);\n}\n";
+    let ps = super::dxc::compile(src, "main", "ps_6_6", &[]).unwrap_or_else(|e| panic!("{e}"));
+    let quad = [-1.0f32, -1.0, 1.0, -1.0, -1.0, 1.0, 1.0, -1.0, 1.0, 1.0, -1.0, 1.0];
+    let layout = [runner::VertexElement { semantic: "POSITION", index: 0, format: DXGI_FORMAT_R32G32_FLOAT, offset: 0 }];
+    let px = runner::draw(&vs, &ps, &layout, &quad, 8, &[], &[], 32, [9.0; 4]).unwrap();
+    let helpers: Vec<[f32; 4]> = px.iter().copied().filter(|p| p[0] == 1.0).collect();
+    let ballot = helpers.iter().filter(|p| p[1] == 1.0).count();
+    let bit_or = helpers.iter().filter(|p| p[2] == 1.0).count();
+    let quads = px.iter().filter(|p| p[3] == 1.0).count();
+    println!("{:?}: {} pixels next to a helper lane; its ballot right in {ballot}, its bit-or in {bit_or}; quads at lanes 4k in {quads} of {}", runner::adapter(), helpers.len(), px.len());
+    assert!(!helpers.is_empty(), "no helper lanes along the diagonal");
+    assert_eq!(ballot, helpers.len(), "helper lanes without the wave's ballot");
+    assert_eq!(quads, px.len(), "quads not at hardware lanes 4k..4k+3");
+}
+
+/// The three reductions of the pack (`reductions`): instruction, identity operand code, op.
+const WAVE_REDUCTIONS: [(&str, u64, super::reductions::Op); 3] = [
+    ("V_MIN_U32", 193, super::reductions::Op::MinU32),
+    ("V_MAX_U32", 128, super::reductions::Op::MaxU32),
+    ("V_OR_B32", 128, super::reductions::Op::OrB32),
+];
+
+/// The translation of recognised reductions (`reductions`, `Em::reduction`) in every VS / PS
+/// form: wave operations instead of the steps (no lane read left), quad reads in a pixel
+/// shader only, the halves of a 64-lane wave for wave32 programs, the same HLSL whether or not
+/// the GPU has 64-lane waves (`split_wave64`); it compiles (DXC, where there is one).
+#[test]
+fn whole_wave_reductions_translate_to_wave_operations() {
+    for wave64 in [true, false] {
+        for pixel in [true, false] {
+            let mut parts: Vec<Vec<u8>> = WAVE_REDUCTIONS.iter().map(|(op, id, _)| whole_wave_reduction_as(wave64, op, *id, 13, Some(18), 40, 41)).collect();
+            let (mode, profile) = if pixel {
+                parts.push(ins("EXP", "ENC_EXP", &[("TGT", 0), ("EN", 0xF), ("VSRC0", 6), ("VSRC1", 7), ("VSRC2", 6), ("VSRC3", 7), ("DONE", 1), ("VM", 1)], None));
+                (Mode::Pixel(draw_psi()), "ps_6_6")
+            } else {
+                parts.push(ins("EXP", "ENC_EXP", &[("TGT", 12), ("EN", 0xF), ("VSRC0", 6), ("VSRC1", 7), ("VSRC2", 6), ("VSRC3", 7), ("DONE", 1)], None));
+                parts.push(ins("EXP", "ENC_EXP", &[("TGT", 32), ("EN", 0xF), ("VSRC0", 6), ("VSRC1", 7), ("VSRC2", 6), ("VSRC3", 7)], None));
+                (Mode::Vertex(draw_vsi()), "vs_6_6")
+            };
+            let code = program_of(&parts);
+            let what = format!("wave64 {wave64}, {profile}");
+            let native = translate(&code, &Options { mode: mode.clone(), wave64, ..Default::default() }).unwrap();
+            let split = translate(&code, &Options { mode, wave64, split_wave64: true, ..Default::default() }).unwrap();
+            assert!(native.complete(), "{what}: {:?}", native.unsupported_why);
+            let h = &native.hlsl;
+            assert_eq!(h, &split.hlsl, "{what}: one form at every wave size");
+            for op in ["min_u32", "max_u32", "or_b32"] {
+                assert_eq!(h.matches(&format!("xcl_wave_{op}(")).count(), 2, "{what}: the function and its call\n{h}");
+            }
+            assert!(!h.contains(" = rla("), "{what}: a lane read left\n{h}");
+            assert_eq!(h.contains("QuadReadLaneAt(x, 3u)"), pixel, "{what}: quad reads\n{h}");
+            assert_eq!(h.contains("select(xcl_half != 0u, "), !wave64, "{what}: the halves\n{h}");
+            if super::dxc::location().is_ok() {
+                super::dxc::compile(h, "main", profile, &[]).unwrap_or_else(|e| panic!("{what}: {e}\n{h}"));
+            }
+        }
+    }
+}
+
+/// Whole-wave reductions (`reductions`) in full and partial pixel waves, of wave64 and of wave32
+/// programs: the pack's min, max and or of pixel number + 1, over the odd pixels (`s_and` of
+/// the saved EXEC with the live pixels' mask, as in the pack) and over every lane of the wave's
+/// quads (the saved EXEC after `s_wqm`, helper lanes included), drawn as the whole target, a
+/// 3-quad triangle and a 55-pixel one. A pixel exports its console wave and lane and one of the
+/// results for each op – the wave's (sT), the upper half's (sH, wave64), what the steps leave in
+/// its lane (vA, vB) – which the CPU computes from the console wave's lanes, as on a console
+/// wave whose other lanes are not populated. Each step translated on its own (before,
+/// `XCL_NO_WAVE_REDUCTIONS=1`) reads the lanes the PC did not launch: 0 on NVIDIA, so the min
+/// of a partial wave was 0 – and the or over the quads' lanes of 3 quads missed helper pixels.
+#[test]
+fn gpu_ps_partial_wave_reductions() {
+    use std::collections::BTreeMap;
+    if !gpu_ready() {
+        return;
+    }
+    const RESULTS: [&str; 4] = ["sT", "sH", "vA", "vB"];
+    // `view`: which result a pixel exports (RESULTS)
+    let program = |wave64: bool, wqm: bool, view: usize| -> Vec<u8> {
+        let w = |b64: &'static str, b32: &'static str| if wave64 { b64 } else { b32 };
+        let pixel = [
+            ins("V_CVT_U32_F32", "ENC_VOP1", &[("VDST", 10), ("SRC0", V + 2)], None),
+            ins("V_CVT_U32_F32", "ENC_VOP1", &[("VDST", 11), ("SRC0", V + 3)], None),
+            ins("V_LSHL_ADD_U32", "ENC_VOP3", &[("VDST", 12), ("SRC0", V + 11), ("SRC1", 128 + 4), ("SRC2", V + 10)], None),
+        ];
+        // v12 = pixel number y·16 + x; the console wave: its first lane's pixel number (s62),
+        // the lane (v15)
+        let mut c = pixel.to_vec();
+        c.extend([
+            ins("V_READFIRSTLANE_B32", "ENC_VOP1", &[("VDST", 62), ("SRC0", V + 12)], None),
+            ins("V_MBCNT_LO_U32_B32", "ENC_VOP3", &[("VDST", 15), ("SRC0", 193), ("SRC1", 128)], None),
+            ins("V_MBCNT_HI_U32_B32", "ENC_VOP3", &[("VDST", 15), ("SRC0", 193), ("SRC1", V + 15)], None),
+        ]);
+        if wqm {
+            // live pixels in s[16:17], then the whole quads: the helper lanes' pixel numbers too
+            c.push(ins(w("S_MOV_B64", "S_MOV_B32"), "ENC_SOP1", &[("SDST", 16), ("SSRC0", 126)], None));
+            c.push(ins(w("S_WQM_B64", "S_WQM_B32"), "ENC_SOP1", &[("SDST", 126), ("SSRC0", 126)], None));
+            c.extend(pixel.iter().cloned());
+        }
+        // v13 = pixel number + 1, s[18:19] = the odd pixels
+        c.extend([
+            ins("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 13), ("SRC0", 129), ("VSRC1", 12)], None),
+            ins("V_AND_B32", "ENC_VOP2", &[("VDST", 14), ("SRC0", 129), ("VSRC1", 12)], None),
+            ins("V_CMP_NE_U32", "ENC_VOPC", &[("SRC0", 128), ("VSRC1", 14)], None),
+            ins(w("S_MOV_B64", "S_MOV_B32"), "ENC_SOP1", &[("SDST", 18), ("SSRC0", 106)], None),
+        ]);
+        // op k: sH in s[40 + 2k], sT in s[41 + 2k], vA / vB copied to v[20 + 2k] / v[21 + 2k]
+        for (k, (op, id, _)) in WAVE_REDUCTIONS.iter().enumerate() {
+            let k = k as u64;
+            c.push(whole_wave_reduction_as(wave64, op, *id, 13, (!wqm).then_some(18), 40 + 2 * k, 41 + 2 * k));
+            c.push(ins("V_MOV_B32", "ENC_VOP1", &[("VDST", 20 + 2 * k), ("SRC0", V + 6)], None));
+            c.push(ins("V_MOV_B32", "ENC_VOP1", &[("VDST", 21 + 2 * k), ("SRC0", V + 7)], None));
+        }
+        if wqm {
+            c.push(ins(w("S_MOV_B64", "S_MOV_B32"), "ENC_SOP1", &[("SDST", 126), ("SSRC0", 16)], None));
+        }
+        for k in 0..3u64 {
+            let src = [41 + 2 * k, 40 + 2 * k, V + 20 + 2 * k, V + 21 + 2 * k][view];
+            c.push(ins("V_CVT_F32_U32", "ENC_VOP1", &[("VDST", 30 + k), ("SRC0", src)], None));
+        }
+        c.extend([
+            ins("V_LSHL_ADD_U32", "ENC_VOP3", &[("VDST", 33), ("SRC0", 62), ("SRC1", 128 + 6), ("SRC2", V + 15)], None),
+            ins("V_CVT_F32_U32", "ENC_VOP1", &[("VDST", 33), ("SRC0", V + 33)], None),
+            ins("EXP", "ENC_EXP", &[("TGT", 0), ("EN", 0xF), ("VSRC0", 30), ("VSRC1", 31), ("VSRC2", 32), ("VSRC3", 33), ("DONE", 1), ("VM", 1)], None),
+        ]);
+        program_of(&c)
+    };
+    let shapes: [(&str, [[f32; 2]; 3]); 3] = [
+        ("whole target", [[0.0, 0.0], [0.0, 32.0], [32.0, 0.0]]),
+        ("3 quads", [[0.0, 0.0], [3.2, 0.0], [0.0, 3.2]]),
+        ("55 pixels", [[0.0, 0.0], [11.0, 0.0], [0.0, 11.0]]),
+    ];
+    let mut wave_sizes = BTreeMap::new();
+    // wave size, shape, mask, op, result → (pixels wrong, the first: pixel, lane, got, want)
+    let mut wrong: BTreeMap<String, (usize, (u32, u32, u32, u32))> = BTreeMap::new();
+    for wave64 in [true, false] {
+        let size = if wave64 { "wave64" } else { "wave32" };
+        for (shape, tri) in &shapes {
+            for wqm in [false, true] {
+                let mask = if wqm { "the quads' lanes" } else { "the odd pixels" };
+                for (view, what) in RESULTS.iter().enumerate() {
+                    if view == 1 && !wave64 {
+                        continue;
+                    }
+                    let px = draw_console_as(None, Some(&program(wave64, wqm, view)), tri, wave64);
+                    // by console wave (its first lane's pixel number): (pixel number, lane, results)
+                    let mut waves: BTreeMap<u32, Vec<(u32, u32, [f32; 4])>> = BTreeMap::new();
+                    for (id, p) in px.iter().enumerate().filter(|(_, p)| p[3] >= 0.0) {
+                        let kl = p[3] as u32;
+                        waves.entry(kl >> 6).or_default().push((id as u32, kl & 63, *p));
+                    }
+                    assert!(!waves.is_empty(), "{size}, {shape}: nothing drawn");
+                    if view == 0 {
+                        wave_sizes.insert((size, *shape, wqm), waves.values().map(|w| w.len()).collect::<Vec<_>>());
+                    }
+                    for (first, w) in &waves {
+                        // the lanes in the mask: (row = lane / 16, value)
+                        let lanes: Vec<(u32, u32)> = if wqm {
+                            // every lane of a quad with a live pixel; a quad keeps to one row
+                            let quads: BTreeMap<(u32, u32), u32> = w.iter().map(|(id, lane, _)| ((id % 16 / 2, id / 16 / 2), lane >> 4)).collect();
+                            quads.iter().flat_map(|(&(qx, qy), &row)| [(0, 0), (1, 0), (0, 1), (1, 1)].map(|(dx, dy)| (row, (2 * qy + dy) * 16 + 2 * qx + dx + 1))).collect()
+                        } else {
+                            w.iter().filter(|x| x.0 % 2 == 1).map(|(id, lane, _)| (lane >> 4, id + 1)).collect()
+                        };
+                        for (o, (_, _, op)) in WAVE_REDUCTIONS.iter().enumerate() {
+                            let rows: [u32; 4] = std::array::from_fn(|k| lanes.iter().filter(|l| l.0 == k as u32).fold(op.identity(), |a, l| op.apply(a, l.1)));
+                            let half = op.apply(rows[2], rows[3]);
+                            let wave = op.apply(op.apply(rows[0], rows[1]), half);
+                            for (id, lane, p) in w {
+                                let want = match view {
+                                    0 => wave,
+                                    1 => half,
+                                    2 if *lane < 32 => wave,
+                                    2 => half,
+                                    _ => rows[((lane >> 4) ^ 1) as usize],
+                                };
+                                // u32 → f32 → u32: exact below 2^24; the identity -1 saturates back
+                                let got = p[o] as u32;
+                                if got != want {
+                                    let k = format!("{size}, {shape}, over {mask}: {} {what} (wave of pixel {first})", op.name());
+                                    wrong.entry(k).or_insert((0, (*id, *lane, got, want))).0 += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    println!("pixels per console wave: {wave_sizes:?}");
+    for (k, (n, (id, lane, got, want))) in &wrong {
+        println!("{k}: {n} pixels wrong, e.g. pixel {id} (lane {lane}): {got:#x}, want {want:#x}");
+    }
+    assert!(wrong.is_empty(), "{} results wrong", wrong.len());
+}
+
+/// Whole-wave reductions (`reductions`) in a vertex wave of three lanes, of a wave64 and of a
+/// wave32 program: min, max and or of vertex id + 1 over the saved EXEC, exported as param0 with
+/// what v_permlanex16 leaves for the min (vB: the other row's – no lane there, so the
+/// identity). The same at every vertex, so the interpolated value is exact. Before
+/// (`XCL_NO_WAVE_REDUCTIONS=1`) the min and vB read lanes the PC did not launch: 0 on NVIDIA.
+#[test]
+fn gpu_vs_partial_wave_reductions() {
+    if !gpu_ready() {
+        return;
+    }
+    for wave64 in [true, false] {
+        // v13 = vertex id + 1 (the id is in v0), then the position and the reductions
+        let mut c = vec![
+            ins("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 13), ("SRC0", 129), ("VSRC1", 0)], None),
+            ins("V_MOV_B32", "ENC_VOP1", &[("VDST", 0), ("SRC0", V + 4)], None),
+            ins("V_MOV_B32", "ENC_VOP1", &[("VDST", 1), ("SRC0", V + 5)], None),
+            ins("V_MOV_B32", "ENC_VOP1", &[("VDST", 2), ("SRC0", 128)], None),
+            ins("V_MOV_B32", "ENC_VOP1", &[("VDST", 3), ("SRC0", 242)], None),
+        ];
+        for (k, (op, id, _)) in WAVE_REDUCTIONS.iter().enumerate() {
+            c.push(whole_wave_reduction_as(wave64, op, *id, 13, None, 40 + 2 * k as u64, 41 + 2 * k as u64));
+            if k == 0 {
+                c.push(ins("V_MOV_B32", "ENC_VOP1", &[("VDST", 21), ("SRC0", V + 7)], None));
+            }
+        }
+        c.extend([
+            ins("V_CVT_F32_U32", "ENC_VOP1", &[("VDST", 8), ("SRC0", 41)], None),
+            ins("V_CVT_F32_U32", "ENC_VOP1", &[("VDST", 9), ("SRC0", 43)], None),
+            ins("V_CVT_F32_U32", "ENC_VOP1", &[("VDST", 10), ("SRC0", 45)], None),
+            ins("V_CVT_F32_U32", "ENC_VOP1", &[("VDST", 11), ("SRC0", V + 21)], None),
+            ins("EXP", "ENC_EXP", &[("TGT", 12), ("EN", 0xF), ("VSRC0", 0), ("VSRC1", 1), ("VSRC2", 2), ("VSRC3", 3), ("DONE", 1)], None),
+            ins("EXP", "ENC_EXP", &[("TGT", 32), ("EN", 0xF), ("VSRC0", 8), ("VSRC1", 9), ("VSRC2", 10), ("VSRC3", 11)], None),
+        ]);
+        let px = draw_console_as(Some(&program_of(&c)), None, &[[0.0, 0.0], [0.0, 32.0], [32.0, 0.0]], wave64);
+        println!("wave64 {wave64}: {:?}", px[0]);
+        for (i, p) in px.iter().enumerate() {
+            assert_eq!(p.map(|x| x as u32), [1, 3, 3, u32::MAX], "wave64 {wave64}, pixel {i}: min, max, or of vertex id + 1, vB of the min");
         }
     }
 }
@@ -3074,6 +4163,17 @@ fn gpu_mesh_mode_reads_memory_windows() {
 /// accesses in window 0.
 #[test]
 fn gpu_memory_windows_above_4_gib() {
+    memory_windows_above_4_gib(false);
+}
+
+/// The same program with the windows taken from the descriptor heap (`Options::heap_windows`):
+/// same results, and no `switch` over windows in the HLSL.
+#[test]
+fn gpu_memory_windows_from_the_heap() {
+    memory_windows_above_4_gib(true);
+}
+
+fn memory_windows_above_4_gib(heap: bool) {
     if !gpu_ready() {
         return;
     }
@@ -3104,8 +4204,10 @@ fn gpu_memory_windows_above_4_gib() {
     let p = prog(&refs);
     let one = translate(&p, &Options::default()).unwrap();
     assert!(!one.hlsl.contains("mem1") && !one.hlsl.contains("xcl_w =") && !one.hlsl.contains("xcl_m"), "one window: the single-window HLSL");
-    let t = translate(&p, &on_gpu(Options { mem_windows: 2, ..Default::default() })).unwrap();
+    let t = translate(&p, &on_gpu(Options { mem_windows: 2, heap_windows: heap, ..Default::default() })).unwrap();
     assert!(t.hlsl.contains("RWByteAddressBuffer mem1 : register(u3)"));
+    assert_eq!(t.hlsl.contains("switch (xcl_w)"), !heap, "heap windows: no switch over windows");
+    assert_eq!(t.hlsl.contains("ResourceDescriptorHeap[NonUniformResourceIndex(0u + (xcl_w"), heap);
     let dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).map_err(|e| format!("{e}\n{}", t.hlsl)).unwrap();
     let hi = |a: u64| (a >> 32) as u32;
     let mut st = KernelState::default();
@@ -3148,6 +4250,64 @@ fn gpu_uma_import_check_at_init() {
     crate::hle::d3d12x::real::init().expect("real D3D12.X backend");
     let s = crate::hle::d3d12x::real::stats().uma_import_check;
     assert!(s.starts_with("ok") || s.starts_with("off"), "{s}");
+}
+
+/// An address whose offset carries out of the low dword is in the next window: the base sits
+/// at 0xFFFF_F000 of window 0, base + offset in window 1 (s_load, s_buffer_load, buffer load /
+/// store, global with SADDR, global atomic).
+#[test]
+fn gpu_memory_window_carry() {
+    if !gpu_ready() {
+        return;
+    }
+    let arena = crate::gpu::uma::Uma::with_windows(2, 1 << 20).unwrap();
+    let (w0, w1) = (arena.window(0).0 as u64, arena.window(1).0 as u64);
+    assert_eq!((w1 - w0, w0 as u32), (1 << 32, 0));
+    let word = |a: u64| unsafe { &mut *(a as *mut u32) };
+    *word(w1 + 0x1000) = 0xC0FFEE;
+    *word(w1 + 0x1004) = 0x1234;
+    for l in 0..64u64 {
+        *word(w1 + 0x2000 + 4 * l) = 1000 + l as u32;
+        *word(w1 + 0x4000 + 4 * l) = 5000 + l as u32;
+    }
+    let list: Vec<(&str, &str, &[(&str, u64)], Option<u32>)> = vec![
+        ("S_LOAD_DWORDX2", "ENC_SMEM", &[("SDATA", 20), ("SBASE", 1), ("OFFSET", 0x2000)], None),
+        ("S_BUFFER_LOAD_DWORD", "ENC_SMEM", &[("SDATA", 22), ("SBASE", 4), ("OFFSET", 0x3000)], None),
+        ("BUFFER_LOAD_DWORD", "ENC_MUBUF", &[("VDATA", 10), ("VADDR", 0), ("SRSRC", 2), ("SOFFSET", 128), ("OFFEN", 1)], None),
+        ("BUFFER_STORE_DWORD", "ENC_MUBUF", &[("VDATA", 2), ("VADDR", 6), ("SRSRC", 3), ("SOFFSET", 128), ("OFFEN", 1)], None),
+        ("GLOBAL_LOAD_DWORD", "ENC_FLAT_GLBL", &[("VDST", 11), ("ADDR", 1), ("SADDR", 16), ("OFFSET", 0)], None),
+        ("GLOBAL_ATOMIC_ADD", "ENC_FLAT_GLBL", &[("VDST", 12), ("ADDR", 3), ("DATA", 13), ("SADDR", 16), ("OFFSET", 0), ("GLC", 1)], None),
+    ];
+    let p = prog(&list);
+    let t = translate(&p, &on_gpu(Options { mem_windows: 2, ..Default::default() })).unwrap();
+    // 32-bit adds and compares only: 64-bit integers here crashed the AMD shader compiler (#123)
+    let carries: Vec<&str> = t.hlsl.lines().filter(|l| l.contains("xcl_w =")).collect();
+    assert!(carries.len() >= 6 && carries.iter().all(|l| !l.contains("64")), "{carries:#?}");
+    let dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).map_err(|e| format!("{e}\n{}", t.hlsl)).unwrap();
+    let hi0 = (w0 >> 32) as u32;
+    let mut st = KernelState::default();
+    st.sgpr[2..4].copy_from_slice(&[0xFFFF_F000, hi0]);
+    st.sgpr[8..12].copy_from_slice(&[0xFFFF_F000, hi0 & 0xFFFF, 0x10000, 0]);
+    st.sgpr[12..16].copy_from_slice(&[0xFFFF_F000, hi0 & 0xFFFF, 0x10000, 0]);
+    st.sgpr[16..18].copy_from_slice(&[0xFFFF_F000, hi0]);
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        let l = l as u32;
+        r[0] = 0x3000 + 4 * l; // → w1 + 0x2000
+        r[1] = 0x5000 + 4 * l; // → w1 + 0x4000
+        r[2] = 7 * l;
+        r[3] = 0x7000; // → w1 + 0x6000, one counter
+        r[6] = 0x9000 + 4 * l; // → w1 + 0x8000
+        r[13] = 1;
+    }
+    let r = runner::run_in_arena(&dxil, &st, &arena).unwrap();
+    assert_eq!((r.sgpr[20], r.sgpr[21]), (0xC0FFEE, 0x1234), "s_load carried into window 1");
+    assert_eq!(r.sgpr[22], 1000, "s_buffer_load carried into window 1");
+    for l in 0..64u64 {
+        assert_eq!(r.vgpr[l as usize][10], 1000 + l as u32, "lane {l}: buffer_load carried into window 1");
+        assert_eq!(r.vgpr[l as usize][11], 5000 + l as u32, "lane {l}: global_load (SADDR) carried into window 1");
+        assert_eq!(*word(w1 + 0x8000 + 4 * l), 7 * l as u32, "lane {l}: buffer_store carried into window 1");
+    }
+    assert_eq!(*word(w1 + 0x6000), 64, "global_atomic_add carried into window 1");
 }
 
 /// End-to-end GPU test of the sparse-window VRAM runtime layout:
@@ -5241,10 +6401,12 @@ fn retail_wave64_graphics_lane_census() {
 }
 
 /// The 32-lane form of the pack's wave64 VS / PS (`upper_lanes`): every program whose
-/// translation it changes is compiled with DXC. Digests of every program's translation in the
-/// native form (`split_wave64` off – the form a GPU with 64-lane waves gets) and of the other
-/// modes' 32-lane form are printed, to compare with another build: `XCL_SAMPLE_RPF`;
-/// `XCL_FORMS_NO_DXC=1` skips the compiles.
+/// translation it changes is compiled with DXC, and so is the native form of every VS / PS
+/// with a whole-wave reduction recognised as a whole (`reductions`: it changes the form of
+/// every GPU). Digests of every program's translation in the native form (`split_wave64` off
+/// – the form a GPU with 64-lane waves gets) and of the other modes' 32-lane form are printed,
+/// to compare with another build: `XCL_SAMPLE_RPF`; `XCL_FORMS_NO_DXC=1` skips the compiles;
+/// `XCL_FORMS_LIST=<file>`: each program's digests, one line each (to diff two builds).
 #[test]
 #[ignore]
 fn retail_wave64_graphics_lane_forms() {
@@ -5252,10 +6414,14 @@ fn retail_wave64_graphics_lane_forms() {
     use std::sync::Mutex;
     let Ok(path) = std::env::var("XCL_SAMPLE_RPF") else { return };
     let dxc = std::env::var_os("XCL_FORMS_NO_DXC").is_none();
+    let list_out = std::env::var("XCL_FORMS_LIST").ok();
     let data = std::fs::read(path).unwrap();
     let records = crate::gpu::pack::scan(&data, 0x40);
     let (digest, programs, changed, compiled) = (AtomicU64::new(0), AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0));
     let split_digest = AtomicU64::new(0);
+    // VS / PS with a recognised reduction, wave64 / wave32; their native forms compiled
+    let (reduced64, reduced32, reduced_compiled) = (AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0));
+    let list: Mutex<Vec<String>> = Mutex::new(Vec::new());
     let errors: Mutex<Vec<String>> = Mutex::new(Vec::new());
     let next = AtomicUsize::new(0);
     std::thread::scope(|s| {
@@ -5282,16 +6448,41 @@ fn retail_wave64_graphics_lane_forms() {
                             Mode::Pixel(_) => "ps_6_6",
                             _ => {
                                 // the other modes' 32-lane form: unchanged by `upper_lanes`
+                                let mut sh = 0;
                                 if let Ok(t) = translate(code, &Options { split_wave64: true, ..opt }) {
-                                    split_digest.fetch_add(crate::gpu::shader::fnv64(format!("{key}\\n{}", t.hlsl).as_bytes()), Ordering::Relaxed);
+                                    sh = crate::gpu::shader::fnv64(format!("{key}\\n{}", t.hlsl).as_bytes());
+                                    split_digest.fetch_add(sh, Ordering::Relaxed);
+                                }
+                                if list_out.is_some() {
+                                    list.lock().unwrap().push(format!("{key}\t{h:016x}\t{sh:016x}\t-"));
                                 }
                                 continue;
                             }
                         };
+                        // (the list's last column: whether the program has one)
+                        let reduced = native.hlsl.contains("uint4 xcl_wave_");
+                        if reduced {
+                            if wave64 { &reduced64 } else { &reduced32 }.fetch_add(1, Ordering::Relaxed);
+                            if dxc {
+                                match super::dxc::compile(&native.hlsl, "main", profile, &[]) {
+                                    Ok(_) => {
+                                        reduced_compiled.fetch_add(1, Ordering::Relaxed);
+                                    }
+                                    Err(e) => errors.lock().unwrap().push(format!("{key} (native): {}", e.lines().take(4).collect::<Vec<_>>().join(" | "))),
+                                }
+                            }
+                        }
                         if !wave64 {
+                            if list_out.is_some() {
+                                list.lock().unwrap().push(format!("{key}\t{h:016x}\t-\t{reduced}"));
+                            }
                             continue;
                         }
                         let t = translate(code, &Options { split_wave64: true, ..opt }).unwrap();
+                        if list_out.is_some() {
+                            let sh = crate::gpu::shader::fnv64(format!("{key}\n{}", t.hlsl).as_bytes());
+                            list.lock().unwrap().push(format!("{key}\t{h:016x}\t{sh:016x}\t{reduced}"));
+                        }
                         if t.hlsl == native.hlsl {
                             continue;
                         }
@@ -5311,18 +6502,132 @@ fn retail_wave64_graphics_lane_forms() {
     });
     let errors = errors.into_inner().unwrap();
     println!(
-        "{} programs, native-form digest {:016x}, 32-lane-form digest of the other modes {:016x}; 32-lane form differs for {} wave64 VS / PS, {} compiled, {} DXC errors",
+        "{} programs, native-form digest {:016x}, 32-lane-form digest of the other modes {:016x}; 32-lane form differs for {} wave64 VS / PS, {} compiled; whole-wave reductions as wave operations in {} wave64 and {} wave32 VS / PS, native form {} compiled; {} DXC errors",
         programs.into_inner(),
         digest.into_inner(),
         split_digest.into_inner(),
         changed.into_inner(),
         compiled.into_inner(),
+        reduced64.into_inner(),
+        reduced32.into_inner(),
+        reduced_compiled.into_inner(),
         errors.len()
     );
+    if let Some(out) = list_out {
+        let mut v = list.into_inner().unwrap();
+        v.sort();
+        std::fs::write(out, v.join("\n") + "\n").unwrap();
+    }
     for e in errors.iter().take(10) {
         println!("  {e}");
     }
     assert!(errors.is_empty());
+}
+
+/// The pack's whole-wave sections (`s_or_saveexec_b64` / `_b32` with -1) and the reductions
+/// `reductions` recognises in them: sites, programs and distinct programs (by code) per op,
+/// and per reason for the sections it leaves – for wave64 VS / PS, where the translation uses
+/// them, and for the other modes and wave sizes, where it does not. For wave64 VS / PS also the
+/// programs with a lane ≥ 32 read as a constant (`upper_lanes`, #133), those whose such reads
+/// are all inside recognised reductions, and those that still get the 32-lane form.
+/// `XCL_SAMPLE_RPF`; `XCL_CENSUS_OUT=<file>`: the sections left, with their instructions.
+#[test]
+#[ignore]
+fn retail_wave_reductions_census() {
+    use super::upper_lanes::Read;
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+    let Ok(path) = std::env::var("XCL_SAMPLE_RPF") else { return };
+    let out = std::env::var("XCL_CENSUS_OUT").ok();
+    let data = std::fs::read(path).unwrap();
+    let records = crate::gpu::pack::scan(&data, 0x40);
+    // (programs, kind) → (sites, programs, distinct programs by code hash)
+    type Stats = BTreeMap<(String, String), (usize, usize, BTreeSet<u64>)>;
+    let stats: Mutex<Stats> = Mutex::new(BTreeMap::new());
+    let left: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    let next = AtomicUsize::new(0);
+    std::thread::scope(|s| {
+        for _ in 0..std::thread::available_parallelism().map_or(4, |n| n.get()) {
+            s.spawn(|| loop {
+                let i = next.fetch_add(1, Ordering::Relaxed);
+                let Some(r) = records.get(i) else { break };
+                let Some(blob) = crate::gpu::pack::inflate(&data, r) else { continue };
+                let Some(sh) = crate::gpu::xbox::parse(&blob) else { continue };
+                for (fi, f) in sh.fssm.iter().enumerate() {
+                    let label = match super::interface(&blob, &sh, f) {
+                        Some(Mode::Vertex(_)) => "VS",
+                        Some(Mode::Pixel(_)) => "PS",
+                        Some(Mode::Compute(_)) => "CS",
+                        Some(Mode::Mesh(_)) => "MS",
+                        Some(Mode::Geometry(_)) => "GS",
+                        _ => "other",
+                    };
+                    for p in &f.programs {
+                        let code = &f.data[p.offset..p.offset + p.len];
+                        let mut insts = Vec::new();
+                        let mut off = 0;
+                        while off + 4 <= code.len() {
+                            let Ok(d) = crate::gpu::rdna2::decode(&code[off..], off as u64) else { break };
+                            off += d.len;
+                            insts.push(d);
+                        }
+                        crate::gpu::rdna2::resolve_far_jumps(&mut insts);
+                        let sections = super::reductions::survey(&insts);
+                        if sections.is_empty() {
+                            continue;
+                        }
+                        let wave64 = super::detect_wave64(code);
+                        let group = format!("{label} {}", if wave64 { "wave64" } else { "wave32" });
+                        let hash = crate::gpu::shader::fnv64(code);
+                        let mut kinds = BTreeSet::from(["(programs with a whole-wave section)".to_string()]);
+                        let mut st = stats.lock().unwrap();
+                        for (pc, res) in &sections {
+                            let kind = match res {
+                                Ok(r) => format!("recognised: {}", r.op.name()),
+                                Err(e) => format!("left: {e}"),
+                            };
+                            st.entry((group.clone(), kind.clone())).or_default().0 += 1;
+                            if let (Err(e), Some(_)) = (res, &out) {
+                                let lines = crate::gpu::rdna2::disassemble(code, 0, false);
+                                let k = lines.iter().position(|l| l.pc == *pc).unwrap_or(0);
+                                let text: Vec<String> = lines[k..(k + 16).min(lines.len())].iter().map(|l| format!("  {:05x}: {}", l.pc, l.text)).collect();
+                                left.lock().unwrap().push(format!("=== {group} {} FSSM#{fi} {hash:016x}: {e}\n{}\n", r.name, text.join("\n")));
+                            }
+                            kinds.insert(kind);
+                        }
+                        if wave64 && matches!(label, "VS" | "PS") {
+                            let a = super::upper_lanes::analyze(&insts);
+                            let reduced: BTreeSet<u64> = sections.iter().filter_map(|(_, r)| r.as_ref().ok()).flat_map(|r| r.rest.iter().copied()).collect();
+                            let consts: Vec<u64> = a.reads.iter().filter(|(_, r)| matches!(r, Read::Const(_))).map(|(pc, _)| *pc).collect();
+                            if !consts.is_empty() {
+                                kinds.insert("(programs with a lane >= 32 read as a constant, #133)".into());
+                                if consts.iter().all(|pc| reduced.contains(pc)) {
+                                    kinds.insert("(... all inside recognised reductions)".into());
+                                }
+                            }
+                            if a.reads.iter().any(|(pc, r)| !reduced.contains(pc) && matches!(r, Read::Const(_) | Read::Shadow)) {
+                                kinds.insert("(programs that still get the 32-lane form)".into());
+                            }
+                        }
+                        for k in kinds {
+                            let e = st.entry((group.clone(), k)).or_default();
+                            e.1 += 1;
+                            e.2.insert(hash);
+                        }
+                    }
+                }
+            });
+        }
+    });
+    for ((group, kind), (sites, programs, distinct)) in stats.into_inner().unwrap() {
+        println!("  {group:<11} {kind:<62} {sites:>6} sites {programs:>6} programs {:>6} distinct", distinct.len());
+    }
+    if let Some(out) = out {
+        let mut v = left.into_inner().unwrap();
+        v.sort();
+        std::fs::write(out, v.concat()).unwrap();
+    }
 }
 
 /// `ds_swizzle_b32`'s four modes against the RDNA ISA (its FFT examples, rotate, quad
@@ -7001,6 +8306,24 @@ fn sdwa_f16_inline_constants_hlsl() {
 }
 
 #[test]
+fn valu64_clamp_and_omod_hlsl() {
+    let code = prog(&[
+        ("V_ADD_F64", "ENC_VOP3", &[("VDST", 2), ("SRC0", V), ("SRC1", V + 2), ("CLAMP", 1)], None),
+        ("V_MUL_F64", "ENC_VOP3", &[("VDST", 4), ("SRC0", V), ("SRC1", V + 2), ("OMOD", 1)], None),
+        ("V_FMA_F64", "ENC_VOP3", &[("VDST", 6), ("SRC0", V), ("SRC1", V + 2), ("SRC2", V + 4), ("OMOD", 2), ("CLAMP", 1)], None),
+    ]);
+    let t = translate(&code, &Options { wave64: false, ..Default::default() }).unwrap();
+    assert!(t.complete(), "{:?}", t.unsupported_why);
+    assert!(t.hlsl.contains("double t1_d = clamp(asdouble(v0, v1) + asdouble(v2, v3), 0.0, 1.0);"), "{}", t.hlsl);
+    assert!(t.hlsl.contains("double t2_d = ((asdouble(v0, v1) * asdouble(v2, v3)) * 2.0);"), "{}", t.hlsl);
+    assert!(t.hlsl.contains("double t3_d = clamp(((fma(asdouble(v0, v1), asdouble(v2, v3), asdouble(v4, v5))) * 4.0), 0.0, 1.0);"), "{}", t.hlsl);
+    assert!(!t.hlsl.contains("saturate(asdouble"), "{}", t.hlsl);
+    if super::dxc::location().is_ok() {
+        super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl));
+    }
+}
+
+#[test]
 fn gpu_wave32_and_wave64_src_vccz_execz() {
     if !gpu_ready() {
         return;
@@ -7140,4 +8463,621 @@ fn fspx_containers_translate_and_compile() {
     let (n, ok) = (n.into_inner(), ok.into_inner());
     println!("FSPX: {ok} / {n} translated and compiled");
     assert_eq!(ok, n);
+}
+
+// ---- compute groups that are not whole waves ----
+
+fn cs_of(threads: [u32; 3], tg_size: bool) -> super::CsInterface {
+    super::CsInterface { threads, user_sgprs: 4, tgid: [true, false, false], tg_size, tid_components: 3 }
+}
+
+/// A compute program that can tell the lanes its last, partial wave did not launch
+/// (`partial_waves`): on the console they exist, inactive – code that turns them on in EXEC
+/// runs in them (a compare of a register with itself is true there whatever it holds, `v_mov`
+/// writes them) and `v_writelane` writes them whatever EXEC is. v0 = thread index in the
+/// group (s1 = x, s2 = x · y of the group). Each thread stores at s0 + 16 · thread: the bits
+/// of `v_cmp_eq_u32 vcc, v0, v0` after `s_not exec, exec` and after `s_or_saveexec s, -1`,
+/// the wave's last lane of a VGPR written with EXEC = -1, and a lane `v_writelane` wrote.
+fn lanes_not_launched_program(wave64: bool) -> Vec<u8> {
+    let (b, last) = if wave64 { ("B64", 63) } else { ("B32", 31) };
+    let s1 = |n: &str, d: u64, s: u64| ins(&format!("{n}_{b}"), "ENC_SOP1", &[("SDST", d), ("SSRC0", s)], None);
+    let all = || ins("V_CMP_EQ_U32", "ENC_VOPC", &[("SRC0", V), ("VSRC1", 0)], None);
+    let lane = |n: &str, d: u64, s: u64, l: u64| ins(n, "ENC_VOP3", &[("VDST", d), ("SRC0", s), ("SRC1", 128 + l)], None);
+    let mut parts = vec![
+        ins("V_MAD_U32_U24", "ENC_VOP3", &[("VDST", 20), ("SRC0", V + 1), ("SRC1", 1), ("SRC2", V)], None),
+        ins("V_MAD_U32_U24", "ENC_VOP3", &[("VDST", 0), ("SRC0", V + 2), ("SRC1", 2), ("SRC2", V + 20)], None),
+        s1("S_MOV", 30, 126),
+        s1("S_NOT", 126, 126),
+        all(),
+        s1("S_BCNT1_I32", 20, 106),
+        s1("S_MOV", 126, 30),
+        s1("S_OR_SAVEEXEC", 12, 193),
+        all(),
+        s1("S_BCNT1_I32", 21, 106),
+        ins("V_MOV_B32", "ENC_VOP1", &[("VDST", 9), ("SRC0", 135)], None),
+        s1("S_MOV", 126, 30),
+        lane("V_READLANE_B32", 22, V + 9, last),
+        lane("V_WRITELANE_B32", 10, 128 + 33, last - 1),
+        lane("V_READLANE_B32", 23, V + 10, last - 1),
+    ];
+    for k in 0..4 {
+        parts.push(ins("V_MOV_B32", "ENC_VOP1", &[("VDST", 24 + k), ("SRC0", 20 + k)], None));
+    }
+    parts.extend([
+        ins("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 30), ("SRC0", 132), ("VSRC1", 0)], None),
+        ins("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 30), ("SRC0", 0), ("VSRC1", 30)], None),
+        ins("V_MOV_B32", "ENC_VOP1", &[("VDST", 31), ("SRC0", 128)], None),
+        ins("GLOBAL_STORE_DWORDX4", "ENC_FLAT_GLBL", &[("ADDR", 30), ("DATA", 24), ("SADDR", 0x7D)], None),
+    ]);
+    program_of(&parts)
+}
+
+/// Runs `lanes_not_launched_program` in groups of each of `groups`' dimensions: one line per
+/// console wave whose threads did not all store what the console's would (the ISA's
+/// definition, not a measurement), and per group in which a thread the console does not
+/// have stored anything.
+fn lanes_not_launched_mismatches(groups: &[[u32; 3]], wave64: bool, pad_waves: PadWaves) -> Vec<String> {
+    let (base, lanes) = (0x100usize, if wave64 { 64 } else { 32 });
+    let code = lanes_not_launched_program(wave64);
+    let mut bad = Vec::new();
+    for &dims in groups {
+        let threads = dims.iter().product::<u32>();
+        let t = translate(&code, &on_gpu(Options { mode: Mode::Compute(cs_of(dims, false)), wave64, pad_waves, ..Default::default() })).unwrap();
+        assert!(t.complete(), "{dims:?}: {:?}", t.unsupported_why);
+        let dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{dims:?}: {e}"));
+        let mem = vec![0xDEAD_BEEFu32; (base + threads.next_multiple_of(lanes) as usize * 16) / 4];
+        let out = runner::dispatch(&dxil, [1, 1, 1], &[base as u32, dims[0], dims[0] * dims[1]], &mem).unwrap_or_else(|e| panic!("{dims:?}: {e}"));
+        for w in 0..threads.div_ceil(lanes) {
+            let n = (threads - w * lanes).min(lanes);
+            let want = [lanes - n, lanes, 7, 33];
+            let mut got: Vec<[u32; 4]> = (w * lanes..w * lanes + n).map(|tid| out[base / 4 + tid as usize * 4..][..4].try_into().unwrap()).collect();
+            got.dedup();
+            if got != [want] {
+                bad.push(format!("{pad_waves:?} | group {dims:?} wave {w} ({n} lanes) | want {want:?} | got {got:?}"));
+            }
+        }
+        if out[base / 4 + threads as usize * 4..].iter().any(|&x| x != 0xDEAD_BEEF) {
+            bad.push(format!("{pad_waves:?} | group {dims:?}: a thread past the group's {threads} stored"));
+        }
+    }
+    bad
+}
+
+/// A wave64 compute group that is not whole waves, for a program that can tell: before, a
+/// group of 40 threads counted no lane after `s_not_b64 exec, exec` (24 on the console) and
+/// 40 after `s_or_saveexec_b64 s, -1` (64), and lost what it wrote to lane 62. In 1-D, 2-D
+/// and 3-D groups; without the padding lanes (`PadWaves::Never`: the translation as it was)
+/// each of the 11 partial waves differs.
+#[test]
+fn gpu_wave64_valu_code_in_lanes_not_launched() {
+    if !gpu_ready() {
+        return;
+    }
+    let groups = [[64, 1, 1], [40, 1, 1], [42, 1, 1], [20, 1, 1], [10, 1, 1], [96, 1, 1], [8, 5, 1], [4, 5, 2], [6, 7, 1], [2, 5, 1], [8, 12, 1], [1, 1, 1]];
+    let bad = lanes_not_launched_mismatches(&groups, true, PadWaves::WhereSeen);
+    assert!(bad.is_empty(), "{bad:#?}");
+    let before = lanes_not_launched_mismatches(&groups, true, PadWaves::Never);
+    assert_eq!(before.len(), 11, "{before:#?}");
+}
+
+/// The same for wave32 programs: groups of 20, 10, 52 (a full wave and 20 lanes), 5 x 4 and
+/// 1 threads; a group of 32 is a whole wave.
+#[test]
+fn gpu_wave32_valu_code_in_lanes_not_launched() {
+    if !gpu_ready() {
+        return;
+    }
+    let groups = [[32, 1, 1], [20, 1, 1], [10, 1, 1], [52, 1, 1], [5, 4, 1], [1, 1, 1]];
+    let bad = lanes_not_launched_mismatches(&groups, false, PadWaves::WhereSeen);
+    assert!(bad.is_empty(), "{bad:#?}");
+    let before = lanes_not_launched_mismatches(&groups, false, PadWaves::Never);
+    assert_eq!(before.len(), 5, "{before:#?}");
+}
+
+/// Only a program that can tell gets the padded group (`partial_waves`), and only in a group
+/// that is not whole waves: every other translation is the one it was.
+#[test]
+fn compute_groups_are_padded_only_where_the_program_can_tell() {
+    // the switches (for comparison) replace `WhereSeen`
+    if std::env::var_os("XCL_CS_PAD_ALL").is_some() || std::env::var_os("XCL_NO_CS_PAD").is_some() {
+        return;
+    }
+    // an if block: EXEC stays inside the launched lanes
+    let plain = prog(&[
+        ("V_CMP_GT_U32", "ENC_VOPC", &[("SRC0", V), ("VSRC1", 1)], None),
+        ("S_AND_SAVEEXEC_B64", "ENC_SOP1", &[("SDST", 6), ("SSRC0", 106)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 3), ("SRC0", 129)], None),
+        ("S_MOV_B64", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 6)], None),
+    ]);
+    let wide = lanes_not_launched_program(true);
+    let hlsl = |code: &[u8], dims: [u32; 3], wave64: bool, split: bool, pad: PadWaves| {
+        let t = translate(code, &Options { mode: Mode::Compute(cs_of(dims, false)), wave64, split_wave64: split, pad_waves: pad, ..Default::default() }).unwrap();
+        assert!(t.complete(), "{:?}", t.unsupported_why);
+        t.hlsl
+    };
+    for split in [false, true] {
+        for dims in [[40, 1, 1], [8, 5, 1], [96, 1, 1], [1, 1, 1]] {
+            let h = hlsl(&plain, dims, true, split, PadWaves::WhereSeen);
+            assert!(h.contains(&format!("[numthreads({}, {}, {})]", dims[0], dims[1], dims[2])) && h.contains("(true); exec_lo = e0.x;"), "{dims:?}");
+            assert_eq!(h, hlsl(&plain, dims, true, split, PadWaves::Never), "{dims:?}");
+        }
+        // one that can: whole waves, the lanes past its threads inactive at the start
+        for (dims, padded, threads) in [([40, 1, 1], 64, 40), ([8, 5, 1], 64, 40), ([1, 1, 1], 64, 1), ([4, 4, 6], 128, 96), ([1000, 1, 1], 1024, 1000)] {
+            let h = hlsl(&wide, dims, true, split, PadWaves::WhereSeen);
+            assert!(h.contains(&format!("[numthreads({padded}, 1, 1)]")) && h.contains(&format!("(gi < {threads}u); exec_lo = e0.x;")), "{dims:?}");
+            // the split form's halves both exist then
+            assert_eq!(h.contains(&format!("#define XCL_X_THREADS {padded}u")), split, "{dims:?}");
+        }
+        // whole waves are never padded
+        for dims in [[64, 1, 1], [8, 8, 4]] {
+            assert_eq!(hlsl(&wide, dims, true, split, PadWaves::Always), hlsl(&wide, dims, true, split, PadWaves::Never), "{dims:?}");
+        }
+    }
+    // a wave32 program's waves have 32 lanes
+    let h = hlsl(&lanes_not_launched_program(false), [20, 1, 1], false, false, PadWaves::WhereSeen);
+    assert!(h.contains("[numthreads(32, 1, 1)]") && h.contains("(gi < 20u); exec_lo = e0.x;"));
+}
+
+/// What a program sees of its group when the group is padded to whole waves is what it sees
+/// otherwise: thread ids (1-D, 2-D and 3-D groups), the group id, TG_SIZE, its lane and the
+/// launched lanes of its wave, LDS shared across the group around `s_barrier`, and memory –
+/// each console thread runs once (an atomic count per group) and no padding lane stores.
+/// Wave64 programs (split on 32-lane GPUs: the barrier and the counter-paired forms) and
+/// wave32 ones, three groups each.
+#[test]
+fn gpu_padded_compute_groups_look_the_same_to_the_program() {
+    if !gpu_ready() {
+        return;
+    }
+    let w64 = [[40u32, 1, 1], [20, 1, 1], [10, 1, 1], [96, 1, 1], [8, 5, 1], [4, 5, 2], [4, 4, 6], [3, 1, 1], [1, 1, 1]];
+    let w32 = [[20u32, 1, 1], [10, 1, 1], [52, 1, 1], [5, 4, 1], [1, 1, 1]];
+    for (wave64, dims) in w64.map(|d| (true, d)).into_iter().chain(w32.map(|d| (false, d))) {
+        let lanes: u32 = if wave64 { 64 } else { 32 };
+        let (x, xy, n) = (dims[0], dims[0] * dims[1], dims.iter().product::<u32>());
+        let mut parts = vec![
+            // v21 = thread index in the group
+            ins("V_MAD_U32_U24", "ENC_VOP3", &[("VDST", 20), ("SRC0", V + 1), ("SRC1", 1), ("SRC2", V)], None),
+            ins("V_MAD_U32_U24", "ENC_VOP3", &[("VDST", 21), ("SRC0", V + 2), ("SRC1", 2), ("SRC2", V + 20)], None),
+            // LDS[4 · thread] = thread + 100; after the barrier, the word of thread n - 1 - thread
+            ins("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 22), ("SRC0", 130), ("VSRC1", 21)], None),
+            ins("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 23), ("SRC0", 255), ("VSRC1", 21)], Some(100)),
+            ins("DS_WRITE_B32", "ENC_DS", &[("ADDR", 22), ("DATA0", 23)], None),
+            ins("S_BARRIER", "ENC_SOPP", &[], None),
+            ins("V_SUB_NC_U32", "ENC_VOP2", &[("VDST", 32), ("SRC0", 3), ("VSRC1", 21)], None),
+            ins("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 32), ("SRC0", 193), ("VSRC1", 32)], None),
+            ins("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 32), ("SRC0", 130), ("VSRC1", 32)], None),
+            ins("DS_READ_B32", "ENC_DS", &[("VDST", 29), ("ADDR", 32)], None),
+            // count[group] += 1 at s0 - 64 + 4 · group
+            ins("S_SUB_U32", "ENC_SOP2", &[("SDST", 8), ("SSRC0", 0), ("SSRC1", 192)], None),
+            ins("S_MOV_B32", "ENC_SOP1", &[("SDST", 9), ("SSRC0", 128)], None),
+            ins("V_MOV_B32", "ENC_VOP1", &[("VDST", 40), ("SRC0", 4)], None),
+            ins("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 40), ("SRC0", 130), ("VSRC1", 40)], None),
+            ins("V_MOV_B32", "ENC_VOP1", &[("VDST", 41), ("SRC0", 129)], None),
+            ins("GLOBAL_ATOMIC_ADD", "ENC_FLAT_GLBL", &[("VDST", 42), ("ADDR", 40), ("DATA", 41), ("SADDR", 8), ("OFFSET", 0), ("GLC", 1)], None),
+            // the thread id, TG_SIZE (s5), the group id (s4), the lane and the wave's lanes
+            ins("V_MOV_B32", "ENC_VOP1", &[("VDST", 24), ("SRC0", V)], None),
+            ins("V_MOV_B32", "ENC_VOP1", &[("VDST", 25), ("SRC0", V + 1)], None),
+            ins("V_MOV_B32", "ENC_VOP1", &[("VDST", 26), ("SRC0", V + 2)], None),
+            ins("V_MOV_B32", "ENC_VOP1", &[("VDST", 27), ("SRC0", 5)], None),
+            ins("V_MOV_B32", "ENC_VOP1", &[("VDST", 28), ("SRC0", 4)], None),
+            ins("V_MBCNT_LO_U32_B32", "ENC_VOP3", &[("VDST", 30), ("SRC0", 126), ("SRC1", 128)], None),
+        ];
+        if wave64 {
+            parts.push(ins("V_MBCNT_HI_U32_B32", "ENC_VOP3", &[("VDST", 30), ("SRC0", 127), ("SRC1", V + 30)], None));
+            parts.push(ins("S_BCNT1_I32_B64", "ENC_SOP1", &[("SDST", 10), ("SSRC0", 126)], None));
+        } else {
+            parts.push(ins("S_BCNT1_I32_B32", "ENC_SOP1", &[("SDST", 10), ("SSRC0", 126)], None));
+        }
+        parts.extend([
+            ins("V_MOV_B32", "ENC_VOP1", &[("VDST", 31), ("SRC0", 10)], None),
+            // out[(group · 256 + thread) · 32]: v24..v27, v28..v31
+            ins("S_LSHL_B32", "ENC_SOP2", &[("SDST", 11), ("SSRC0", 4), ("SSRC1", 136)], None),
+            ins("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 34), ("SRC0", 11), ("VSRC1", 21)], None),
+            ins("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 34), ("SRC0", 133), ("VSRC1", 34)], None),
+            ins("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 34), ("SRC0", 0), ("VSRC1", 34)], None),
+            ins("V_MOV_B32", "ENC_VOP1", &[("VDST", 35), ("SRC0", 128)], None),
+            ins("GLOBAL_STORE_DWORDX4", "ENC_FLAT_GLBL", &[("ADDR", 34), ("DATA", 24), ("SADDR", 0x7D)], None),
+            ins("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 34), ("SRC0", 144), ("VSRC1", 34)], None),
+            ins("GLOBAL_STORE_DWORDX4", "ENC_FLAT_GLBL", &[("ADDR", 34), ("DATA", 28), ("SADDR", 0x7D)], None),
+        ]);
+        let code = program_of(&parts);
+        let (base, groups) = (0x100usize, 3usize);
+        let mut tg_size = Vec::new();
+        for pad in [PadWaves::Never, PadWaves::Always, PadWaves::WhereSeen] {
+            let what = format!("{dims:?}, wave{lanes}, {pad:?}");
+            let t = translate(&code, &on_gpu(Options { mode: Mode::Compute(cs_of(dims, true)), wave64, pad_waves: pad, ..Default::default() })).unwrap();
+            assert!(t.complete(), "{what}: {:?}", t.unsupported_why);
+            let padded = t.hlsl.contains(&format!("[numthreads({}, 1, 1)]", n.next_multiple_of(lanes)));
+            // nothing here turns on a lane the wave did not launch: only `Always` pads
+            // (`XCL_CS_PAD_ALL` makes `WhereSeen` that)
+            assert_eq!(padded, pad == PadWaves::Always || pad == PadWaves::WhereSeen && std::env::var_os("XCL_CS_PAD_ALL").is_some(), "{what}");
+            let dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{what}: {e}"));
+            let mut mem = vec![0xDEAD_BEEFu32; (base + groups * 256 * 32) / 4];
+            mem[..base / 4].fill(0);
+            let out = runner::dispatch(&dxil, [groups as u32, 1, 1], &[base as u32, x, xy, n], &mem).unwrap_or_else(|e| panic!("{what}: {e}"));
+            let mut tg = Vec::new();
+            for g in 0..groups {
+                assert_eq!(out[(base - 64) / 4 + g], n, "{what}: threads of group {g} that ran");
+                for tid in 0..256u32 {
+                    let at = (base + (g * 256 + tid as usize) * 32) / 4;
+                    let got = &out[at..at + 8];
+                    if tid >= n {
+                        assert!(got.iter().all(|&v| v == 0xDEAD_BEEF), "{what}: group {g}, a thread {tid} stored");
+                        continue;
+                    }
+                    let (wave, lane) = (tid / lanes, tid % lanes);
+                    assert_eq!(&got[..3], &[tid % x, tid / x % dims[1], tid / xy], "{what}: group {g} thread {tid}: thread id");
+                    assert_eq!(got[3] >> 6, wave, "{what}: group {g} thread {tid}: wave in TG_SIZE");
+                    assert_eq!(got[4], g as u32, "{what}: thread {tid}: group id");
+                    assert_eq!(got[5], n - 1 - tid + 100, "{what}: group {g} thread {tid}: LDS word of thread {}", n - 1 - tid);
+                    assert_eq!(got[6], lane, "{what}: group {g} thread {tid}: lane");
+                    assert_eq!(got[7], (n - wave * lanes).min(lanes), "{what}: group {g} thread {tid}: lanes of its wave");
+                    tg.push(got[3]);
+                }
+            }
+            tg_size.push(tg);
+        }
+        assert!(tg_size[0] == tg_size[1] && tg_size[0] == tg_size[2], "{dims:?}, wave{lanes}: TG_SIZE with and without padding");
+    }
+}
+
+/// DXC cost of a folder of console shader containers (`XCL_BENCH_DIR`): every program
+/// translated (`XCL_BENCH_SPLIT=1`: the split wave64 form, `XCL_BENCH_WINDOWS=n`: n memory windows), then
+/// compiled on `XCL_BENCH_THREADS` threads (default: the DXC pool's) with `XCL_DXC_ARGS`.
+/// Prints translate time, HLSL bytes and digest, DXC wall time, sum of per-shader times and
+/// DXIL bytes. `XCL_BENCH_NO_DXC=1`: translation and digest only.
+#[test]
+#[ignore]
+fn dxc_bench_folder() {
+    let Ok(dir) = std::env::var("XCL_BENCH_DIR") else { return };
+    let split = std::env::var("XCL_BENCH_SPLIT").is_ok_and(|v| v == "1");
+    // `XCL_BENCH_WINDOWS=4`: the memory windows of a running title (`Uma::for_runtime`)
+    let windows = std::env::var("XCL_BENCH_WINDOWS").ok().and_then(|v| v.parse().ok()).unwrap_or(1u32);
+    let args = std::env::var("XCL_DXC_ARGS").unwrap_or_default();
+    let extra: Vec<&str> = args.split_whitespace().collect();
+    let mut files: Vec<_> = std::fs::read_dir(&dir).unwrap().flatten().map(|e| e.path()).collect();
+    files.sort();
+    // `XCL_BENCH_SLICE=k/n`: every n-th file from the k-th (processes side by side)
+    if let Some((k, n)) = std::env::var("XCL_BENCH_SLICE").ok().and_then(|v| v.split_once('/').and_then(|(k, n)| Some((k.parse::<usize>().ok()?, n.parse::<usize>().ok()?)))) {
+        files = files.into_iter().skip(k).step_by(n.max(1)).collect();
+    }
+    if let Ok(out) = std::env::var("XCL_BENCH_HLSL_OUT") {
+        let _ = std::fs::create_dir_all(&out);
+    }
+    let t0 = std::time::Instant::now();
+    let mut jobs: Vec<(String, String, &'static str)> = Vec::new();
+    // `XCL_BENCH_HLSL=1`: the folder holds saved HLSL (`<name>.<profile>.hlsl`) instead
+    let hlsl_dir = std::env::var("XCL_BENCH_HLSL").is_ok_and(|v| v == "1");
+    for path in files.iter().filter(|_| hlsl_dir) {
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        let profile = ["vs_6_6", "ps_6_6", "cs_6_6"].into_iter().find(|p| name.contains(p)).unwrap_or("cs_6_6");
+        let stem = name.strip_suffix(".hlsl").and_then(|n| n.strip_suffix(profile)).and_then(|n| n.strip_suffix('.')).unwrap_or(&name).to_string();
+        jobs.push((stem, std::fs::read_to_string(path).unwrap(), profile));
+    }
+    for path in files.iter().filter(|_| !hlsl_dir) {
+        let Ok(blob) = std::fs::read(path) else { continue };
+        let Some(sh) = crate::gpu::xbox::parse(&blob) else { continue };
+        for f in &sh.fssm {
+            let Some(mode) = super::interface(&blob, &sh, f) else { continue };
+            let profile = match &mode {
+                Mode::Vertex(_) => "vs_6_6",
+                Mode::Pixel(_) => "ps_6_6",
+                Mode::Compute(_) => "cs_6_6",
+                _ => continue,
+            };
+            for p in &f.programs {
+                let code = &f.data[p.offset..p.offset + p.len];
+                let opt = Options { mode: mode.clone(), wave64: super::detect_wave64(code), split_wave64: split, mem_windows: windows, ..Default::default() };
+                let Ok(t) = translate(code, &opt) else { continue };
+                if t.complete() {
+                    let name = path.file_name().unwrap().to_string_lossy().into_owned();
+                    if let Ok(out) = std::env::var("XCL_BENCH_HLSL_OUT") {
+                        let _ = std::fs::write(std::path::Path::new(&out).join(format!("{name}.{profile}.hlsl")), &t.hlsl);
+                    }
+                    jobs.push((name, t.hlsl, profile));
+                }
+            }
+        }
+    }
+    let translate_s = t0.elapsed().as_secs_f64();
+    let mut digest = 0xcbf2_9ce4_8422_2325u64;
+    for (_, h, p) in &jobs {
+        for b in h.bytes().chain(p.bytes()).chain([0]) {
+            digest ^= b as u64;
+            digest = digest.wrapping_mul(0x100_0000_01b3);
+        }
+    }
+    let bytes: usize = jobs.iter().map(|j| j.1.len()).sum();
+    let distinct: std::collections::HashSet<(&str, &str)> = jobs.iter().map(|j| (j.1.as_str(), j.2)).collect();
+    println!(
+        "programs {}, distinct HLSL {}, HLSL {:.1} MB, digest {digest:016x}, translate {translate_s:.2} s (one thread)",
+        jobs.len(),
+        distinct.len(),
+        bytes as f64 / 1048576.0
+    );
+    if std::env::var("XCL_BENCH_NO_DXC").is_ok() {
+        return;
+    }
+    let threads = std::env::var("XCL_BENCH_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or_else(super::dxc::compile_threads);
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let results: std::sync::Mutex<Vec<(f64, usize, usize, String)>> = Default::default();
+    let dxil_digest = std::sync::atomic::AtomicU64::new(0);
+    let t1 = std::time::Instant::now();
+    std::thread::scope(|s| {
+        for _ in 0..threads {
+            s.spawn(|| loop {
+                let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let Some((name, h, p)) = jobs.get(i) else { break };
+                let t = std::time::Instant::now();
+                let r = super::dxc::compile(h, "main", p, &extra);
+                let secs = t.elapsed().as_secs_f64();
+                let n = r.as_ref().map_or(0, |b| b.len());
+                // DXIL digest per program, combined by name below (order-free)
+                let mut d = 0xcbf2_9ce4_8422_2325u64;
+                for &b in r.as_deref().unwrap_or(&[]).iter().chain(name.as_bytes()).chain(p.as_bytes()) {
+                    d ^= b as u64;
+                    d = d.wrapping_mul(0x100_0000_01b3);
+                }
+                dxil_digest.fetch_xor(d, std::sync::atomic::Ordering::Relaxed);
+                if let Err(e) = &r {
+                    println!("  {name}: {}", e.lines().find(|l| l.contains("error")).unwrap_or(""));
+                }
+                results.lock().unwrap().push((secs, h.len(), n, name.clone()));
+            });
+        }
+    });
+    let wall = t1.elapsed().as_secs_f64();
+    if let Ok(out) = std::env::var("XCL_BENCH_TIMES") {
+        let t: String = results.lock().unwrap().iter().map(|(s, l, _, n)| format!("{n}	{s:.4}	{l}
+")).collect();
+        let _ = std::fs::write(out, t);
+    }
+    let mut r = results.into_inner().unwrap();
+    r.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let sum: f64 = r.iter().map(|x| x.0).sum();
+    let dxil: usize = r.iter().map(|x| x.2).sum();
+    let failed = r.iter().filter(|x| x.2 == 0).count();
+    let q = |f: f64| r[((r.len() - 1) as f64 * f) as usize].0;
+    println!(
+        "DXC {extra:?} threads {threads}: wall {wall:.2} s, {:.0} programs/s, per-program sum {sum:.1} s (median {:.3}, p90 {:.3}, max {:.2}), DXIL {:.1} MB (digest {:016x}), failed {failed}",
+        r.len() as f64 / wall,
+        q(0.5),
+        q(0.9),
+        q(1.0),
+        dxil as f64 / 1048576.0,
+        dxil_digest.into_inner()
+    );
+    for (secs, len, _, name) in r.iter().rev().take(3) {
+        println!("  {secs:.2} s, HLSL {} KB: {name}", len / 1024);
+    }
+    // cost by size: ms per HLSL KB in size buckets (is DXC linear in the source?)
+    let mut buckets = std::collections::BTreeMap::<usize, (usize, f64, usize)>::new();
+    for (secs, len, _, _) in &r {
+        let b = buckets.entry((*len / 1024).next_power_of_two()).or_default();
+        b.0 += 1;
+        b.1 += secs;
+        b.2 += len;
+    }
+    for (kb, (n, secs, len)) in buckets {
+        println!("  size <= {kb} KB: {n} programs, {:.1} ms each, {:.2} ms/KB", secs * 1e3 / n as f64, secs * 1e3 / (len as f64 / 1024.0));
+    }
+    unsafe {
+        use windows_sys::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
+        let mut c: PROCESS_MEMORY_COUNTERS = std::mem::zeroed();
+        c.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
+        GetProcessMemoryInfo(windows_sys::Win32::System::Threading::GetCurrentProcess(), &mut c, c.cb);
+        println!("  peak commit {} MB", c.PeakPagefileUsage >> 20);
+    }
+}
+
+/// After a pixel shader's reduction, what the helper lanes of a quad hold (sT copied to a
+/// VGPR, vA, vB), read by the live pixels through DPP quad_perm (the console: every lane holds
+/// the result).
+#[test]
+fn gpu_ps_reduction_result_in_helper_lanes() {
+    if !gpu_ready() {
+        return;
+    }
+    let mut bad = 0;
+    for wave64 in [true, false] {
+        let w = |b64: &'static str, b32: &'static str| if wave64 { b64 } else { b32 };
+        for (op, id, rop) in WAVE_REDUCTIONS.iter() {
+            for view in 0..3u64 {
+                // view 0: sT (as a VGPR), 1: vA, 2: vB
+                let mut c = vec![
+                    ins(w("S_MOV_B64", "S_MOV_B32"), "ENC_SOP1", &[("SDST", 16), ("SSRC0", 126)], None),
+                    ins(w("S_WQM_B64", "S_WQM_B32"), "ENC_SOP1", &[("SDST", 126), ("SSRC0", 126)], None),
+                    ins("V_CVT_U32_F32", "ENC_VOP1", &[("VDST", 10), ("SRC0", V + 2)], None),
+                    ins("V_CVT_U32_F32", "ENC_VOP1", &[("VDST", 11), ("SRC0", V + 3)], None),
+                    ins("V_LSHL_ADD_U32", "ENC_VOP3", &[("VDST", 12), ("SRC0", V + 11), ("SRC1", 128 + 4), ("SRC2", V + 10)], None),
+                    ins("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 13), ("SRC0", 129), ("VSRC1", 12)], None),
+                ];
+                c.push(whole_wave_reduction_as(wave64, op, *id, 13, Some(16), 40, 41));
+                let src = [41, V + 6, V + 7][view as usize];
+                c.extend([
+                    ins("V_MOV_B32", "ENC_VOP1", &[("VDST", 20), ("SRC0", src)], None),
+                    ins("V_MOV_B32", "VOP1_VOP_DPP16", &[("VDST", 21), ("SRC0", 0xFA), ("VSRC0", 20), ("DPP_CTRL", 0xB1), ("ROW_MASK", 0xF), ("BANK_MASK", 0xF)], None),
+                    ins("V_MOV_B32", "VOP1_VOP_DPP16", &[("VDST", 22), ("SRC0", 0xFA), ("VSRC0", 20), ("DPP_CTRL", 0x4E), ("ROW_MASK", 0xF), ("BANK_MASK", 0xF)], None),
+                    ins("V_MOV_B32", "VOP1_VOP_DPP16", &[("VDST", 23), ("SRC0", 0xFA), ("VSRC0", 20), ("DPP_CTRL", 0x1B), ("ROW_MASK", 0xF), ("BANK_MASK", 0xF)], None),
+                    ins(w("S_MOV_B64", "S_MOV_B32"), "ENC_SOP1", &[("SDST", 126), ("SSRC0", 16)], None),
+                    ins("V_CVT_F32_U32", "ENC_VOP1", &[("VDST", 30), ("SRC0", V + 20)], None),
+                    ins("V_CVT_F32_U32", "ENC_VOP1", &[("VDST", 31), ("SRC0", V + 21)], None),
+                    ins("V_CVT_F32_U32", "ENC_VOP1", &[("VDST", 32), ("SRC0", V + 22)], None),
+                    ins("V_CVT_F32_U32", "ENC_VOP1", &[("VDST", 33), ("SRC0", V + 23)], None),
+                    ins("EXP", "ENC_EXP", &[("TGT", 0), ("EN", 0xF), ("VSRC0", 30), ("VSRC1", 31), ("VSRC2", 32), ("VSRC3", 33), ("DONE", 1), ("VM", 1)], None),
+                ]);
+                let code = program_of(&c);
+                for (shape, tri) in [("3 quads", [[0.0f32, 0.0], [3.2, 0.0], [0.0, 3.2]]), ("55 pixels", [[0.0, 0.0], [11.0, 0.0], [0.0, 11.0]]), ("sliver", [[1.0, 1.0], [15.0, 2.2], [1.0, 2.2]])] {
+                    let px = draw_console_as(None, Some(&code), &tri, wave64);
+                    let live: Vec<(usize, [u32; 4])> = px.iter().enumerate().filter(|(_, p)| p[0] >= 0.0).map(|(i, p)| (i, p.map(|x| x as u32))).collect();
+                    let wrong: Vec<&(usize, [u32; 4])> = live.iter().filter(|(_, p)| p[1] != p[0] || p[2] != p[0] || p[3] != p[0]).collect();
+                    if !wrong.is_empty() {
+                        bad += 1;
+                        println!(
+                            "wave64 {wave64} {} view {} {shape}: {} of {} live pixels see another value in their quad, e.g. pixel {} own {:#x} h {:#x} v {:#x} d {:#x}",
+                            rop.name(),
+                            ["sT", "vA", "vB"][view as usize],
+                            wrong.len(),
+                            live.len(),
+                            wrong[0].0,
+                            wrong[0].1[0],
+                            wrong[0].1[1],
+                            wrong[0].1[2],
+                            wrong[0].1[3]
+                        );
+                    }
+                }
+            }
+        }
+    }
+    println!("gpu_ps_reduction_result_in_helper_lanes: {bad} cases differ");
+    assert_eq!(bad, 0);
+}
+
+enum RvIt {
+    L(&'static str),
+    I(Vec<u8>),
+    B(&'static str, &'static str),
+}
+
+/// Assemble items with labels and branches; ends in s_endpgm.
+fn rv_assemble(items: &[RvIt]) -> Vec<u8> {
+    let mut at = std::collections::BTreeMap::new();
+    let mut pc = 0usize;
+    for it in items {
+        match it {
+            RvIt::L(l) => {
+                at.insert(*l, pc);
+            }
+            RvIt::I(b) => pc += b.len(),
+            RvIt::B(..) => pc += 4,
+        }
+    }
+    let mut code = Vec::new();
+    for it in items {
+        match it {
+            RvIt::L(_) => {}
+            RvIt::I(b) => code.extend(b.iter().copied()),
+            RvIt::B(n, l) => {
+                let rel = (at[l] as i64 - (code.len() as i64 + 4)) / 4;
+                code.extend(ins(n, "ENC_SOPP", &[("SIMM16", (rel as i16 as u16) as u64)], None));
+            }
+        }
+    }
+    code.extend(ins("S_ENDPGM", "ENC_SOPP", &[], None));
+    code
+}
+
+/// Reductions as the retail pixel shaders place them - live pixels saved, s_wqm, a kill (cmpx, live &= ~exec),
+/// a region under s_and_saveexec / s_cbranch_execz with a min reduction and a loop of two or
+/// reductions (mask = live & saved EXEC).
+#[test]
+fn gpu_ps_reductions_in_branches_and_loops() {
+    use std::collections::BTreeMap;
+    use RvIt::*;
+    if !gpu_ready() {
+        return;
+    }
+    let mut bad = 0;
+    for wave64 in [true, false] {
+        let w = |b64: &'static str, b32: &'static str| if wave64 { b64 } else { b32 };
+        let items = vec![
+            I(ins("V_CVT_U32_F32", "ENC_VOP1", &[("VDST", 10), ("SRC0", V + 2)], None)),
+            I(ins("V_CVT_U32_F32", "ENC_VOP1", &[("VDST", 11), ("SRC0", V + 3)], None)),
+            I(ins("V_LSHL_ADD_U32", "ENC_VOP3", &[("VDST", 12), ("SRC0", V + 11), ("SRC1", 128 + 4), ("SRC2", V + 10)], None)),
+            I(ins("V_READFIRSTLANE_B32", "ENC_VOP1", &[("VDST", 62), ("SRC0", V + 12)], None)),
+            I(ins("V_MBCNT_LO_U32_B32", "ENC_VOP3", &[("VDST", 15), ("SRC0", 193), ("SRC1", 128)], None)),
+            I(ins("V_MBCNT_HI_U32_B32", "ENC_VOP3", &[("VDST", 15), ("SRC0", 193), ("SRC1", V + 15)], None)),
+            I(ins("S_MOV_B32", "ENC_SOP1", &[("SDST", 43), ("SSRC0", 128)], None)),
+            I(ins("S_MOV_B32", "ENC_SOP1", &[("SDST", 50), ("SSRC0", 128)], None)),
+            I(ins("S_MOV_B32", "ENC_SOP1", &[("SDST", 51), ("SSRC0", 128)], None)),
+            I(ins(w("S_MOV_B64", "S_MOV_B32"), "ENC_SOP1", &[("SDST", 16), ("SSRC0", 126)], None)),
+            I(ins(w("S_WQM_B64", "S_WQM_B32"), "ENC_SOP1", &[("SDST", 126), ("SSRC0", 126)], None)),
+            // the helper lanes' pixel numbers too
+            I(ins("V_CVT_U32_F32", "ENC_VOP1", &[("VDST", 10), ("SRC0", V + 2)], None)),
+            I(ins("V_CVT_U32_F32", "ENC_VOP1", &[("VDST", 11), ("SRC0", V + 3)], None)),
+            I(ins("V_LSHL_ADD_U32", "ENC_VOP3", &[("VDST", 12), ("SRC0", V + 11), ("SRC1", 128 + 4), ("SRC2", V + 10)], None)),
+            I(ins("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 13), ("SRC0", 129), ("VSRC1", 12)], None)),
+            // kill the pixels with (number & 3) == 3
+            I(ins(w("S_MOV_B64", "S_MOV_B32"), "ENC_SOP1", &[("SDST", 0), ("SSRC0", 126)], None)),
+            I(ins("V_AND_B32", "ENC_VOP2", &[("VDST", 14), ("SRC0", 131), ("VSRC1", 12)], None)),
+            I(ins("V_CMPX_EQ_U32", "ENC_VOPC", &[("SRC0", 131), ("VSRC1", 14)], None)),
+            I(ins(w("S_ANDN2_B64", "S_ANDN2_B32"), "ENC_SOP2", &[("SDST", 16), ("SSRC0", 16), ("SSRC1", 126)], None)),
+            B("S_CBRANCH_SCC0", "end"),
+            I(ins(w("S_WQM_B64", "S_WQM_B32"), "ENC_SOP1", &[("SDST", 2), ("SSRC0", 16)], None)),
+            I(ins(w("S_AND_B64", "S_AND_B32"), "ENC_SOP2", &[("SDST", 126), ("SSRC0", 0), ("SSRC1", 2)], None)),
+            // the region: pixels with (number & 4) == 0
+            I(ins("V_AND_B32", "ENC_VOP2", &[("VDST", 14), ("SRC0", 132), ("VSRC1", 12)], None)),
+            I(ins("V_CMP_EQ_U32", "ENC_VOPC", &[("SRC0", 128), ("VSRC1", 14)], None)),
+            I(ins(w("S_AND_SAVEEXEC_B64", "S_AND_SAVEEXEC_B32"), "ENC_SOP1", &[("SDST", 60), ("SSRC0", 106)], None)),
+            B("S_CBRANCH_EXECZ", "skip"),
+            I(whole_wave_reduction_as(wave64, "V_MIN_U32", 193, 13, Some(16), 40, 43)),
+            L("loop"),
+            I(ins("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 19), ("SRC0", 51), ("VSRC1", 13)], None)),
+            I(whole_wave_reduction_as(wave64, "V_OR_B32", 128, 19, Some(16), 40, 41)),
+            I(ins("S_ADD_U32", "ENC_SOP2", &[("SDST", 50), ("SSRC0", 50), ("SSRC1", 41)], None)),
+            I(ins("S_ADD_U32", "ENC_SOP2", &[("SDST", 51), ("SSRC0", 51), ("SSRC1", 129)], None)),
+            I(ins("S_CMP_LT_U32", "ENC_SOPC", &[("SSRC0", 51), ("SSRC1", 130)], None)),
+            B("S_CBRANCH_SCC1", "loop"),
+            L("skip"),
+            I(ins(w("S_MOV_B64", "S_MOV_B32"), "ENC_SOP1", &[("SDST", 126), ("SSRC0", 16)], None)),
+            I(ins("V_CVT_F32_U32", "ENC_VOP1", &[("VDST", 30), ("SRC0", 43)], None)),
+            I(ins("V_CVT_F32_U32", "ENC_VOP1", &[("VDST", 31), ("SRC0", 50)], None)),
+            I(ins("V_CVT_F32_U32", "ENC_VOP1", &[("VDST", 32), ("SRC0", 51)], None)),
+            I(ins("V_LSHL_ADD_U32", "ENC_VOP3", &[("VDST", 33), ("SRC0", 62), ("SRC1", 128 + 6), ("SRC2", V + 15)], None)),
+            I(ins("V_CVT_F32_U32", "ENC_VOP1", &[("VDST", 33), ("SRC0", V + 33)], None)),
+            I(ins("EXP", "ENC_EXP", &[("TGT", 0), ("EN", 0xF), ("VSRC0", 30), ("VSRC1", 31), ("VSRC2", 32), ("VSRC3", 33), ("DONE", 1), ("VM", 1)], None)),
+            L("end"),
+        ];
+        let code = rv_assemble(&items);
+        {
+            let mut insts = Vec::new();
+            let mut off = 0;
+            while off + 4 <= code.len() {
+                let d = crate::gpu::rdna2::decode(&code[off..], off as u64).unwrap();
+                off += d.len;
+                insts.push(d);
+            }
+            assert_eq!(super::reductions::find(&insts, wave64).len(), 2, "both recognised");
+        }
+        let shapes: [(&str, [[f32; 2]; 3]); 5] = [
+            ("whole target", [[0.0, 0.0], [0.0, 32.0], [32.0, 0.0]]),
+            ("3 quads", [[0.0, 0.0], [3.2, 0.0], [0.0, 3.2]]),
+            ("55 pixels", [[0.0, 0.0], [11.0, 0.0], [0.0, 11.0]]),
+            ("sliver", [[1.0, 1.0], [15.0, 2.2], [1.0, 2.2]]),
+            ("right", [[9.0, 9.0], [16.0, 9.0], [16.0, 16.0]]),
+        ];
+        for (shape, tri) in shapes {
+            let px = draw_console_as(None, Some(&code), &tri, wave64);
+            let mut waves: BTreeMap<u32, Vec<(u32, u32, [f32; 4])>> = BTreeMap::new();
+            for (id, p) in px.iter().enumerate().filter(|(_, p)| p[3] >= 0.0) {
+                let kl = p[3] as u32;
+                waves.entry(kl >> 6).or_default().push((id as u32, kl & 63, *p));
+            }
+            let mut wrong = 0;
+            let mut eg = String::new();
+            for (first, wv) in &waves {
+                assert!(wv.iter().all(|x| x.0 & 3 != 3), "a killed pixel was drawn");
+                let m: Vec<u32> = wv.iter().filter(|x| x.0 & 4 == 0).map(|x| x.0 + 1).collect();
+                let want = if m.is_empty() {
+                    [0, 0, 0]
+                } else {
+                    let or = m.iter().fold(0, |a, b| a | b);
+                    [*m.iter().min().unwrap(), or + (or << 1), 2]
+                };
+                for (id, lane, p) in wv {
+                    let got = [p[0] as u32, p[1] as u32, p[2] as u32];
+                    if got != want {
+                        wrong += 1;
+                        if eg.is_empty() {
+                            eg = format!("pixel {id} lane {lane} wave of {first} ({} pixels): got {got:x?} want {want:x?}", wv.len());
+                        }
+                    }
+                }
+            }
+            println!("wave64 {wave64} {shape}: waves {:?}, {wrong} wrong {eg}", waves.values().map(|w| w.len()).collect::<Vec<_>>());
+            bad += (wrong != 0) as usize;
+        }
+    }
+    assert_eq!(bad, 0);
 }
