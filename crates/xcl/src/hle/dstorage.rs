@@ -26,7 +26,9 @@
 //! Each queue has a worker thread: submitted requests run in order (file reads through the
 //! VFS like the title's own, memory copies, zlib), a status entry gets the first failure of
 //! the requests since the previous one, a signal sets the fence from the CPU. Methods not
-//! listed are logged and answer E_NOTIMPL; BCPack and other console formats are refused.
+//! listed are logged and answer E_NOTIMPL; a BCPack mode without a decoder completes with a
+//! placeholder block (`XCL_BCPACK_PLACEHOLDER=0` refuses it as before), and the hardware
+//! swizzle and other console formats are refused.
 
 #![allow(non_snake_case)]
 
@@ -182,6 +184,71 @@ impl BcpackRefusals {
 
 static BCPACK: BcpackRefusals = BcpackRefusals::new();
 
+/// BCPack requests completed with a placeholder block (their mode has no decoder), by mode.
+struct BcpackPlaceholders {
+    requests: [AtomicU64; 16],
+    bytes: [AtomicU64; 16],
+}
+
+impl BcpackPlaceholders {
+    const fn new() -> Self {
+        const Z: AtomicU64 = AtomicU64::new(0);
+        Self { requests: [Z; 16], bytes: [Z; 16] }
+    }
+
+    /// Count one completed request of `mode`; the placeholders so far, this one included.
+    fn note(&self, mode: u8, bytes: usize) -> u64 {
+        let i = mode as usize & 0xF;
+        if self.requests[i].fetch_add(1, Ordering::Relaxed) == 0 {
+            crate::xlog_info!(
+                "DirectStorage: BCPack {}: no decoder; the destination gets a placeholder block and the request succeeds",
+                bcpack_name(mode)
+            );
+        }
+        self.bytes[i].fetch_add(bytes as u64, Ordering::Relaxed);
+        self.requests.iter().map(|r| r.load(Ordering::Relaxed)).sum()
+    }
+
+    fn summary(&self) -> String {
+        (1..16u8)
+            .filter(|&m| self.requests[m as usize].load(Ordering::Relaxed) > 0)
+            .map(|m| {
+                let i = m as usize;
+                format!(
+                    "{} {} ({} bytes)",
+                    bcpack_name(m),
+                    self.requests[i].load(Ordering::Relaxed),
+                    self.bytes[i].load(Ordering::Relaxed)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    fn stats(&self) -> BTreeMap<String, BcpackStats> {
+        (1..16u8)
+            .filter(|&m| self.requests[m as usize].load(Ordering::Relaxed) > 0)
+            .map(|m| {
+                let i = m as usize;
+                let bytes = self.bytes[i].load(Ordering::Relaxed);
+                let s = BcpackStats { requests: self.requests[i].load(Ordering::Relaxed), with_zlib: 0, destination_bytes: bytes, filled_bytes: bytes };
+                (bcpack_name(m), s)
+            })
+            .collect()
+    }
+}
+
+static PLACEHOLDERS: BcpackPlaceholders = BcpackPlaceholders::new();
+
+/// Count one completed placeholder and log the running total on the first 16 and every power
+/// of two, as the refusals counter does.
+fn log_bcpack_placeholder(r: &Request) {
+    let k = PLACEHOLDERS.note(r.bcpack(), r.destination_size as usize);
+    if k <= 16 || k.is_power_of_two() {
+        crate::xlog_info!("DirectStorage: BCPack placeholders so far: {k} ({})", PLACEHOLDERS.summary());
+    }
+}
+
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct BcpackStats {
     pub requests: u64,
@@ -197,10 +264,13 @@ pub struct BcpackStats {
 pub struct DStorageStats {
     /// BCPack requests refused (no decoder), by `DSTORAGE_BCPACK_MODE`
     pub bcpack_refused: BTreeMap<String, BcpackStats>,
+    /// BCPack requests completed with a placeholder block (no decoder), by `DSTORAGE_BCPACK_MODE`
+    #[serde(default)]
+    pub bcpack_placeholder: BTreeMap<String, BcpackStats>,
 }
 
 pub fn stats() -> DStorageStats {
-    DStorageStats { bcpack_refused: BCPACK.stats() }
+    DStorageStats { bcpack_refused: BCPACK.stats(), bcpack_placeholder: PLACEHOLDERS.stats() }
 }
 
 /// Log a refused BCPack request: one warning per mode and zlib stage, then a running count on
@@ -225,7 +295,8 @@ fn log_bcpack_refusal(r: &Request, k: u64) {
 
 /// `XCL_DSTORAGE_BCPACK_FILL=1`: a refused BCPack destination gets solid blocks of its BCn
 /// format (magenta; red for BC4/BC5) instead of staying as it was, so the title's textures
-/// that wait on BCPack show where they are. The request still fails.
+/// that wait on BCPack show where they are. The request still fails. Only a refusal reaches it
+/// (with `XCL_BCPACK_PLACEHOLDER=0`; otherwise the request completes with a placeholder).
 fn bcpack_fill_from_env() -> bool {
     std::env::var("XCL_DSTORAGE_BCPACK_FILL").is_ok_and(|v| !v.trim().is_empty() && v.trim() != "0")
 }
@@ -256,6 +327,28 @@ fn bcpack_fill_block(mode: u8) -> Option<Vec<u8>> {
     })
 }
 
+/// `XCL_BCPACK_PLACEHOLDER=0`: a BCPack request whose mode has no decoder fails with
+/// E_DECOMPRESSION as before. Any other value, or no variable, completes it with a placeholder
+/// block.
+fn bcpack_placeholder_enabled() -> bool {
+    !std::env::var("XCL_BCPACK_PLACEHOLDER").is_ok_and(|v| v.trim() == "0")
+}
+
+/// A solid BC7 mode-6 block: every texel (127, 127, 127, 255), opaque mid grey. Mode 6, one
+/// subset; the endpoints are 7-bit r/g/b 63 with p-bit 1 (127 in 8 bits) and 7-bit alpha 127
+/// with p-bit 1 (255); every index is 0, the first stored as 3 bits (its high bit is dropped).
+const BC7_GREY: [u8; 16] = [0xC0, 0xDF, 0xEF, 0xF7, 0xFB, 0xFD, 0xFE, 0xFF, 0x01, 0, 0, 0, 0, 0, 0, 0];
+
+/// One solid block of `mode`'s BCn format for a placeholder texture: BC7 mid grey, the other
+/// modes the same solid blocks `XCL_DSTORAGE_BCPACK_FILL` uses. `None` for a mode whose block
+/// size is not known (`DSTORAGE_BCPACK_MODE` 8..=15).
+fn bcpack_placeholder_block(mode: u8) -> Option<Vec<u8>> {
+    match mode {
+        7 => Some(BC7_GREY.to_vec()),
+        _ => bcpack_fill_block(mode),
+    }
+}
+
 /// Where a refused BCPack request's fill goes: its virtual destination, or the physical pages
 /// it named (snapshot at enqueue, as for a request that runs).
 enum FillTarget {
@@ -284,6 +377,27 @@ unsafe fn bcpack_fill(r: &Request, target: &FillTarget) -> bool {
         BCPACK.filled_bytes[r.bcpack() as usize & 0xF].fetch_add(n as u64, Ordering::Relaxed);
     }
     ok
+}
+
+/// Fill `r`'s destination (exactly `destination_size` bytes) with the placeholder block of its
+/// mode. `false` when the mode has no block or the destination cannot be written.
+unsafe fn bcpack_placeholder_write(r: &Request, dest_pages: Option<&[usize]>) -> bool {
+    let Some(block) = bcpack_placeholder_block(r.bcpack()) else { return false };
+    let n = r.destination_size as usize;
+    let bytes: Vec<u8> = block.iter().copied().cycle().take(n).collect();
+    if r.dest_physical_pages() {
+        let Some(snapshot) = dest_pages else { return false };
+        let pages = destination_pages_at_turn(r, snapshot);
+        crate::hle::kernelx::write_physical_pages(&pages, r.destination_page_offset as usize, &bytes)
+    } else {
+        if !writable(r.destination as usize, n) {
+            return false;
+        }
+        if n > 0 {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), r.destination as *mut u8, n);
+        }
+        true
+    }
 }
 
 /// A vtable: the listed methods, then logged E_NOTIMPL stubs up to `total` entries.
@@ -856,8 +970,18 @@ unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[us
         b
     };
 
-    if r.swizzle() != 0 || r.bcpack() != 0 {
+    if r.swizzle() != 0 {
         return Err(E_DECOMPRESSION);
+    }
+    // No BCPack mode has a decoder on this branch: the queue routes such a request to
+    // `Entry::Placeholder`, and one that reaches here anyway completes with a placeholder
+    // block, or fails as before.
+    if r.bcpack() != 0 {
+        if !bcpack_placeholder_enabled() || !bcpack_placeholder_write(r, dest_pages) {
+            return Err(E_DECOMPRESSION);
+        }
+        log_bcpack_placeholder(r);
+        return Ok(());
     }
 
     let payload: Vec<u8> = if r.zlib() {
@@ -928,6 +1052,13 @@ enum Entry {
         /// a refused BCPack request under `XCL_DSTORAGE_BCPACK_FILL`: where its solid blocks go
         fill: Option<FillTarget>,
     },
+    /// a BCPack request whose mode has no decoder, under `XCL_BCPACK_PLACEHOLDER`: the worker
+    /// fills the destination with a placeholder block and the request succeeds
+    Placeholder {
+        seq: u64,
+        req: Request,
+        dest_pages: Option<Vec<usize>>,
+    },
     Status(Arc<StatusInner>, u32),
     /// a fence (one reference held) and the value it gets
     Signal(FenceRef, u64),
@@ -971,6 +1102,8 @@ struct QueueInner {
     failed_since_status: AtomicI32,
     /// `XCL_DSTORAGE_BCPACK_FILL` when the queue was made
     bcpack_fill: AtomicBool,
+    /// `XCL_BCPACK_PLACEHOLDER` when the queue was made
+    bcpack_placeholder: AtomicBool,
 }
 
 impl QueueInner {
@@ -1094,6 +1227,18 @@ impl QueueInner {
                         self.note_failure(hr);
                     }
                 }
+                Entry::Placeholder { seq, req, dest_pages } => {
+                    if self.is_cancelled(seq, req.tag) {
+                        continue;
+                    }
+                    // a destination pages array filled in after Submit gets the same grace
+                    if unsafe { bcpack_placeholder_write(&req, dest_pages.as_deref()) } {
+                        log_bcpack_placeholder(&req);
+                    } else {
+                        self.fail(E_ACCESS_VIOLATION, req, None);
+                        self.note_failure(E_ACCESS_VIOLATION);
+                    }
+                }
                 Entry::Refused { hr, req, file, fill } => {
                     if let Some(t) = &fill {
                         // the destination gets solid blocks; the request still fails
@@ -1157,6 +1302,22 @@ impl QueueInner {
             let seq = p.next_seq;
             p.next_seq += 1;
             p.entries.push(Entry::Request { seq, req, file, dest_pages, src_pages });
+            p.entries.len()
+        };
+        if n >= (self.capacity / 2).max(1) {
+            self.submit();
+        }
+    }
+
+    fn enqueue_placeholder(self: &Arc<Self>, req: Request, dest_pages: Option<Vec<usize>>) {
+        let n = {
+            let mut p = self.pending.lock().unwrap();
+            if self.closed.load(Ordering::Acquire) {
+                return;
+            }
+            let seq = p.next_seq;
+            p.next_seq += 1;
+            p.entries.push(Entry::Placeholder { seq, req, dest_pages });
             p.entries.len()
         };
         if n >= (self.capacity / 2).max(1) {
@@ -1233,6 +1394,7 @@ unsafe extern "system" fn factory_create_queue(_p: *mut c_void, desc: *const u8,
         errors: Mutex::new((0, None)),
         failed_since_status: AtomicI32::new(S_OK),
         bcpack_fill: AtomicBool::new(bcpack_fill_from_env()),
+        bcpack_placeholder: AtomicBool::new(bcpack_placeholder_enabled()),
     });
     let o = new_object(queue_vtbl(), inner);
     let hr = queue_qi(o, riid, out);
@@ -1275,6 +1437,25 @@ unsafe extern "system" fn queue_enqueue_request(p: *mut c_void, req: *const u8) 
     }
     let r = Request::parse(&*(req as *const [u8; REQUEST_BYTES]));
     if let Err(hr) = r.check(q.source_memory) {
+        // A BCPack mode with no block rebuild would fail every request with E_DECOMPRESSION at
+        // both stages; under the default switch it completes with a placeholder block instead.
+        if hr == E_DECOMPRESSION
+            && r.bcpack() != 0
+            && r.swizzle() == 0
+            && !super::bcpack::can_decode(r.bcpack())
+            && bcpack_placeholder_block(r.bcpack()).is_some()
+            && q.bcpack_placeholder.load(Ordering::Relaxed)
+        {
+            let dest_pages = if r.dest_physical_pages() {
+                match snapshot_page_array(r.destination, r.destination_page_offset, r.destination_size) {
+                    Ok(pages) => Some(pages),
+                    Err(hr) => return q.enqueue(Entry::Refused { hr, req: r, file: None, fill: None }),
+                }
+            } else {
+                None
+            };
+            return q.enqueue_placeholder(r, dest_pages);
+        }
         warn_once("EnqueueRequest", format_args!("refused ({hr:#x}): {r:x?}"));
         let mut fill = None;
         if hr == E_DECOMPRESSION && r.bcpack() != 0 {
@@ -1363,7 +1544,7 @@ unsafe extern "system" fn queue_cancel(p: *mut c_void, mask: u64, value: u64) {
     let q = queue(p);
     let cutoff = {
         let mut pend = q.pending.lock().unwrap();
-        pend.entries.retain(|e| !matches!(e, Entry::Request { req, .. } if req.tag & mask == value));
+        pend.entries.retain(|e| !matches!(e, Entry::Request { req, .. } | Entry::Placeholder { req, .. } if req.tag & mask == value));
         pend.next_seq.saturating_sub(1)
     };
     if cutoff == 0 {
@@ -1473,6 +1654,35 @@ unsafe extern "system" fn queue_query(p: *mut c_void, out: *mut u8) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One test at a time changes the process environment.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// An environment variable set for the lifetime, restored on drop.
+    struct EnvVar(&'static str, Option<std::ffi::OsString>);
+
+    impl EnvVar {
+        fn set(k: &'static str, v: &str) -> EnvVar {
+            let old = std::env::var_os(k);
+            std::env::set_var(k, v);
+            EnvVar(k, old)
+        }
+
+        fn clear(k: &'static str) -> EnvVar {
+            let old = std::env::var_os(k);
+            std::env::remove_var(k);
+            EnvVar(k, old)
+        }
+    }
+
+    impl Drop for EnvVar {
+        fn drop(&mut self) {
+            match self.1.take() {
+                Some(v) => std::env::set_var(self.0, v),
+                None => std::env::remove_var(self.0),
+            }
+        }
+    }
 
     fn request(options: u64, dst: u64, dst_size: u32, src: u64, offset: u64, src_size: u32) -> [u8; REQUEST_BYTES] {
         let mut b = [0u8; REQUEST_BYTES];
@@ -2486,6 +2696,9 @@ mod tests {
     #[test]
     fn a_refused_bcpack_request_is_filled_only_under_the_switch() {
         unsafe {
+            // this test wants the refusal itself: turn off the placeholder for its queues
+            let _env = ENV_LOCK.lock().unwrap();
+            let _off = EnvVar::set("XCL_BCPACK_PLACEHOLDER", "0");
             let mut f = std::ptr::null_mut();
             assert_eq!(DStorageGetFactory(&IID_FACTORY, &mut f), S_OK);
             let vt = *(f as *const *const usize);
@@ -2532,6 +2745,102 @@ mod tests {
             assert!(dst[..n].chunks(16).all(|c| c == &block[..c.len()]), "solid BC7 blocks up to the destination size");
             assert!(dst[n..].iter().all(|&b| b == 0xCD), "nothing past the destination size");
             assert!(BCPACK.filled_bytes[7].load(Ordering::Relaxed) >= before + n as u64);
+            queue_close(q);
+            queue_release(q);
+            status_release(s);
+        }
+    }
+
+    /// A BC7 BCPack request (no decoder, no game data) completes under the default switch:
+    /// S_OK, the fence after it signals, and the destination holds the placeholder block. With
+    /// `XCL_BCPACK_PLACEHOLDER=0` it fails as before.
+    #[test]
+    fn an_undecodable_bcpack_request_completes_with_a_placeholder_block() {
+        let _env = ENV_LOCK.lock().unwrap();
+        // the block decodes as one mid-grey, opaque colour in the reference BC7 decoder
+        let block = bcpack_placeholder_block(7).unwrap();
+        assert_eq!(block, BC7_GREY.to_vec());
+        assert!(bc7_mode6_texels(&block).iter().all(|t| *t == [127, 127, 127, 255]), "BC7 placeholder: mid grey, opaque");
+        assert_eq!((bcpack_placeholder_block(8), bcpack_placeholder_block(0)), (None, None), "no block size: still refused");
+        unsafe {
+            let mut f = std::ptr::null_mut();
+            assert_eq!(DStorageGetFactory(&IID_FACTORY, &mut f), S_OK);
+            let vt = *(f as *const *const usize);
+            let create_queue: unsafe extern "system" fn(*mut c_void, *const u8, *const GUID, *mut *mut c_void) -> HRESULT = std::mem::transmute(*vt.add(3));
+            let create_status: unsafe extern "system" fn(*mut c_void, u32, *const u8, *const GUID, *mut *mut c_void) -> HRESULT = std::mem::transmute(*vt.add(5));
+            let mut desc = [0u8; 0x18];
+            desc[0..4].copy_from_slice(&1u32.to_le_bytes());
+            desc[8..10].copy_from_slice(&8u16.to_le_bytes());
+            desc[10] = 2;
+            let new_queue = |f: *mut c_void, cap: u32| {
+                let mut q = std::ptr::null_mut();
+                assert_eq!(create_queue(f, desc.as_ptr(), &IID_QUEUE, &mut q), S_OK);
+                let mut s = std::ptr::null_mut();
+                assert_eq!(create_status(f, cap, std::ptr::null(), &IID_STATUS_ARRAY, &mut s), S_OK);
+                (q, s)
+            };
+            let packed = [0x5Au8; 64];
+            let table = |q: *mut c_void| {
+                let qv = *(q as *const *const usize);
+                (
+                    std::mem::transmute::<usize, unsafe extern "system" fn(*mut c_void, *const u8)>(*qv.add(3)),
+                    std::mem::transmute::<usize, unsafe extern "system" fn(*mut c_void, *mut c_void, u32)>(*qv.add(4)),
+                    std::mem::transmute::<usize, unsafe extern "system" fn(*mut c_void)>(*qv.add(6)),
+                )
+            };
+            // one request of `mode` blocks through q/s; its status once the worker got there
+            let run = |q: *mut c_void, s: *mut c_void, dst: &mut [u8], n: u32, mode: u64, index: u32| {
+                let (enqueue, status, submit) = table(q);
+                let r = request(SOURCE_MEMORY_BIT | mode << BCPACK_SHIFT, dst.as_mut_ptr() as u64, n, packed.as_ptr() as u64, 0, packed.len() as u32);
+                enqueue(q, r.as_ptr());
+                status(q, s, index);
+                submit(q);
+                let sv = *(s as *const *const usize);
+                let complete: unsafe extern "system" fn(*mut c_void, u32) -> bool = std::mem::transmute(*sv.add(3));
+                let hresult: unsafe extern "system" fn(*mut c_void, u32) -> HRESULT = std::mem::transmute(*sv.add(4));
+                let t = std::time::Instant::now();
+                while !complete(s, index) && t.elapsed().as_secs() < 5 {
+                    std::thread::yield_now();
+                }
+                hresult(s, index)
+            };
+
+            // default: the destination gets the block, the request succeeds and counts
+            let _on = EnvVar::clear("XCL_BCPACK_PLACEHOLDER");
+            let (q, s) = new_queue(f, 8);
+            let n = 0x1008usize; // a part block at the end
+            let mut dst = vec![0xCDu8; n + 64];
+            let before = PLACEHOLDERS.requests[7].load(Ordering::Relaxed);
+            assert_eq!(run(q, s, &mut dst, n as u32, 7, 0), S_OK, "the placeholder completes");
+            assert!(dst[..n].chunks(16).all(|c| c == &block[..c.len()]), "solid BC7 blocks up to the destination size");
+            assert!(dst[n..].iter().all(|&b| b == 0xCD), "nothing past the destination size");
+            assert!(PLACEHOLDERS.requests[7].load(Ordering::Relaxed) > before, "the placeholder is counted");
+
+            // the signal enqueued after it reaches the fence, as for a normal request
+            let (_, _, submit) = table(q);
+            let fence = MockFence { vtbl: mock_fence_vtbl().as_ptr(), refs: AtomicU32::new(1), signalled: AtomicU64::new(0) };
+            queue_enqueue_signal(q, &fence as *const MockFence as *mut c_void, 41);
+            submit(q);
+            let t = std::time::Instant::now();
+            while fence.signalled.load(Ordering::Acquire) != 41 && t.elapsed().as_secs() < 5 {
+                std::thread::yield_now();
+            }
+            assert_eq!(fence.signalled.load(Ordering::Acquire), 41, "the fence signals after the placeholder");
+
+            // a mode whose block size is not known is still refused
+            let mut dst8 = vec![0xCDu8; n + 64];
+            assert_eq!(run(q, s, &mut dst8, n as u32, 8, 1), E_DECOMPRESSION, "mode 8 has no block");
+            assert!(dst8.iter().all(|&b| b == 0xCD), "mode 8 writes nothing");
+            queue_close(q);
+            queue_release(q);
+            status_release(s);
+
+            // opt-out: the same BC7 request fails as before and writes nothing
+            let _off = EnvVar::set("XCL_BCPACK_PLACEHOLDER", "0");
+            let (q, s) = new_queue(f, 4);
+            let mut dst0 = vec![0xCDu8; n + 64];
+            assert_eq!(run(q, s, &mut dst0, n as u32, 7, 0), E_DECOMPRESSION, "with XCL_BCPACK_PLACEHOLDER=0 it fails");
+            assert!(dst0.iter().all(|&b| b == 0xCD), "with XCL_BCPACK_PLACEHOLDER=0 the destination is left as it was");
             queue_close(q);
             queue_release(q);
             status_release(s);
