@@ -1966,3 +1966,23 @@ Little is left to do without the exe – the rest needs an actual run of the gam
 5. Smaller: whole-wave reductions of compute / mesh programs in partial waves (VS / PS done), `image_sample_o` with an offset from a VGPR,
    smaller HLSL, further XGameRuntime APIs (XGameUI, XNetworking…), GameInput → system GameInput.dll,
    mapping physical pages at the game's address.
+
+## Console ABI and memory-API gaps closed (2026-11-23)
+
+Three behaviours measured on the console side of a large retail title, re-implemented here:
+- **Struct-returning GetDesc, either argument order.** Console x64 callers pass the 16-byte structure's return
+  buffer first (`(ret, heap)` / `(ret, queue)`) instead of the PC C++ `(this, ret)`, as they already do for the
+  device's `GetResourceAllocationInfo` and `GetCustomHeapProperties` (`real::this_first`). Heap #8
+  (`heap_get_desc_x`) and queue #18 (`queue_dispatch`) now take both orders, told apart by which argument is an
+  adopted object; the old code called the PC method with the buffer as `this` and wrote the description over the
+  object's vtable pointer. Only the older queue layout's #18 is a GetDesc (newer: GetTimestampFrequency).
+  Tests: `queue_get_desc_accepts_the_console_argument_order`, `heap_get_desc_accepts_the_console_argument_order`
+  (fake adopted objects; both orders, a return buffer holding a stale vtable copy, the object left untouched).
+- **`XMemGetWriteWatch` / `XMemResetWriteWatch`** (kernelx): the host `GetWriteWatch` / `ResetWriteWatch`. XCL's
+  GPU-visible title memory is already write-watched (`reserve_watched`, the graphics reservations
+  `title_textures` watches), so the calls answer for it; memory Windows did not watch fails as the host call does.
+  Test: `xmem_write_watch_reports_and_resets_dirty_pages`.
+- **`XSystemGetAppMemoryUsageLimit` / `XSystemGetAppMemoryUsage`** (XGameRuntime): the title's budget in bytes and
+  the process's commit capped at it – the numbers `XMemGetWorkingSetStatistics` and `TitleMemoryStatus` report.
+  Titles size pools and streaming from them. Test added to `system_info`.
+- `XMemIsToolsMemAvailable` answers FALSE (no development-kit tools memory on a PC).
