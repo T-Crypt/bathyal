@@ -971,6 +971,8 @@ fn console_slots(kind: Kind) -> Vec<(usize, usize)> {
         Kind::DescriptorHeap => vec![(9, heap_cpu_start_x as usize), (10, heap_gpu_start_x as usize)],
         Kind::Resource => vec![(11, res_gpu_va_x as usize)],
         Kind::Fence => vec![(12, super::fence_x::completed_value_address as usize)],
+        // the console's allocator callback (slot 9; the PC chain ends at Reset #8)
+        Kind::CommandAllocator => vec![(9, alloc_set_callback_x as usize)],
         // the title's calls from #14 on: Signal / Wait / … / SignalX / PresentX at the slots of
         // its runtime's layout (`queue_dispatch`)
         Kind::CommandQueue => QUEUE_SLOTS.iter().enumerate().map(|(k, &f)| (QUEUE_FIRST + k, f as usize)).collect(),
@@ -1041,6 +1043,13 @@ fn console_slots(kind: Kind) -> Vec<(usize, usize)> {
                 (90, l::write32_bottom_of_shader_x as usize),
                 (93, l::kickoff_x as usize),
                 (94, l::set_depth_bias_x as usize),
+                // GDS ordered-append counter setup (console-only: XCL does not emulate GDS, so
+                // #76 / #77 WriteGDSX / ReadGDSX are no-ops too)
+                (75, l::setup_ordered_append_counter_x as usize),
+                // pipeline syncs at the top / bottom of the pipe; PC list order and the wait
+                // after each submission make them no-ops (see `list_x`)
+                (131, l::sync_top_of_pipe_x as usize),
+                (132, l::sync_bottom_of_pipe_x as usize),
                 // DispatchMesh after RSSetShadingRate / RSSetShadingRateImage (#124 / #125) as on
                 // the PC – inferred, see `bind::dispatch_mesh`
                 (126, b::dispatch_mesh as usize),
@@ -5145,12 +5154,23 @@ fn is_fence(p: usize) -> bool {
     p != 0 && FENCES.read().unwrap_or_else(|e| e.into_inner()).contains(&p)
 }
 
+/// Command allocator #9 SetAllocatorCallbackX(callback, context, ...): the console's command
+/// memory allocator callback. XCL keeps command memory in PC allocator objects, so it never
+/// calls the title's callback. Record it and answer S_OK.
+unsafe extern "system" fn alloc_set_callback_x(this: *mut c_void, callback: usize, context: usize) -> HRESULT {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        crate::xlog_info!("D3D12.X: ID3D12CommandAllocator::#9 SetAllocatorCallbackX({callback:#x}, {context:#x}) on {this:p}");
+    });
+    S_OK
+}
+
 /// first queue slot `queue_dispatch` handles
 const QUEUE_FIRST: usize = 14;
 
 /// A title's call of queue slot `slot` (arguments as integers; Signal / Wait / SignalX /
-/// PresentX / GetTimestampFrequency / GetClockCalibration / GetDesc all fit).
-unsafe fn queue_dispatch(slot: usize, this: *mut c_void, a1: usize, a2: usize, a3: usize, a4: usize) -> usize {
+/// PresentX / GetTimestampFrequency / GetClockCalibration / GetDesc / page mappings all fit).
+unsafe fn queue_dispatch(slot: usize, this: *mut c_void, a1: usize, a2: usize, a3: usize, a4: usize, a5: usize) -> usize {
     const PC_SIGNAL: usize = 14;
     const PC_WAIT: usize = 15;
     const PC_TIMESTAMP_FREQUENCY: usize = 16;
@@ -5204,6 +5224,12 @@ unsafe fn queue_dispatch(slot: usize, this: *mut c_void, a1: usize, a2: usize, a
             f(this, a1)
         }
         23 => q_signal_x(this, a1 as *mut c_void, a2 as u64, a3 as u32) as u32 as usize,
+        // the newer layout's #31 (older #29): CopyPageMappingsBatchX(count, batches, pool,
+        // pool pages, flags). The console maps physical pages of a registered pool into a
+        // placed tiled resource through its GPU page tables. XCL exposes the title's memory
+        // at its own addresses instead (unified memory and sparse windows, `sparse.rs`), so
+        // there is no page table to change; the call is validated and answered S_OK.
+        29 if shifted => q_copy_page_mappings_batch(a1 as u32, a2 as *const c_void, a3 as u64, a4 as u32, a5 as u32) as u32 as usize,
         30 => super::present::present_x(this, a1 as u32, a2 as *const u8, a3 as *const u8) as u32 as usize,
         // the newer layout's #35: ExecuteCommandListsX(count, lists, a value, flags) – a retail
         // game submits all its command lists this way (flags 3; 0 for the one it recorded at
@@ -5230,7 +5256,7 @@ unsafe fn queue_dispatch(slot: usize, this: *mut c_void, a1: usize, a2: usize, a
                     }
                 }
             };
-            let _ = a4;
+            let _ = (a4, a5);
             stubs::record_call(info, 0);
             0
         }
@@ -5240,9 +5266,9 @@ unsafe fn queue_dispatch(slot: usize, this: *mut c_void, a1: usize, a2: usize, a
 macro_rules! queue_slots {
     ($($slot:literal),*) => {
         /// the title's entry for each queue slot from `QUEUE_FIRST`
-        static QUEUE_SLOTS: &[unsafe extern "system" fn(*mut c_void, usize, usize, usize, usize) -> usize] = &[$({
-            unsafe extern "system" fn f(this: *mut c_void, a1: usize, a2: usize, a3: usize, a4: usize) -> usize {
-                queue_dispatch($slot, this, a1, a2, a3, a4)
+        static QUEUE_SLOTS: &[unsafe extern "system" fn(*mut c_void, usize, usize, usize, usize, usize) -> usize] = &[$({
+            unsafe extern "system" fn f(this: *mut c_void, a1: usize, a2: usize, a3: usize, a4: usize, a5: usize) -> usize {
+                queue_dispatch($slot, this, a1, a2, a3, a4, a5)
             }
             f
         }),*];
@@ -5262,6 +5288,22 @@ unsafe extern "system" fn q_signal_x(this: *mut c_void, fence: *mut c_void, valu
         super::fence_x::note_queue_signal(fence as usize, value);
     }
     hr
+}
+
+/// queue #31 (newer layout; older #29) CopyPageMappingsBatchX(count, batches, pool,
+/// pool pages, flags): the console maps physical pages of a registered page pool into a
+/// placed tiled resource through its GPU page tables. XCL does not model console page tables:
+/// the title's memory is visible to the GPU at its own addresses (unified memory and sparse
+/// windows), and the pages are committed there. Validate the call and answer S_OK.
+unsafe extern "system" fn q_copy_page_mappings_batch(count: u32, batches: *const c_void, pool: u64, pool_pages: u32, flags: u32) -> HRESULT {
+    if count > 0 && batches.is_null() {
+        return E_INVALIDARG;
+    }
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        crate::xlog_info!("D3D12.X: queue #31 CopyPageMappingsBatchX({count} batches, pool {pool:#x}, {pool_pages} pages, flags {flags:#x}) – title pages are already GPU-visible in unified memory");
+    });
+    S_OK
 }
 
 /// Fence::Signal (CPU)
@@ -5800,18 +5842,36 @@ mod queue_tests {
         QUEUE_OLDER.store(false, Ordering::Release);
         unsafe {
             let mut out = [0xAAAA_AAAAu32; 4];
-            let r = queue_dispatch(18, this, out.as_mut_ptr() as usize, 0, 0, 0);
+            let r = queue_dispatch(18, this, out.as_mut_ptr() as usize, 0, 0, 0, 0);
             assert_eq!(r, out.as_ptr() as usize);
             assert_eq!(out, [1, 2, 0xAAAA_AAAA, 0xAAAA_AAAA], "only the first 8 bytes");
             FENCES.write().unwrap().push(fence);
-            queue_dispatch(14, this, fence, 1, 0, 0);
+            queue_dispatch(14, this, fence, 1, 0, 0, 0);
             FENCES.write().unwrap().retain(|&f| f != fence);
             assert!(QUEUE_OLDER.load(Ordering::Acquire) && !QUEUE_SHIFTED.load(Ordering::Acquire));
             let mut out = [0xAAAA_AAAAu32; 4];
-            queue_dispatch(18, this, out.as_mut_ptr() as usize, 0, 0, 0);
+            queue_dispatch(18, this, out.as_mut_ptr() as usize, 0, 0, 0, 0);
             assert_eq!(out, [1, 2, 3, 4], "older layout: the whole description");
         }
         QUEUE_OLDER.store(false, Ordering::Release);
+    }
+
+    /// Queue #31 on the newer layout is CopyPageMappingsBatchX: it is validated and answered
+    /// S_OK without touching the PC queue (XCL keeps title pages GPU-visible itself).
+    #[test]
+    fn queue_slot_31_validates_page_mapping_batches() {
+        let shifted = QUEUE_SHIFTED.swap(true, Ordering::AcqRel);
+        QUEUE_OLDER.store(false, Ordering::Release);
+        unsafe {
+            let null = std::ptr::null_mut();
+            assert_eq!(queue_dispatch(31, null, 0, 0, 0, 0, 0), S_OK as u32 as usize);
+            assert_eq!(
+                queue_dispatch(31, null, 1, 0, 0x1000, 1, 0),
+                E_INVALIDARG as u32 as usize,
+                "a non-zero count needs a batch array"
+            );
+        }
+        QUEUE_SHIFTED.store(shifted, Ordering::Release);
     }
 }
 
@@ -5845,6 +5905,19 @@ mod srv_tests {
         let mut d2 = cube;
         d2.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
         assert!(cube_as_cube_array(&d2).is_none());
+    }
+
+    #[test]
+    fn console_slots_register_the_allocator_and_list_extensions() {
+        let alloc = console_slots(Kind::CommandAllocator);
+        assert_eq!(alloc, vec![(9, alloc_set_callback_x as usize)]);
+        unsafe {
+            assert_eq!(alloc_set_callback_x(std::ptr::null_mut(), 0x1234, 0x5678), S_OK);
+        }
+        let list = console_slots(Kind::CommandList);
+        for slot in [75, 131, 132] {
+            assert!(list.iter().any(|&(s, _)| s == slot), "command list slot {slot} must be registered");
+        }
     }
 }
 

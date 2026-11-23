@@ -150,11 +150,17 @@ fn vtable(kind: Kind) -> *const usize {
             v[17] = Queue_GetClockCalibration as usize;
             v[18] = Hidden_ZeroDesc16 as usize; // GetDesc
         }
-        Kind::CommandAllocator => v[8] = Ret_S_OK as usize, // Reset
+        Kind::CommandAllocator => {
+            v[8] = Ret_S_OK as usize; // Reset
+            v[9] = Ret_S_OK as usize; // SetAllocatorCallbackX (console)
+        }
         Kind::CommandList => {
             v[8] = Ret_Zero as usize; // GetType → DIRECT
             v[9] = Ret_S_OK as usize; // Close
             v[10] = Ret_S_OK as usize; // Reset
+            v[75] = Ret_Void as usize; // SetupOrderedAppendCounterX (no GDS)
+            v[131] = Ret_Zero as usize; // SyncTopOfPipeX
+            v[132] = Ret_Zero as usize; // SyncBottomOfPipeX
         }
         Kind::Fence => {
             v[8] = Fence_GetCompletedValue as usize;
