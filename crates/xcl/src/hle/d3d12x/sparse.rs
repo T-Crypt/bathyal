@@ -223,6 +223,8 @@ struct State {
     pinned: FxHashMap<(u32, u32), u32>,
     /// placed buffers → the pool tiles they use
     buffers: FxHashMap<usize, Vec<(u32, u32)>>,
+    /// placed buffers → the title address they cover (for the GPU-visible watch set)
+    spans: FxHashMap<usize, (usize, usize)>,
     /// reused tiles / decommitted partial pages to clear: (address, bytes)
     to_zero: Vec<(usize, usize)>,
     /// ring-buffered upload staging heap (`STAGING` bytes, persistently mapped)
@@ -463,6 +465,50 @@ pub fn mapped_gen() -> u64 {
     MAPPED_GEN.load(Ordering::Acquire)
 }
 
+/// Spans of the title's memory that a GPU-visible object covers: what `alloc` / `alloc_in`
+/// handed out (XMem graphics, console and view heaps, XCL's own arenas), placed buffers, and
+/// the descriptor heaps XCL places in the title's memory – with a use count, since a placed
+/// buffer can cover memory that also came from an allocation.
+///
+/// A raw commit of a title reservation (`committed`, from `VirtualAlloc(MEM_COMMIT)` inside a
+/// sparse window) is not here: on the console all of a reservation is GPU-visible, and a title
+/// may hand the GPU an address of it that XCL never saw. So the write-watch keeps every mapped
+/// tile unless `XCL_WATCH_TILES=covered` asks for this set; `visible_ranges` is what that set
+/// is, and the covered share of the mapped tiles is logged for the title's own layout.
+static VISIBLE: Mutex<BTreeMap<usize, (usize, u32)>> = Mutex::new(BTreeMap::new());
+static VISIBLE_GEN: AtomicU64 = AtomicU64::new(0);
+
+/// Generation counter of `visible_ranges()`.
+pub fn visible_gen() -> u64 {
+    VISIBLE_GEN.load(Ordering::Acquire)
+}
+
+/// `[a, a + n)` is covered by a GPU-visible object now (see `VISIBLE`).
+pub fn note_visible(a: usize, n: usize) {
+    if n == 0 {
+        return;
+    }
+    let mut v = VISIBLE.lock().unwrap();
+    let span = v.entry(a).or_insert((n, 0));
+    span.0 = span.0.max(n);
+    span.1 += 1;
+    VISIBLE_GEN.fetch_add(1, Ordering::Release);
+}
+
+/// The span at `a` is covered no more (the object or the allocation is gone). Keyed by its base:
+/// a heap XCL places at an address an allocation already gave it is the same span.
+pub fn note_hidden(a: usize, _n: usize) {
+    let mut v = VISIBLE.lock().unwrap();
+    match v.get_mut(&a) {
+        Some((_, c)) if *c > 1 => *c -= 1,
+        Some(_) => {
+            v.remove(&a);
+        }
+        None => {}
+    }
+    VISIBLE_GEN.fetch_add(1, Ordering::Release);
+}
+
 fn buffer_desc(bytes: u64) -> D3D12_RESOURCE_DESC {
     D3D12_RESOURCE_DESC {
         Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
@@ -530,6 +576,7 @@ pub unsafe fn init(dev: &ID3D12Device) -> Vec<(usize, usize, u64)> {
             mapped: FxHashMap::default(),
             pinned: FxHashMap::default(),
             buffers: FxHashMap::default(),
+            spans: FxHashMap::default(),
             to_zero: Vec::new(),
             staging: None,
             ring_write: 0,
@@ -1209,6 +1256,7 @@ pub unsafe fn alloc(size: usize, align: usize) -> Option<(usize, usize)> {
         return None;
     }
     committed(addr, rounded);
+    note_visible(addr, rounded);
     Some((addr, rounded))
 }
 
@@ -1222,6 +1270,7 @@ pub unsafe fn alloc_in(window: usize, size: usize, align: usize) -> Option<(usiz
         return None;
     }
     committed(addr, rounded);
+    note_visible(addr, rounded);
     Some((addr, rounded))
 }
 
@@ -1232,6 +1281,7 @@ pub unsafe fn free(p: usize) -> bool {
         return false;
     }
     let Some(len) = u.sparse_release(p) else { return false };
+    note_hidden(p, len);
     decommitted(p, len);
     VirtualFree(p as *mut c_void, len, MEM_DECOMMIT);
     true
@@ -1398,6 +1448,50 @@ pub fn stats() -> Option<(usize, usize)> {
     Some((s.mapped.len(), s.pools.len()))
 }
 
+/// The tile runs of `spans` that a mapped tile covers, sorted and disjoint: a merge of two
+/// sorted lists.
+fn clip_to_mapped(spans: &[(usize, usize)], mapped: &[(usize, usize)]) -> Vec<(usize, usize)> {
+    let mut out: Vec<(usize, usize)> = Vec::new();
+    let mut m = 0usize;
+    for &(a, n) in spans {
+        let end = a.saturating_add(n);
+        while m < mapped.len() && mapped[m].1 <= a {
+            m += 1;
+        }
+        let mut k = m;
+        while k < mapped.len() && mapped[k].0 < end {
+            let (lo, hi) = (a.max(mapped[k].0), end.min(mapped[k].1));
+            // a span inside one that is already there adds nothing (a placed buffer in an allocation)
+            let lo = lo.max(out.last().map_or(lo, |last| last.1));
+            if lo < hi {
+                match out.last_mut() {
+                    Some(last) if last.1 == lo => last.1 = hi,
+                    _ => out.push((lo, hi)),
+                }
+            }
+            if mapped[k].1 >= end {
+                break;
+            }
+            k += 1;
+        }
+    }
+    out
+}
+
+/// The tiles a GPU-visible object covers, as sorted (start, end) runs clipped to the tiles with
+/// video memory: `mapped_ranges` narrowed to what resources actually cover.
+pub fn visible_ranges() -> Vec<(usize, usize)> {
+    let mut spans: Vec<(usize, usize)> = {
+        let v = VISIBLE.lock().unwrap();
+        if v.is_empty() {
+            return Vec::new();
+        }
+        v.iter().map(|(&a, &(n, _))| (a, n)).collect()
+    };
+    spans.sort_unstable();
+    clip_to_mapped(&spans, &mapped_ranges())
+}
+
 /// The sparse windows' tiles with video memory as sorted (start, end) runs: where a CPU write
 /// has to reach the GPU.
 pub fn mapped_ranges() -> Vec<(usize, usize)> {
@@ -1557,7 +1651,9 @@ pub unsafe fn place_buffer(this: *mut c_void, va: usize, desc: &D3D12_RESOURCE_D
         *s.pinned.entry(tile).or_default() += 1;
     }
     s.buffers.insert(raw as usize, tiles.iter().map(|x| x.1).collect());
+    s.spans.insert(raw as usize, (va, bytes));
     s.signal();
+    note_visible(va, bytes);
     Some((hr, delta))
 }
 
@@ -1575,11 +1671,52 @@ pub fn forget_buffer(res: usize) {
             }
         }
     }
+    let span = s.spans.remove(&res);
+    drop(g);
+    if let Some((va, bytes)) = span {
+        note_hidden(va, bytes);
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The GPU-visible spans keep only the mapped tiles, merged, and a span inside one that is
+    /// already watched adds nothing.
+    #[test]
+    fn visible_spans_are_clipped_to_mapped_tiles() {
+        let mapped = [(0x2_0000, 0x4_0000), (0xA_0000, 0xB_0000), (0x14_0000, 0x16_0000)];
+        // a span across a mapped run and a gap, one before it, one inside a watched run, one
+        // that only touches its start
+        let spans = [(0x2_0000, 0x9_0000), (0x0, 0x2_0000), (0xA_0800, 0x1_0000), (0xA_0000, 0x100)];
+        assert_eq!(clip_to_mapped(&spans, &mapped), vec![(0x2_0000, 0x4_0000), (0xA_0000, 0xB_0000)]);
+        // nothing mapped under a span: nothing watched; an empty input stays empty
+        assert_eq!(clip_to_mapped(&[(0x5_0000, 0x1_0000)], &mapped), vec![]);
+        assert_eq!(clip_to_mapped(&[], &mapped), vec![]);
+        // two adjacent mapped runs under one span are one run
+        assert_eq!(clip_to_mapped(&[(0x2_0000, 0x2_0000)], &[(0x2_0000, 0x3_0000), (0x3_0000, 0x4_0000)]), vec![(0x2_0000, 0x4_0000)]);
+    }
+
+    /// A span is covered while any object covers it: a heap placed inside an allocation, then the
+    /// allocation freed, keeps the heap's span; the last owner takes it out.
+    #[test]
+    fn a_visible_span_lives_until_its_last_owner_is_gone() {
+        let base = 0x5_0000_0000usize;
+        let other = 0x5_1000_0000usize;
+        note_visible(base, 0x1_0000);
+        note_visible(base, 0x2000);
+        note_visible(other, 0x1_0000);
+        assert_eq!(VISIBLE.lock().unwrap().get(&base), Some(&(0x1_0000, 2)), "the longer span names it");
+        note_hidden(base, 0x1_0000);
+        assert_eq!(VISIBLE.lock().unwrap().get(&base), Some(&(0x1_0000, 1)), "one owner left");
+        note_hidden(base, 0x2000);
+        assert!(!VISIBLE.lock().unwrap().contains_key(&base), "no owner left");
+        note_hidden(base, 0x2000);
+        assert!(!VISIBLE.lock().unwrap().contains_key(&base), "a second hide does nothing");
+        assert!(VISIBLE.lock().unwrap().contains_key(&other));
+        note_hidden(other, 0x1_0000);
+    }
 
     #[test]
     fn aligned_tile_addresses_spread_across_hash_buckets() {
@@ -1752,6 +1889,7 @@ mod tests {
                 mapped: FxHashMap::default(),
                 pinned: FxHashMap::default(),
                 buffers: FxHashMap::default(),
+                spans: FxHashMap::default(),
                 to_zero: Vec::new(),
                 staging: None,
                 ring_write: 0,
