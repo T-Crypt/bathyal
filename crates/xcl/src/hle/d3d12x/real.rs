@@ -541,20 +541,22 @@ pub fn init() -> Result<String, String> {
     }
 }
 
-/// A debug layer message: errors and warnings into the log – the first 8 of each message id
-/// (3 000 in all). One cap for all of them (200) was used up in seconds by two per-frame state
-/// errors of a retail game, long before the message that came with its device removal.
+/// A debug layer message into the log: the first 20 errors and the first 8 warnings of each
+/// message id (3 000 in all). One cap for all of them (200) was used up in seconds by two
+/// per-frame state errors of a retail game, long before the message that came with its device
+/// removal.
 unsafe extern "system" fn debug_message(_category: D3D12_MESSAGE_CATEGORY, severity: D3D12_MESSAGE_SEVERITY, id: D3D12_MESSAGE_ID, text: windows::core::PCSTR, _context: *mut c_void) {
     static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     static PER_ID: Mutex<Option<HashMap<i32, u32>>> = Mutex::new(None);
     if severity.0 > D3D12_MESSAGE_SEVERITY_WARNING.0 {
         return;
     }
+    let cap = if severity.0 <= D3D12_MESSAGE_SEVERITY_ERROR.0 { 20 } else { 8 };
     {
         let mut g = PER_ID.lock().unwrap();
         let n = g.get_or_insert_with(HashMap::new).entry(id.0).or_insert(0);
         *n += 1;
-        if *n > 8 {
+        if *n > cap {
             return;
         }
     }
