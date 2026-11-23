@@ -8,6 +8,18 @@ use crate::config::Boot;
 
 pub static HOST_MODE: AtomicBool = AtomicBool::new(false);
 
+/// Validate that this CPU has the console Zen 2 instruction set extensions.
+/// Returns Ok(()) if all features are present or if XCL_SKIP_CPU_CHECK is set;
+/// returns Err(missing) listing any missing features.
+pub fn check_cpu_requirements() -> Result<(), Vec<&'static str>> {
+    let missing = crate::launcher::missing_console_cpu_features();
+    if missing.is_empty() || std::env::var_os("XCL_SKIP_CPU_CHECK").is_some() {
+        Ok(())
+    } else {
+        Err(missing)
+    }
+}
+
 pub fn host_main(boot_path: &Path) -> i32 {
     let boot: Boot = match std::fs::read_to_string(boot_path).map_err(|e| e.to_string()).and_then(|s| serde_json::from_str(&s).map_err(|e| e.to_string())) {
         Ok(b) => b,
@@ -29,6 +41,22 @@ pub fn host_main(boot_path: &Path) -> i32 {
         std::env::set_var("XCL_UMA_MB", boot.config.uma_mb.to_string());
     }
     crate::state::set_boot(boot.clone());
+
+    // the console's CPU is a Zen 2: its titles are compiled for it and fault with an illegal
+    // instruction (0xC000001D) on a PC without its extensions – said here instead
+    let missing = crate::launcher::missing_console_cpu_features();
+    if !missing.is_empty() {
+        if std::env::var_os("XCL_SKIP_CPU_CHECK").is_some() {
+            crate::xlog_warn!("this CPU lacks {} (XCL_SKIP_CPU_CHECK set, continuing)", missing.join(", "));
+            println!("  WARNING: this CPU lacks {} (XCL_SKIP_CPU_CHECK set, continuing)", missing.join(", "));
+        } else {
+            let msg = crate::launcher::format_missing_cpu_message(&missing);
+            crate::xlog_error!("{msg}");
+            eprintln!("xcl host: {msg}");
+            crate::report::write_final(Some(format!("CPU lacks required Zen 2 features: {}", missing.join(", "))));
+            return 0x7C1_0003;
+        }
+    }
     // `XCL_ACTIVITY=1`: every 2 s what the title did since (a timeline of where it stops)
     if std::env::var_os("XCL_ACTIVITY").is_some() {
         let _ = std::thread::Builder::new().name("xcl-activity".into()).spawn(|| {
@@ -145,4 +173,24 @@ pub fn host_main(boot_path: &Path) -> i32 {
     crate::report::write_final(None);
     crate::log::flush();
     code as i32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn host_cpu_validation() {
+        std::env::set_var("XCL_SKIP_CPU_CHECK", "1");
+        assert!(check_cpu_requirements().is_ok());
+        std::env::remove_var("XCL_SKIP_CPU_CHECK");
+
+        let result = check_cpu_requirements();
+        let expected_missing = crate::launcher::missing_console_cpu_features();
+        if expected_missing.is_empty() {
+            assert!(result.is_ok());
+        } else {
+            assert_eq!(result.unwrap_err(), expected_missing);
+        }
+    }
 }
