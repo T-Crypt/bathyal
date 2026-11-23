@@ -593,16 +593,16 @@ unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>) {
         let mut batch = Vec::new();
         let mut bytes = 0usize;
         let mut device = 0usize;
-        while let Some((_, (dev, _, _, tex, _))) = todo.peek() {
+        while let Some((_, (dev, _, tex, _))) = todo.peek() {
             if !batch.is_empty() && (bytes + tex.size() as usize > BATCH_BYTES || *dev != device) {
                 break;
             }
-            let (r, (dev, va, src, tex, states)) = todo.next().unwrap();
+            let (r, (dev, src, tex, states)) = todo.next().unwrap();
             device = dev;
             bytes += tex.size() as usize;
             let subs = subresources(src, &tex);
             if super::present::trace_frame() {
-                note_content(va, &r, &subs);
+                note_content(src, &r, &subs);
             }
             batch.push((r, subs, states));
         }
@@ -660,7 +660,7 @@ pub unsafe fn probe_gpu_content(res: usize) {
         }
         g.push(res);
     }
-    let Some((device, va, tex, gpu_written)) = TEXTURES.lock().unwrap().get(&res).map(|e| (e.device, e.src, Arc::clone(&e.tex), e.gpu_written)) else { return };
+    let Some((device, va, src, tex, gpu_written)) = TEXTURES.lock().unwrap().get(&res).map(|e| (e.device, e.va, e.src, Arc::clone(&e.tex), e.gpu_written)) else { return };
     let d = device as *mut c_void;
     let r = res as *mut c_void;
     let (Some(dev), Some(r)) = (ID3D12Device::from_raw_borrowed(&d), ID3D12Resource::from_raw_borrowed(&r)) else { return };
