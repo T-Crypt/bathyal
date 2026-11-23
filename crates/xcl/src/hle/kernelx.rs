@@ -876,6 +876,28 @@ struct Away {
 }
 static AWAY: std::sync::Mutex<Option<Away>> = std::sync::Mutex::new(None);
 
+/// Whether a physical page is mapped at the page holding `va` away from its home – committed
+/// or not yet (`lazy`: a page never used is committed at its first access).
+pub fn physical_page_at(va: usize) -> bool {
+    AWAY.lock().unwrap().as_ref().is_some_and(|a| a.at.contains_key(&(va & !(PHYS_PAGE - 1))))
+}
+
+/// Counts the calls that map or unmap physical pages in a GPU view (`mirrors`): what
+/// `physical_page_at` says there may have changed.
+static GPU_VIEW_MAP_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Generation of the physical-page mappings inside GPU views.
+pub fn gpu_view_map_gen() -> u64 {
+    GPU_VIEW_MAP_GEN.load(Ordering::Acquire)
+}
+
+/// Pages are mapped or unmapped at `va`: a GPU view's mappings changed if it lies in one.
+fn note_mapping_at(va: usize) {
+    if mirrors::source(va).is_some() {
+        GPU_VIEW_MAP_GEN.fetch_add(1, Ordering::Release);
+    }
+}
+
 /// Page numbers count 4 KiB frames, as on the console: a 64 KiB page's is a multiple of 16 (a retail game
 /// packs them shifted right by 4). Index 0 of unified memory is page 16 - 0 means "no page".
 const FRAMES: usize = PHYS_PAGE >> 12;
@@ -1141,6 +1163,7 @@ pub unsafe extern "system" fn FreeTitlePhysicalPages(_p: HANDLE, n: usize, arr: 
         for i in 0..n {
             if let Some(at) = away.page.remove(&*arr.add(i)) {
                 away.at.remove(&at);
+                note_mapping_at(at);
             }
         }
     }
@@ -1191,6 +1214,7 @@ pub unsafe extern "system" fn MapTitlePhysicalPages(va: *mut c_void, n: usize, _
 /// `MapTitlePhysicalPages` with `AWAY` held; the homes it moves away are given back by the
 /// caller (`give_back_homes`).
 unsafe fn map_pages(away: &mut Away, va: *mut c_void, n: usize, arr: *mut usize) -> *mut c_void {
+    note_mapping_at(va as usize);
     if crate::gpu::uma::get().is_none() || n == 0 || (va.is_null() && arr.is_null()) {
         fnd::SetLastError(fnd::ERROR_INVALID_PARAMETER);
         return std::ptr::null_mut();
