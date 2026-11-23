@@ -987,12 +987,10 @@ mod tests {
         let g = |wanted, gap| watch_ranges_gap(&regions, wanted, gap);
         let wanted = vec![(0x12000, 0x13000), (0x11000, 0x12800), (0x1F000, 0x41000), (0x60000, 0x61000)];
         assert_eq!(g(wanted, WATCH_GAP), vec![(0x11000, 0xF000), (0x40000, 0x10000)]);
-        // ranges a gap of 512 KiB apart: one scan; 47 MiB apart: two
-        let wanted = vec![(0x1000_0000, 0x1000_1000), (0x1008_0000, 0x1008_1000), (0x1300_0000, 0x1300_1000)];
-        assert_eq!(g(wanted.clone(), 16 << 20), vec![(0x1000_0000, 0x8_1000), (0x1300_0000, 0x1000)]);
-        // the default gap (a MiB, the measured break-even over a title's written memory) leaves
-        // an 8 MiB gap as a call of its own
-        assert_eq!(g(wanted, WATCH_GAP), vec![(0x1000_0000, 0x1000), (0x1008_0000, 0x1000), (0x1300_0000, 0x1000)]);
+        // ranges 16 MiB apart: one scan at a 16 MiB gap, two at the default 1 MiB
+        let wanted = vec![(0x1000_0000, 0x1000_1000), (0x1100_0000, 0x1100_1000), (0x1300_0000, 0x1300_1000)];
+        assert_eq!(g(wanted.clone(), 16 << 20), vec![(0x1000_0000, 0x10_1000), (0x1300_0000, 0x1000)]);
+        assert_eq!(g(wanted, WATCH_GAP), vec![(0x1000_0000, 0x1000), (0x1100_0000, 0x1000), (0x1300_0000, 0x1000)]);
         // a call costs more than the walk over a gap of up to `WATCH_GAP`: 8 MiB merges at 16, 40 MiB not
         let wanted = vec![(0x1000_0000, 0x1000_1000), (0x1080_1000, 0x1080_2000)];
         assert_eq!(g(wanted.clone(), 16 << 20), vec![(0x1000_0000, 0x80_2000)]);
