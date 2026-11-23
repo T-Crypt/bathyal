@@ -217,6 +217,12 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
     let pso = super::pso_async::resolve_wait(with(this, |s| s.pso));
     let (gfx, compute) = (super::real::is_translated_graphics(pso), super::real::is_translated_compute(pso));
     let (args_off, count_off) = (args_off + super::real::buffer_delta(args), count_off + super::real::buffer_delta(count_buf));
+    if let Some(tp) = super::real::two_pass_of(pso) {
+        // the group / vertex counts are in GPU memory: the record buffer cannot be sized here
+        count(DRAWS_SKIPPED);
+        note_skipped(format_args!("ExecuteIndirect with a console {} pipeline (two passes) skipped – not done yet", tp.kind));
+        return;
+    }
     if !gfx && !compute {
         return pc(this, sig, max, args, args_off, count_buf, count_off);
     }
@@ -315,6 +321,9 @@ fn cpu_rect_expansion(pso: usize) -> bool {
 /// #12 DrawInstanced
 pub(super) unsafe extern "system" fn draw_instanced(this: *mut c_void, vertices: u32, instances: u32, first_vertex: u32, first_instance: u32) {
     DRAW_ARGS.with(|d| d.set((false, vertices, instances, first_vertex, 0)));
+    if gs_draw(this, vertices, instances, first_vertex, None, first_instance).is_some() {
+        return;
+    }
     if let Some(list) = graphics_bound(this) {
         if draw_rects(this, &list, vertices, instances, first_vertex, first_instance) {
             return;
@@ -331,6 +340,10 @@ thread_local! {
 
 /// #13 DrawIndexedInstanced
 pub(super) unsafe extern "system" fn draw_indexed_instanced(this: *mut c_void, indices: u32, instances: u32, first_index: u32, base_vertex: i32, first_instance: u32) {
+    DRAW_ARGS.with(|d| d.set((true, indices, instances, first_index, base_vertex)));
+    if gs_draw(this, indices, instances, first_index, Some(base_vertex), first_instance).is_some() {
+        return;
+    }
     if let Some(list) = prepare_indexed_draw(this, indices, instances, first_index, base_vertex) {
         super::list_x::sync_title_buffers(this, Some((first_index, indices, base_vertex)), 0, 0, if first_instance != 0 { instances.max(2) } else { instances });
         emit_prepared_indexed_draw(&list, indices, instances, first_index, base_vertex, first_instance);
@@ -368,6 +381,13 @@ unsafe fn graphics_bound(this: *mut c_void) -> Option<ID3D12GraphicsCommandList>
     let list = ID3D12GraphicsCommandList::from_raw_borrowed(&this)?.clone();
     let pso = with(this, |s| s.pso);
     // a pipeline still being built in the background is waited for (its stand-in draws nothing)
+    if super::real::two_pass_of(super::pso_async::resolve_wait(pso)).is_some() {
+        // a draw XCL does not run in two passes (DrawIndexedX): a mesh pipeline draws no
+        // vertices on the PC
+        count(DRAWS_SKIPPED);
+        note_skipped(format_args!("a draw with a pipeline in two passes that is not run that way (DrawIndexedX) skipped"));
+        return None;
+    }
     if !super::real::is_translated_graphics(super::pso_async::resolve_wait(pso)) {
         count(DRAWS_PC);
         if super::present::trace_frame() {
@@ -815,6 +835,38 @@ unsafe fn translated_dispatch(this: *mut c_void, list: &ID3D12GraphicsCommandLis
 /// arguments the console's way – compute or graphics) and the argument table in unified
 /// memory, u1 res, u2… the memory windows; then the pipeline.
 unsafe fn bind_abi(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usize, gfx: bool) -> Result<(), String> {
+    // a pipeline still being built in the background is waited for
+    let real = super::pso_async::resolve_wait(pso);
+    let views = abi_views(this, real, gfx, None, &[])?;
+    let rs = super::real::pso_root_signature(real).or_else(|| super::real::abi_rs_cached().map(|p| p as usize)).ok_or("no XCL ABI root signature")?;
+    let rs = rs as *mut c_void;
+    let rs = ID3D12RootSignature::from_raw_borrowed(&rs).ok_or("root signature")?;
+    set_abi(list, rs, &views, gfx);
+    let real = real as *mut c_void;
+    let pc = ID3D12PipelineState::from_raw_borrowed(&real).ok_or("pipeline")?;
+    list.SetPipelineState(pc);
+    Ok(())
+}
+
+/// The ABI root signature `rs` and its six root UAVs `views` on the compute or graphics side.
+unsafe fn set_abi(list: &ID3D12GraphicsCommandList, rs: &ID3D12RootSignature, views: &[u64], gfx: bool) {
+    if gfx {
+        list.SetGraphicsRootSignature(rs);
+        for (k, v) in views.iter().enumerate() {
+            list.SetGraphicsRootUnorderedAccessView(k as u32, *v);
+        }
+    } else {
+        list.SetComputeRootSignature(rs);
+        for (k, v) in views.iter().enumerate() {
+            list.SetComputeRootUnorderedAccessView(k as u32, *v);
+        }
+    }
+}
+
+/// The GPU addresses of the ABI's root UAVs for the kept arguments (compute or graphics):
+/// u0 io (the user SGPRs, `io_patch` written over them), u1 res (`res`, or 256 bytes of its
+/// own), u2… the memory windows.
+unsafe fn abi_views(this: *mut c_void, real: usize, gfx: bool, res: Option<u64>, io_patch: &[(usize, u32)]) -> Result<Vec<u64>, String> {
     let u = crate::gpu::uma::get().ok_or("no unified memory")?;
     let windows = super::real::uma_window_vas();
     let first = *windows.first().ok_or("unified memory is not open on the GPU")?;
@@ -825,8 +877,6 @@ unsafe fn bind_abi(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usi
         std::ptr::copy_nonoverlapping(bytes.as_ptr(), p, bytes.len());
         Ok(p as usize)
     };
-    // a pipeline still being built in the background is waited for
-    let real = super::pso_async::resolve_wait(pso);
     // a compute shader takes no more arguments from registers than it has (`inline_for`)
     let user_sgprs = if gfx { None } else { super::real::pso_user_sgprs(real) };
     let inline = layout.as_ref().map_or(0, |l| if gfx { l.inline_gfx } else { console_list::inline_for(l, user_sgprs) } as usize).min(args.len());
@@ -837,28 +887,262 @@ unsafe fn bind_abi(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usi
         None => vec![table_at as u32, (table_at >> 32) as u32],
     };
     io.resize(crate::gpu::recomp::KERNEL_SGPRS, 0);
-    let io_at = copy(&io.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<u8>>())?;
-    let res_at = copy(&[0u8; 256])?;
-    let va = |p: usize| super::real::uma_va_of(p).unwrap_or(first);
-    let rs = super::real::pso_root_signature(real).or_else(|| super::real::abi_rs_cached().map(|p| p as usize)).ok_or("no XCL ABI root signature")?;
-    let rs = rs as *mut c_void;
-    let rs = ID3D12RootSignature::from_raw_borrowed(&rs).ok_or("root signature")?;
-    let views = [va(io_at), va(res_at)].into_iter().chain((0..4).map(|k| windows.get(k).copied().unwrap_or(first)));
-    if gfx {
-        list.SetGraphicsRootSignature(rs);
-        for (k, v) in views.enumerate() {
-            list.SetGraphicsRootUnorderedAccessView(k as u32, v);
-        }
-    } else {
-        list.SetComputeRootSignature(rs);
-        for (k, v) in views.enumerate() {
-            list.SetComputeRootUnorderedAccessView(k as u32, v);
+    for &(k, v) in io_patch {
+        if let Some(w) = io.get_mut(k) {
+            *w = v;
         }
     }
-    let real = real as *mut c_void;
-    let pc = ID3D12PipelineState::from_raw_borrowed(&real).ok_or("pipeline")?;
-    list.SetPipelineState(pc);
+    let io_at = copy(&io.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<u8>>())?;
+    let va = |p: usize| super::real::uma_va_of(p).unwrap_or(first);
+    let res = match res {
+        Some(r) => r,
+        None => va(copy(&[0u8; 256])?),
+    };
+    Ok([va(io_at), res].into_iter().chain((0..4).map(|k| windows.get(k).copied().unwrap_or(first))).collect())
+}
+
+// ---------------------------------------------------------------------------------------
+// pipelines in two passes (console MS / NGG and legacy GS: `real::TwoPassPso`)
+// ---------------------------------------------------------------------------------------
+
+/// D3D12's limit on thread groups in one dimension of a dispatch
+const MAX_GROUPS: u32 = 65535;
+
+/// ID3D12GraphicsCommandList6::DispatchMesh on the PC
+const PC_DISPATCH_MESH: usize = 79;
+
+/// Unified memory for this recording in window 0 – what `mem` (u2) holds, the memory a
+/// 32-bit console address names – freed when the list's allocator is reset. GPU data only: in
+/// the runtime layout window 0 is a sparse window (video memory).
+unsafe fn window0_scratch(this: *mut c_void, size: usize) -> Result<*mut u8, String> {
+    let u = crate::gpu::uma::get().ok_or("no unified memory")?;
+    let size = size.max(16);
+    let p = if u.is_sparse_window(0) { super::sparse::alloc_in(0, size, 1 << 16).map(|(p, _)| p as *mut u8) } else { u.alloc_in(0, size, 1 << 16) };
+    let p = p.ok_or_else(|| format!("window 0 of unified memory is full ({} KB for a two-pass draw)", size >> 10))?;
+    with(this, |s| s.uma.push(p as usize));
+    Ok(p)
+}
+
+/// A UAV barrier on all UAV accesses.
+fn uav_barrier_all() -> D3D12_RESOURCE_BARRIER {
+    D3D12_RESOURCE_BARRIER {
+        Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+        Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+        Anonymous: D3D12_RESOURCE_BARRIER_0 { UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER { pResource: std::mem::ManuallyDrop::new(None) }) },
+    }
+}
+
+/// A draw with a pipeline in two passes: the console program as a compute shader over
+/// `groups` thread groups (one record each, in memory of this recording), a UAV barrier, then
+/// the title's mesh pipeline (pass-through MS + PS) over the records. Both passes get the kept
+/// graphics root arguments (`io_patch` written over the user SGPRs). Afterwards the list has
+/// the mesh pipeline and its ABI root signature bound, as after any translated draw; the
+/// compute side is set again by the next translated dispatch (`bind_abi`), and the title's
+/// own root signatures and arguments never reach the PC list.
+unsafe fn two_pass(this: *mut c_void, list: &ID3D12GraphicsCommandList, real: usize, tp: &super::real::TwoPassPso, groups: u32, io_patch: &[(usize, u32)]) -> Result<(), String> {
+    if groups == 0 {
+        return Ok(());
+    }
+    let mesh_groups = groups.saturating_mul(tp.mesh_groups_per_record.max(1));
+    if groups > MAX_GROUPS || mesh_groups > MAX_GROUPS {
+        return Err(format!("{groups} groups ({mesh_groups} mesh groups) – over D3D12's {MAX_GROUPS} in one dispatch"));
+    }
+    let rec = tp.record.record_dwords() * 4;
+    let res = allocate_upload_memory(this, groups as usize * rec, 256);
+    if res.is_null() {
+        return Err(format!("unified memory is full ({} KB of records)", (groups as usize * rec) >> 10));
+    }
+    // a group that allocates no output leaves its counts at 0 (the memory is reused)
+    for g in 0..groups as usize {
+        std::ptr::write_bytes(res.add(g * rec), 0, 16);
+    }
+    let res_va = super::real::uma_va_of(res as usize).ok_or("record buffer not on the GPU")?;
+    let views = abi_views(this, real, true, Some(res_va), io_patch)?;
+    let rs = |p: usize| {
+        let p = p as *mut c_void;
+        ID3D12RootSignature::from_raw_borrowed(&p).cloned()
+    };
+    let ps = |p: usize| {
+        let p = p as *mut c_void;
+        ID3D12PipelineState::from_raw_borrowed(&p).cloned()
+    };
+    let (crs, cpso) = (rs(tp.compute_rs).ok_or("compute root signature")?, ps(tp.compute).ok_or("compute pipeline")?);
+    let (mrs, mpso) = (rs(tp.mesh_rs).ok_or("mesh root signature")?, ps(real).ok_or("mesh pipeline")?);
+    // pass 1: the console program, one record per group
+    set_abi(list, &crs, &views, false);
+    list.SetPipelineState(&cpso);
+    list.Dispatch(groups, 1, 1);
+    list.ResourceBarrier(&[uav_barrier_all()]);
+    // pass 2: the records rasterised
+    set_abi(list, &mrs, &views, true);
+    list.SetPipelineState(&mpso);
+    let dispatch_mesh: unsafe extern "system" fn(*mut c_void, u32, u32, u32) = std::mem::transmute(super::real::orig_fn(this, PC_DISPATCH_MESH));
+    dispatch_mesh(this, mesh_groups, 1, 1);
+    static N: AtomicU64 = AtomicU64::new(0);
+    let n = N.fetch_add(1, Ordering::Relaxed);
+    if n < 4 || ((n + 1).is_power_of_two() && n >= 63) {
+        crate::xlog_info!("D3D12.X: {} draws in two passes so far (latest: console {} over {groups} groups, {mesh_groups} mesh groups)", n + 1, tp.kind);
+    }
     Ok(())
+}
+
+/// The pipeline bound on `this` (waited for if still being built) and its two-pass parts
+/// (None: not such a pipeline).
+fn bound_two_pass(this: *mut c_void) -> Option<(usize, std::sync::Arc<super::real::TwoPassPso>)> {
+    let real = super::pso_async::resolve_wait(with(this, |s| s.pso));
+    super::real::two_pass_of(real).map(|tp| (real, tp))
+}
+
+fn note_skipped(what: std::fmt::Arguments) {
+    static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    if N.fetch_add(1, Ordering::Relaxed) < 8 {
+        crate::xlog_warn!("D3D12.X: {what}");
+    }
+}
+
+/// #126 (#128 on the newer console layout: `real::NEWER_LIST_SLOTS`) DispatchMesh(x, y, z):
+/// with a console mesh pipeline bound, its two passes. The slot is inferred, not seen in a
+/// title yet: the console list keeps the PC's ID3D12GraphicsCommandList1 at #104–#109 and
+/// RSSetShadingRate / RSSetShadingRateImage at #124 / #125, and on the PC DispatchMesh follows
+/// them. With any other pipeline bound the call is logged with its arguments (they tell what
+/// the method is) and dropped, as by the stub that was there.
+pub(super) unsafe extern "system" fn dispatch_mesh(this: *mut c_void, x: u32, y: u32, z: u32) {
+    let Some((real, tp)) = bound_two_pass(this).filter(|(_, tp)| tp.kind == "MS") else {
+        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        if N.fetch_add(1, Ordering::Relaxed) < 8 {
+            crate::xlog_warn!("D3D12.X: command list DispatchMesh slot called ({x:#x}, {y:#x}, {z:#x}) without a console mesh pipeline bound (pipeline {:#x}) – dropped", with(this, |s| s.pso));
+        }
+        return;
+    };
+    let Some(list) = ID3D12GraphicsCommandList::from_raw_borrowed(&this).cloned() else { return };
+    // the translated program numbers its group by SV_GroupID.x: a grid is flattened
+    let groups = (x as u64) * (y as u64) * (z as u64);
+    if y > 1 || z > 1 {
+        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        if N.fetch_add(1, Ordering::Relaxed) < 4 {
+            crate::xlog_warn!("D3D12.X: DispatchMesh({x}, {y}, {z}) with a console mesh pipeline – drawn as {groups} groups in a row");
+        }
+    }
+    let r = u32::try_from(groups).map_err(|_| "too many groups".to_string()).and_then(|g| two_pass(this, &list, real, &tp, g, &[]));
+    match r {
+        Ok(()) => count(DRAWS),
+        Err(e) => {
+            count(DRAWS_SKIPPED);
+            note_skipped(format_args!("DispatchMesh({x}, {y}, {z}) with a console mesh pipeline skipped: {e}"));
+        }
+    }
+}
+
+/// A Draw* with a pipeline in two passes bound (Some: it was – drawn or skipped). A GS
+/// pipeline: XCL fetches the triangles' vertices (`recomp::fetch`), then the two passes run
+/// over them. `indexed`: the base vertex of an indexed draw.
+unsafe fn gs_draw(this: *mut c_void, count_: u32, instances: u32, first: u32, indexed: Option<i32>, first_instance: u32) -> Option<()> {
+    let (real, tp) = bound_two_pass(this)?;
+    let Some(list) = ID3D12GraphicsCommandList::from_raw_borrowed(&this).cloned() else { return Some(()) };
+    if tp.kind != "GS" {
+        // a mesh pipeline draws no vertices (on the PC the call is invalid)
+        count(DRAWS_SKIPPED);
+        note_skipped(format_args!("Draw* with a console mesh pipeline bound (DispatchMesh draws it) skipped"));
+        return Some(());
+    }
+    match gs_fetch_and_draw(this, &list, real, &tp, count_, instances, first, indexed, first_instance) {
+        Ok(()) => count(DRAWS),
+        Err(e) => {
+            count(DRAWS_SKIPPED);
+            note_skipped(format_args!("draw with a console GS pipeline skipped: {e}"));
+        }
+    }
+    Some(())
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn gs_fetch_and_draw(
+    this: *mut c_void,
+    list: &ID3D12GraphicsCommandList,
+    real: usize,
+    tp: &super::real::TwoPassPso,
+    count_: u32,
+    instances: u32,
+    first: u32,
+    indexed: Option<i32>,
+    first_instance: u32,
+) -> Result<(), String> {
+    use crate::gpu::recomp::fetch;
+    let f = match &tp.fetch {
+        Some(Ok(f)) => f,
+        Some(Err(e)) => return Err(format!("no vertex fetch ({e})")),
+        None => return Err("no vertex fetch".into()),
+    };
+    let (vbs, ib, topology) = super::list_x::ia_state(this);
+    if topology.is_some_and(|t| t != windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST.0 as u32) {
+        return Err(format!("topology {topology:?} (triangle lists only)"));
+    }
+    if instances > 1 {
+        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        if N.fetch_add(1, Ordering::Relaxed) < 4 {
+            crate::xlog_warn!("D3D12.X: a draw of {instances} instances with a console GS pipeline – the first only");
+        }
+    }
+    if !f.missing.is_empty() {
+        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        if N.fetch_add(1, Ordering::Relaxed) < 4 {
+            crate::xlog_warn!("D3D12.X: GS pipeline inputs without an input layout element (zero): {:?}", f.missing);
+        }
+    }
+    let prims = count_ / 3;
+    if prims == 0 || instances == 0 {
+        return Ok(());
+    }
+    let groups = prims.div_ceil(crate::gpu::recomp::GS_PRIMS_PER_GROUP);
+    if groups > MAX_GROUPS {
+        return Err(format!("{prims} triangles in one draw"));
+    }
+    let u = crate::gpu::uma::get().ok_or("no unified memory")?;
+    let vertices = prims * 3;
+    let vin = window0_scratch(this, vertices as usize * f.registers.max(1) as usize * 16)?;
+    // io[IO_GS_VERTICES] is an offset in `mem` (u2, window 0)
+    let vin_offset = vin as usize - u.window(0).0;
+    let vin_va = super::real::uma_va_of(vin as usize).ok_or("fetched vertices not on the GPU")?;
+    // the fetch: buffers bound at 4-byte aligned addresses, the rest in the constants
+    let mut c = fetch::Constants { count: vertices, first, base_vertex: indexed.unwrap_or(0), first_instance, ..Default::default() };
+    let aligned = |va: u64| va & !3;
+    let ib_va = match (indexed, ib) {
+        (Some(_), Some(v)) => {
+            let sixteen = v.Format == windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16_UINT;
+            c.flags = 1 | if sixteen { 2 } else { 0 };
+            c.ib_delta = (v.BufferLocation & 3) as u32;
+            c.ib_bytes = v.SizeInBytes + c.ib_delta;
+            aligned(v.BufferLocation)
+        }
+        (Some(_), None) => return Err("indexed draw without an index buffer".into()),
+        (None, _) => vin_va,
+    };
+    let mut slot_vas = [vin_va; fetch::MAX_SLOTS];
+    for (k, slot) in f.slots.iter().enumerate() {
+        let v = vbs.get(slot).ok_or_else(|| format!("no vertex buffer at slot {slot}"))?;
+        if v.BufferLocation == 0 {
+            return Err(format!("vertex buffer at slot {slot} not on the GPU"));
+        }
+        let delta = (v.BufferLocation & 3) as u32;
+        c.slots[k] = [delta, v.StrideInBytes, v.SizeInBytes + delta, 0];
+        slot_vas[k] = aligned(v.BufferLocation);
+    }
+    let rs = super::real::fetch_rs().ok_or("no vertex fetch root signature")? as *mut c_void;
+    let rs = ID3D12RootSignature::from_raw_borrowed(&rs).ok_or("fetch root signature")?;
+    let pso = f.pso as *mut c_void;
+    let pso = ID3D12PipelineState::from_raw_borrowed(&pso).ok_or("fetch pipeline")?;
+    list.SetComputeRootSignature(rs);
+    let words = c.words();
+    list.SetComputeRoot32BitConstants(0, words.len() as u32, words.as_ptr() as *const c_void, 0);
+    list.SetComputeRootShaderResourceView(fetch::PARAM_IB, ib_va);
+    for (k, va) in slot_vas.iter().enumerate() {
+        list.SetComputeRootShaderResourceView(fetch::PARAM_VB0 + k as u32, *va);
+    }
+    list.SetComputeRootUnorderedAccessView(fetch::PARAM_OUT, vin_va);
+    list.SetPipelineState(pso);
+    list.Dispatch(vertices.div_ceil(fetch::THREADS), 1, 1);
+    list.ResourceBarrier(&[uav_barrier_all()]);
+    two_pass(this, list, real, tp, groups, &[(crate::gpu::recomp::IO_GS_PRIMS, prims), (crate::gpu::recomp::IO_GS_VERTICES, vin_offset as u32)])
 }
 
 #[cfg(test)]

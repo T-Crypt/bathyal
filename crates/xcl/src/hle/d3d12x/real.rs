@@ -1021,6 +1021,9 @@ fn console_slots(kind: Kind) -> Vec<(usize, usize)> {
                 (90, l::write32_bottom_of_shader_x as usize),
                 (93, l::kickoff_x as usize),
                 (94, l::set_depth_bias_x as usize),
+                // DispatchMesh after RSSetShadingRate / RSSetShadingRateImage (#124 / #125) as on
+                // the PC – inferred, see `bind::dispatch_mesh`
+                (126, b::dispatch_mesh as usize),
                 // console compute/BVH builder extensions (`XboxBvhBuilder.dll`)
                 (146, l::uav_barrier_x as usize),
                 (148, b::allocate_upload_memory as usize),
@@ -3830,6 +3833,19 @@ pub struct TwoPassPso {
     pub mesh_groups_per_record: u32,
     /// "MS" or "GS"
     pub kind: &'static str,
+    /// GS: the vertex fetch in front of the compute pass (Err: why the draws cannot have one)
+    pub fetch: Option<Result<GsFetch, String>>,
+}
+
+/// The vertex fetch of a GS pipeline (`recomp::fetch`): its compute pipeline state (XCL's,
+/// root signature `fetch_rs`), the title's vertex buffer slot of each fetch slot, and the ES
+/// input registers each vertex has.
+pub struct GsFetch {
+    pub pso: usize,
+    pub slots: Vec<u32>,
+    pub registers: u32,
+    /// some ES input has no element in the input layout (zero)
+    pub missing: Vec<String>,
 }
 
 impl Drop for TwoPassPso {
@@ -3837,6 +3853,86 @@ impl Drop for TwoPassPso {
         // the compute pipeline state is XCL's (the root signatures are cached or the title's)
         super::pso_async::release(self.compute);
     }
+}
+
+impl Drop for GsFetch {
+    fn drop(&mut self) {
+        super::pso_async::release(self.pso);
+    }
+}
+
+/// The vertex fetch's root signature (`recomp::fetch::root_signature`), made once.
+static FETCH_RS: AtomicUsize = AtomicUsize::new(0);
+
+pub fn fetch_rs() -> Option<usize> {
+    Some(FETCH_RS.load(Ordering::Acquire)).filter(|&p| p != 0)
+}
+
+unsafe fn fetch_rs_for(this: *mut c_void) -> Result<usize, String> {
+    if let Some(p) = fetch_rs() {
+        return Ok(p);
+    }
+    let dev = ID3D12Device::from_raw_borrowed(&this).ok_or("device")?;
+    let raw = crate::gpu::recomp::fetch::root_signature(dev)?.into_raw() as usize;
+    match FETCH_RS.compare_exchange(0, raw, Ordering::AcqRel, Ordering::Acquire) {
+        Ok(_) => Ok(raw),
+        Err(other) => {
+            drop(ID3D12RootSignature::from_raw(raw as *mut c_void));
+            Ok(other)
+        }
+    }
+}
+
+/// The vertex fetch of a GS pipeline from its description's input layout and the ES inputs
+/// (ISG1 of the console VS): elements matched by semantic.
+unsafe fn gs_fetch(this: *mut c_void, d: &D3D12_GRAPHICS_PIPELINE_STATE_DESC, vs: &[u8]) -> Result<GsFetch, String> {
+    use crate::gpu::recomp::fetch;
+    let inputs: Vec<crate::gpu::dxbc::SigElement> = crate::gpu::dxbc::signatures(vs).0.into_iter().filter(|e| e.system_value == 0).collect();
+    let registers = inputs.iter().map(|e| e.register + 1).max().unwrap_or(0);
+    let layout: &[D3D12_INPUT_ELEMENT_DESC] = if d.InputLayout.pInputElementDescs.is_null() || d.InputLayout.NumElements == 0 || d.InputLayout.NumElements > 64 {
+        &[]
+    } else {
+        std::slice::from_raw_parts(d.InputLayout.pInputElementDescs, d.InputLayout.NumElements as usize)
+    };
+    // offsets of D3D12_APPEND_ALIGNED_ELEMENT: after the previous element of the slot
+    let mut ends: HashMap<u32, u32> = HashMap::new();
+    let mut placed = Vec::new();
+    for el in layout {
+        let name = if el.SemanticName.is_null() { String::new() } else { el.SemanticName.to_string().unwrap_or_default() };
+        let f = el.Format.0 as u32;
+        let at = if el.AlignedByteOffset == D3D12_APPEND_ALIGNED_ELEMENT { *ends.get(&el.InputSlot).unwrap_or(&0) } else { el.AlignedByteOffset };
+        ends.insert(el.InputSlot, at + fetch::bytes(f).unwrap_or(4));
+        placed.push((name, el.SemanticIndex, el.InputSlot, at, f, el.InputSlotClass == D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA));
+    }
+    let (mut slots, mut elements, mut missing) = (Vec::<u32>::new(), Vec::new(), Vec::new());
+    for e in &inputs {
+        let Some((_, _, slot, at, f, inst)) = placed.iter().find(|p| p.0.eq_ignore_ascii_case(&e.name) && p.1 == e.index) else {
+            missing.push(e.semantic());
+            continue;
+        };
+        let k = match slots.iter().position(|s| s == slot) {
+            Some(k) => k,
+            None => {
+                slots.push(*slot);
+                slots.len() - 1
+            }
+        };
+        elements.push(fetch::Element { register: e.register, slot: k as u32, offset: *at, format: *f, per_instance: *inst });
+    }
+    let hlsl = fetch::hlsl(registers, &elements)?;
+    let cs = crate::gpu::recomp::dxc::compile_cached(&hlsl, "main", "cs_6_6")?.0;
+    let rs = fetch_rs_for(this)?;
+    let fc: PsoFn = std::mem::transmute(orig_fn(this, slot_of(this, "CreateComputePipelineState")));
+    let mut cdesc = D3D12_COMPUTE_PIPELINE_STATE_DESC::default();
+    cdesc.pRootSignature = std::mem::transmute::<*mut c_void, std::mem::ManuallyDrop<Option<ID3D12RootSignature>>>(rs as *mut c_void);
+    cdesc.CS = bytecode(&cs);
+    let iid = pc_iid(Kind::PipelineState);
+    let mut pso: *mut c_void = std::ptr::null_mut();
+    let hr = fc(this, &cdesc as *const _ as *const c_void, &iid, &mut pso);
+    if hr < 0 || pso.is_null() {
+        return Err(format!("the driver rejected the vertex fetch ({hr:#x})"));
+    }
+    Ok(GsFetch { pso: pso as usize, slots, registers, missing })
 }
 
 static TWO_PASS: Mutex<Option<HashMap<usize, std::sync::Arc<TwoPassPso>>>> = Mutex::new(None);
@@ -3929,7 +4025,7 @@ fn two_pass_ps(ps: Option<&[u8]>, split_wave64: bool) -> Result<(Option<Vec<u8>>
 /// Create the mesh pipeline (`stream`, RS and shaders already in it) and the compute pass;
 /// the title gets the mesh pipeline state.
 #[allow(clippy::too_many_arguments)]
-unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu::recomp::pso::TwoPass, mesh_rs: *mut c_void, kind: &'static str, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu::recomp::pso::TwoPass, mesh_rs: *mut c_void, kind: &'static str, fetch: Option<Result<GsFetch, String>>, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
     let Some(rs) = abi_rs_for(this, &tp.samplers) else { return E_INVALIDARG };
     let fs: PsoFn = std::mem::transmute(orig_fn(this, slot_of(this, "CreatePipelineState")));
     let desc: [usize; 2] = [stream.0.len(), stream.0.as_ptr() as usize];
@@ -3953,7 +4049,7 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
         return E_INVALIDARG;
     }
     note_pso_rs(*ppv, mesh_rs);
-    TWO_PASS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, std::sync::Arc::new(TwoPassPso { compute: compute as usize, compute_rs: rs as usize, mesh_rs: mesh_rs as usize, record: tp.record, mesh_groups_per_record: tp.mesh_groups_per_record, kind }));
+    TWO_PASS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, std::sync::Arc::new(TwoPassPso { compute: compute as usize, compute_rs: rs as usize, mesh_rs: mesh_rs as usize, record: tp.record, mesh_groups_per_record: tp.mesh_groups_per_record, kind, fetch }));
     let n = TRANSLATED_PSO.fetch_add(1, Ordering::Relaxed);
     if n < 5 || n % 1000 == 0 {
         crate::xlog_info!("D3D12.X: pipeline from the console {kind} in two passes (compute {} B + mesh {} B DXIL)", tp.cs.len(), tp.ms.len());
@@ -4035,7 +4131,7 @@ unsafe fn translated_mesh_stream(this: *mut c_void, desc: *const c_void, riid: *
             out.raw(*ty, payload, palign == 8);
         }
     }
-    Some(finish_two_pass(this, &out, tp, rs, "MS", riid, ppv))
+    Some(finish_two_pass(this, &out, tp, rs, "MS", None, riid, ppv))
 }
 
 /// A graphics PSO with a console VS + GS: the GS pipeline in two passes, as a mesh pipeline
@@ -4106,7 +4202,12 @@ unsafe fn translated_gs_pso(this: *mut c_void, d: &D3D12_GRAPHICS_PIPELINE_STATE
     if d.Flags.0 != 0 {
         out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_FLAGS, &d.Flags);
     }
-    finish_two_pass(this, &out, tp, rs, "GS", riid, ppv)
+    // the vertex fetch: a failure only keeps this pipeline's draws from running (logged there)
+    let fetch = gs_fetch(this, d, vs);
+    if let Err(e) = &fetch {
+        note_translation_error(format!("VS+GS vertex fetch: {e}"));
+    }
+    finish_two_pass(this, &out, tp, rs, "GS", Some(fetch), riid, ppv)
 }
 
 /// Rewrite a pipeline state stream with stand-in shaders. None if not possible.
@@ -4615,7 +4716,9 @@ pub(super) static QUEUE_SHIFTED: AtomicBool = AtomicBool::new(false);
 static QUEUE_OLDER: AtomicBool = AtomicBool::new(false);
 
 /// command list slots of the newer layout → the older layout's slot of the same method
-const NEWER_LIST_SLOTS: [(usize, usize); 21] = [(61, 59), (62, 60), (63, 61), (64, 62), (65, 63), (70, 68), (71, 69), (72, 70), (73, 71), (74, 72), (80, 78), (83, 81), (85, 83), (86, 84), (87, 85), (90, 88), (91, 89), (92, 90), (95, 93), (96, 94), (139, 10)];
+/// (128, 126): DispatchMesh, if the shift reaches it – not seen yet; `bind::dispatch_mesh` drops
+/// a call without a console mesh pipeline bound.
+const NEWER_LIST_SLOTS: [(usize, usize); 22] = [(61, 59), (62, 60), (63, 61), (64, 62), (65, 63), (70, 68), (71, 69), (72, 70), (73, 71), (74, 72), (80, 78), (83, 81), (85, 83), (86, 84), (87, 85), (90, 88), (91, 89), (92, 90), (95, 93), (96, 94), (128, 126), (139, 10)];
 
 /// The title called device method `slot`, which only runtimes with the newer layouts have (a retail game
 /// records its first lists before any queue call could tell).

@@ -28,6 +28,8 @@ pub mod sparse;
 pub mod title_list;
 pub mod title_textures;
 pub mod vram;
+#[cfg(test)]
+mod two_pass_tests;
 
 use std::ffi::c_void;
 use std::sync::OnceLock;

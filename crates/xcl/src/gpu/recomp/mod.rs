@@ -53,6 +53,7 @@
 
 pub mod dxc;
 pub(crate) mod emit;
+pub mod fetch;
 pub mod mesh_dispatch;
 pub mod mesh_wave;
 pub mod partial_waves;

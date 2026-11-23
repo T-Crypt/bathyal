@@ -268,6 +268,17 @@ pub(super) fn rect_list_state(list: *mut c_void) -> Option<Vec<(u32, (u64, u32, 
     b.rect_list.then(|| b.vertex_titles.iter().map(|(&k, &v)| (k, v, b.vertex_buffers.get(&k).copied())).collect())
 }
 
+/// What the input assembler of `list` has from console code: the vertex buffers (slot → PC
+/// view), the index buffer (PC view) and the console topology – for a draw XCL fetches the
+/// vertices of itself (a GS pipeline in two passes).
+pub(super) fn ia_state(list: *mut c_void) -> (std::collections::BTreeMap<u32, D3D12_VERTEX_BUFFER_VIEW>, Option<D3D12_INDEX_BUFFER_VIEW>, Option<u32>) {
+    let g = LISTS.lock().unwrap();
+    match g.as_ref().and_then(|m| m.get(&(list as usize))) {
+        Some(s) => (s.bindings.vertex_buffers.clone(), s.index_buffer, s.bindings.topology),
+        None => Default::default(),
+    }
+}
+
 /// `pc_va` for other modules.
 pub(super) fn pc_va_of(va: u64) -> u64 {
     pc_va(va)
