@@ -616,11 +616,11 @@ unsafe extern "system" fn Heap_GetDesc16(this: *mut NullObj, ret: *mut u8) -> *m
     }
     ret
 }
-unsafe extern "system" fn Heap_GetHandleStart(this: *mut NullObj, ret: *mut u64) -> *mut u64 {
-    if !ret.is_null() {
-        *ret = (*this).value.load(Ordering::Relaxed);
-    }
-    ret
+/// #9 / #10 GetCPU / GetGPUDescriptorHandleForHeapStart: console code takes the handle in rax
+/// and passes only `this` (as `real::heap_cpu_start_x`); rdx holds whatever the caller left
+/// there, so it must not be written through as the PC's hidden return pointer.
+unsafe extern "system" fn Heap_GetHandleStart(this: *mut NullObj) -> u64 {
+    (*this).value.load(Ordering::Relaxed)
 }
 unsafe extern "system" fn Resource_Map(this: *mut NullObj, _sub: u32, _range: *const c_void, data: *mut *mut c_void) -> HRESULT {
     let mut g = (*this).mem.lock().unwrap();
@@ -790,6 +790,30 @@ mod tests {
             let unknown: unsafe extern "system" fn(*mut c_void) -> usize = std::mem::transmute(slot(dev, 200));
             assert_eq!(unknown(dev), 0);
             assert!(crate::stubs::all_stubs().iter().any(|s| s.name == "ID3D12Device::#200" && s.calls.load(Ordering::Relaxed) > 0));
+        }
+    }
+
+    /// Console code calls descriptor heap #9 / #10 with only `this` and takes the start in rax;
+    /// rdx is left over from the caller and must not be written (the test title's rdx pointed
+    /// into its read-only .rdata: an access violation under Wine on the null device).
+    #[test]
+    fn heap_start_handles_come_back_in_rax() {
+        unsafe {
+            let mut dev = std::ptr::null_mut();
+            assert_eq!(D3D12CreateDevice(std::ptr::null_mut(), 0xC100, std::ptr::null(), &mut dev), S_OK);
+            let desc = [0u32, 16, 1, 0]; // CBV_SRV_UAV, 16 slots, shader visible
+            let create_heap: Fn4 = std::mem::transmute(slot(dev, 14));
+            let mut h = std::ptr::null_mut();
+            assert_eq!(create_heap(dev, desc.as_ptr() as *const c_void, std::ptr::null(), &mut h), S_OK);
+            for i in [9, 10] {
+                // a caller that passes only `this`, with a stray pointer left in rdx
+                let start: unsafe extern "system" fn(*mut c_void, *mut u64) -> u64 = std::mem::transmute(slot(h, i));
+                let mut stray = 0x5A5A_5A5Au64;
+                let p = start(h, &mut stray);
+                assert_eq!(stray, 0x5A5A_5A5A, "slot {i} wrote through rdx");
+                assert_ne!(p, 0, "slot {i}");
+                assert_ne!(p, &mut stray as *mut u64 as u64, "slot {i} returned rdx");
+            }
         }
     }
 }
