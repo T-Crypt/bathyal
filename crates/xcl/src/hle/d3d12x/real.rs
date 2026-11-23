@@ -5646,7 +5646,7 @@ mod typeless_uav_view_tests {
 
         // an R9G9B9E5 target the PC holds as half floats: the console's view is half floats too
         assert_eq!(pc_uav_desc(&rd(10, 1), Some(&uav(67, 0))).map(|v| v.Format.0), Some(10));
-        assert_eq!(pc_uav_desc(&rd(10, 1), None).map(|v| v.Format.0), Some(10));
+        assert!(pc_uav_desc(&rd(10, 1), None).is_none(), "the half floats are the resource's own format");
 
         // a resource that is its own typed format is left as the title made it
         assert!(pc_uav_desc(&rd(28, 1), Some(&uav(28, 0))).is_none());
