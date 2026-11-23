@@ -645,6 +645,25 @@ pub(super) unsafe extern "system" fn create_sampler_x(this: *mut c_void, x: *con
     real::dev_create_sampler_x(this, &d, dest);
 }
 
+/// Xbox colour formats a PC driver rejects.
+pub fn pc_color_format(format: u32) -> u32 {
+    match format {
+        116 | 117 => 10, // R10G10B10_*E*_A2_FLOAT → R16G16B16A16_FLOAT
+        // A8_UNORM is not a render-target format on this GPU. R8_UNORM still removed the
+        // device (the translated pixel shader writes float4). R8G8B8A8_UNORM matches that.
+        65 => 28,
+        other => other,
+    }
+}
+
+/// Xbox depth formats. 118 is `D16_UNORM_S8_UINT`; the PC depth format with stencil is D24.
+pub fn pc_dsv_format(format: u32) -> u32 {
+    match format {
+        118 | 119 => 45, // D16_UNORM_S8_UINT / its depth read → D24_UNORM_S8_UINT
+        other => other,
+    }
+}
+
 /// the console resource desc (0x38 bytes, D3D12_RESOURCE_DESC) as a PC one: its tile layouts
 /// and console flag bits mean nothing to a PC driver
 pub fn pc_resource_desc(x: &[u8; 0x38]) -> [u8; 0x38] {

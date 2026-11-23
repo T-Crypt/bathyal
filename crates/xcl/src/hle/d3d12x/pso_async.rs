@@ -310,6 +310,82 @@ pub fn is_pending(pso: usize) -> bool {
     entry(pso).is_some_and(|p| !*p.done.lock().unwrap())
 }
 
+/// How many uncached driver compiles may run at once. Each one fans out across the GPU
+/// driver's own compiler, so a few of them already fill the machine; more of them fight
+/// over the same cores and the load takes longer. `XCL_PSO_COMPILES` overrides it.
+fn driver_compile_limit() -> usize {
+    static N: OnceLock<usize> = OnceLock::new();
+    *N.get_or_init(|| {
+        let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
+        std::env::var("XCL_PSO_COMPILES").ok().and_then(|v| v.parse().ok()).unwrap_or((cores / 4).clamp(2, 4))
+    })
+}
+
+struct DriverGate {
+    /// compiles in the driver, and whether a resource create wants the driver to itself
+    running: Mutex<(usize, bool)>,
+    cv: Condvar,
+}
+
+fn driver_gate() -> &'static DriverGate {
+    static G: OnceLock<DriverGate> = OnceLock::new();
+    G.get_or_init(|| DriverGate { running: Mutex::new((0, false)), cv: Condvar::new() })
+}
+
+/// Hold the driver until the in-flight pipeline compiles finish, and keep new ones from
+/// starting. A resource create overlapping a pipeline compile removes the device on this GPU.
+pub struct DriverQuiet;
+
+impl Drop for DriverQuiet {
+    fn drop(&mut self) {
+        let g = driver_gate();
+        let mut n = g.running.lock().unwrap();
+        n.1 = false;
+        g.cv.notify_all();
+    }
+}
+
+pub fn quiet_driver() -> DriverQuiet {
+    let g = driver_gate();
+    let mut n = g.running.lock().unwrap();
+    n.1 = true;
+    if n.0 > 0 {
+        crate::xlog_info!("D3D12.X: waiting for {} pipeline compile(s) before creating a resource", n.0);
+    }
+    while n.0 > 0 {
+        n = g.cv.wait(n).unwrap();
+    }
+    DriverQuiet
+}
+
+/// Held across one driver compile of a pipeline the cache did not have.
+pub struct DriverGuard;
+
+impl Drop for DriverGuard {
+    fn drop(&mut self) {
+        let g = driver_gate();
+        let mut n = g.running.lock().unwrap();
+        n.0 = n.0.saturating_sub(1);
+        g.cv.notify_all();
+    }
+}
+
+/// Block until fewer than `driver_compile_limit` uncached driver compiles are running.
+pub fn uncached_compile() -> DriverGuard {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        crate::xlog_info!("D3D12.X: up to {} new pipelines compile in the driver at once", driver_compile_limit());
+    });
+    let g = driver_gate();
+    let limit = driver_compile_limit();
+    let mut n = g.running.lock().unwrap();
+    while n.1 || n.0 >= limit {
+        n = g.cv.wait(n).unwrap();
+    }
+    n.0 += 1;
+    DriverGuard
+}
+
 /// (built in the background, failed, still building)
 pub fn counts() -> (usize, usize, usize) {
     let pending = PENDING.lock().unwrap().as_ref().map_or(0, |m| m.values().filter(|p| !*p.done.lock().unwrap()).count());
