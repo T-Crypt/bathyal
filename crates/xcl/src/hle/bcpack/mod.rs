@@ -10,19 +10,30 @@
 //!   is published for BC2,
 //! * the rebuild of BC1 blocks ([`bc1`]), which needs two tables of constants that are not in
 //!   the stream ([`bc1::Tables`]). XCL has the estimates bcpack-rs made of them
-//!   (`bc1_fitted.rs`), so its BC1 blocks are an approximation wherever an estimate is off.
+//!   (`bc1_fitted.rs`), so its BC1 blocks are an approximation wherever an estimate is off,
+//! * the rebuild of BC5 blocks ([`bc5`]), which also needs constants that are not in the
+//!   stream ([`bc5::Tables`]). XCL has the index-pair table and the estimates
+//!   leonida-asset-pipeline made of the history (`bc5_tables.rs`), so its BC5 blocks are an
+//!   approximation wherever an estimate is off.
 //!
-//! What is not: the rebuild of the other formats. Their lanes decode, but how the symbols map
-//! to block bits is not published in a form XCL can use, so those requests are still refused.
+//! What is not: the rebuild of BC3, BC4, BC6H and BC7. Their lanes decode, but the block
+//! rebuild needs tables of constants that no stream carries. For BC7 those are the 256-slot
+//! endpoint history, the 256-slot index history and 10 of the 285 lane-15 mode signatures;
+//! the only sources that fitted them are GPL-3.0, which this GPL-2.0-only crate cannot take,
+//! and the clean-room decoder that XCL's BC5 tables come from ships them empty. Guessing them
+//! would make the output wrong, so those requests are still refused.
 //!
 //! Nothing here was compared with what a console writes for the same input: the entropy stage
-//! follows Microsoft's published decoder sample and the BC1 rules the public format notes of
-//! bcpack-decoder (Tim0219800) and bcpack-rs (Ahmet Dedeler), both MIT, whose authors report
-//! them as matching retail streams. The tests check against streams built independently from
-//! those notes (`tests/data/bcpack`), not against hardware output.
+//! follows Microsoft's published decoder sample and the block rules the public format notes of
+//! bcpack-decoder (Tim0219800) and bcpack-rs (Ahmet Dedeler), the clean-room decoder of
+//! leonida-asset-pipeline (wxrrry, MIT) and the format notes of SixNG, whose authors report them
+//! as matching retail streams. The tests check against streams built independently from those
+//! notes (`tests/data/bcpack`), not against hardware output.
 
 pub mod bc1;
 mod bc1_fitted;
+pub mod bc5;
+mod bc5_tables;
 mod lanes;
 mod rans_tables;
 
@@ -128,15 +139,29 @@ fn bc1_tables() -> Option<&'static bc1::Tables> {
     }
 }
 
+/// The BC5 tables, when XCL has them: the estimates of leonida-asset-pipeline, and in the
+/// tests the made-up set their fixtures were built with.
+fn bc5_tables() -> &'static bc5::Tables {
+    #[cfg(test)]
+    {
+        tests::bc5_tables()
+    }
+    #[cfg(not(test))]
+    {
+        &bc5_tables::TABLES
+    }
+}
+
 /// Whether [`decode`] has a block rebuild for `mode`.
 pub fn can_decode(mode: u8) -> bool {
-    mode == 1 && bc1_tables().is_some()
+    mode == 5 || (mode == 1 && bc1_tables().is_some())
 }
 
 /// Unpack a stream of `mode` to its `out_len` bytes of BCn blocks.
 pub fn decode(mode: u8, src: &[u8], out_len: usize) -> Result<Vec<u8>, Error> {
     match (mode, bc1_tables()) {
         (1, Some(t)) => bc1::decode(src, out_len, t),
+        (5, _) => bc5::decode(src, out_len, bc5_tables()),
         _ => Err(Error::Unsupported),
     }
 }

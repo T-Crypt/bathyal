@@ -2306,10 +2306,11 @@ mod tests {
         assert_eq!((s["BC7"].requests, s["BC7"].with_zlib, s["BC7"].destination_bytes), (3, 1, 0x30000));
         assert_eq!((s["BC3"].requests, s["BC3"].with_zlib, s["BC3"].destination_bytes), (1, 0, 0x8000));
         assert_eq!(counts.summary(), "BC3 1 (32768 bytes), BC7 3 (196608 bytes)");
-        // every mode without a block rebuild; BC1 has one (in the tests, with their tables)
+        // every mode without a block rebuild; BC1 and BC5 have one (in the tests, with their
+        // tables)
         for m in 1..=15u64 {
             let r = Request::parse(&request(SOURCE_MEMORY_BIT | m << BCPACK_SHIFT, 0x1000, 64, 0x2000, 0, 20));
-            assert_eq!(r.check(true), if m == 1 { Ok(()) } else { Err(E_DECOMPRESSION) }, "mode {m}");
+            assert_eq!(r.check(true), if m == 1 || m == 5 { Ok(()) } else { Err(E_DECOMPRESSION) }, "mode {m}");
         }
     }
 
@@ -2386,6 +2387,25 @@ mod tests {
             let after = stats().bcpack_unpacked["BC1"].clone();
             assert!(after.requests >= before.requests + 3 && after.destination_bytes >= before.destination_bytes + 0x20000 + small_blocks.len() as u64);
             assert!(after.failed >= before.failed + 2);
+
+            // BC5 takes the same path: the fixture to the blocks the decoder builds from it
+            let bc5 = SOURCE_MEMORY_BIT | 5 << BCPACK_SHIFT;
+            let packed5 = fx::data("bc5-16-1.bin").unwrap();
+            let blocks5 = crate::hle::bcpack::decode(5, &packed5, 8 * 16).unwrap();
+            let before5 = stats().bcpack_unpacked.get("BC5").cloned().unwrap_or_default();
+            let mut dst5 = vec![0xCDu8; blocks5.len() + 32];
+            enqueue(q, request_ex(bc5, dst5.as_mut_ptr() as u64, 0, blocks5.len() as u32, packed5.as_ptr() as u64, 0, packed5.len() as u32, 0, 0).as_ptr());
+            status(q, s, 7);
+            submit(q);
+            while !complete(s, 7) && t.elapsed().as_secs() < 10 {
+                std::thread::yield_now();
+            }
+            assert_eq!(hresult(s, 7), S_OK, "BC5 request");
+            assert_eq!(&dst5[..blocks5.len()], &blocks5[..], "BC5: the destination has the blocks");
+            assert!(dst5[blocks5.len()..].iter().all(|&b| b == 0xCD), "BC5: nothing past the destination size");
+            let after5 = stats().bcpack_unpacked["BC5"].clone();
+            assert!(after5.requests > before5.requests && after5.destination_bytes >= before5.destination_bytes + blocks5.len() as u64);
+
             queue_close(q);
             queue_release(q);
             status_release(s);
