@@ -685,7 +685,9 @@ fn process_private_bytes() -> u64 {
         let mut c: PROCESS_MEMORY_COUNTERS_EX = std::mem::zeroed();
         c.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32;
         if K32GetProcessMemoryInfo(thr::GetCurrentProcess(), &mut c as *mut _ as *mut _, c.cb) != 0 {
-            c.PrivateUsage as u64
+            // Wine fills the fields before PrivateUsage only; PagefileUsage is the same number
+            // on Windows (the commit charge)
+            if c.PrivateUsage != 0 { c.PrivateUsage as u64 } else { c.PagefileUsage as u64 }
         } else {
             0
         }
@@ -2219,6 +2221,8 @@ mod tests {
         assert_eq!(unsafe { TitleMemoryStatus(&mut s) }, 1);
         assert_eq!(s.total, 13_824 * 1024 * 1024);
         assert!(s.avail <= s.total);
+        // the process's own memory counts as used (Wine leaves PrivateUsage 0)
+        assert!(process_private_bytes() > 0 && s.avail < s.total);
         s.dw_length = 8;
         assert_eq!(unsafe { TitleMemoryStatus(&mut s) }, 0);
     }
