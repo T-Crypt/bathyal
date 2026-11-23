@@ -61,6 +61,12 @@ pub fn set_title_filter(f: usize) -> usize {
     TITLE_FILTER.swap(f, Ordering::AcqRel)
 }
 
+/// The first 16 code bytes at `rip`, as hex (as far as they are readable).
+unsafe fn code_at(rip: usize) -> String {
+    let n = (1..=16).rev().find(|&n| crate::gpu::shader::readable(rip, n)).unwrap_or(0);
+    std::slice::from_raw_parts(rip as *const u8, n).iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(" ")
+}
+
 unsafe extern "system" fn unhandled_filter(info: *const EXCEPTION_POINTERS) -> i32 {
     crate::hle::d3d12x::real::log_device_removed();
     if !info.is_null() && !(*info).ExceptionRecord.is_null() {
@@ -76,9 +82,9 @@ unsafe extern "system" fn unhandled_filter(info: *const EXCEPTION_POINTERS) -> i
             };
             extra = format!(" ({op} at address {:#x})", rec.ExceptionInformation[1]);
         }
-        if rec.ExceptionCode as u32 == ILLEGAL_INSTRUCTION {
-            extra = format!(" (code bytes: {})", code_at(addr));
-        }
+        // the faulting instruction, for any exception: the registers alone rarely say what was
+        // dereferenced (an access violation in a title's thread start-up: which field of what)
+        extra.push_str(&format!(" (code bytes: {})", code_at(addr)));
         let ctx = (*info).ContextRecord;
         let regs = if ctx.is_null() {
             String::new()
@@ -109,6 +115,7 @@ unsafe extern "system" fn unhandled_filter(info: *const EXCEPTION_POINTERS) -> i
             modules::describe_address(addr)
         );
         crate::xlog_error!("{msg}");
+        crate::memstat::log();
         crate::report::write_final(Some(msg));
         // the other threads now: a title crash handler (Breakpad) can keep the process for
         // minutes before it ends (the retail title's watchdog: what was its silent thread doing?)
@@ -137,6 +144,7 @@ unsafe extern "system" fn hk_nt_terminate_process(h: isize, status: i32) -> i32 
         let (tid, stack) = (windows_sys::Win32::System::Threading::GetCurrentThreadId(), stack_callers_n(&probe as *const usize as usize, 16));
         if status != 0 {
             crate::xlog_error!("process ends with status {status:#x} (thread {tid}); on the stack: {stack}");
+            crate::memstat::log();
             dump_threads();
         } else {
             crate::xlog_info!("process ends (thread {tid}); on the stack: {stack}");

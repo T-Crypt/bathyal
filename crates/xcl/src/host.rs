@@ -127,6 +127,7 @@ pub fn host_main(boot_path: &Path) -> i32 {
     crate::eh::install_crash_handler();
     crate::alloc_trace::install();
     crate::eh::start_probes();
+    crate::memstat::start();
     HOST_MODE.store(true, Ordering::Release);
 
     let main = match crate::loader::load_main(&boot.exe_path) {
