@@ -140,7 +140,7 @@ pub fn read_game_config(root: &Path) -> (Vec<String>, Option<String>) {
 
 /// `xcl.exe` itself (by name, path or identical bytes) must never be picked as the game.
 fn is_xcl_copy(p: &Path) -> bool {
-    if p.file_name().map(|n| n.to_string_lossy().eq_ignore_ascii_case("xcl.exe")).unwrap_or(false) {
+    if p.file_name().map(|n| { let n = n.to_string_lossy(); n.eq_ignore_ascii_case("bathyal.exe") || n.eq_ignore_ascii_case("xcl.exe") }).unwrap_or(false) {
         return true;
     }
     let Ok(me) = std::env::current_exe() else { return false };
@@ -201,7 +201,7 @@ fn pick_exe(root: &Path) -> Result<PathBuf, String> {
         0 => Err(format!(
             "no game .exe file in {}{}",
             root.display(),
-            if skipped_self { " (only xcl.exe – that is XCL itself; do not copy it into the game folder)" } else { "" }
+            if skipped_self { " (only bathyal.exe – that is Bathyal itself; do not copy it into the game folder)" } else { "" }
         )),
         _ => Err(format!(
             "several .exe files ({}) – point to the game exe directly or set 'exe' in xcl.toml",
@@ -241,7 +241,7 @@ fn resolve_location(target: &Path) -> Result<(PathBuf, Option<PathBuf>, String),
         (target, None)
     } else {
         if is_xcl_copy(&target) {
-            return Err(format!("{} is XCL itself, not a game – give the game exe or folder", target.display()));
+            return Err(format!("{} is Bathyal itself, not a game – give the game exe or folder", target.display()));
         }
         (config_root(&target).unwrap_or(target.parent().ok_or("no parent folder")?.to_path_buf()), Some(target))
     };
@@ -337,7 +337,7 @@ pub fn run(target: &Path, args: &[String]) -> i32 {
     let _ = std::fs::rename(boot.report_path(), logs.join("report.prev.json"));
     let _ = std::fs::remove_file(boot.report_path());
 
-    println!("XCL {} – starting '{title}'", env!("CARGO_PKG_VERSION"));
+    println!("Bathyal {} – starting '{title}'", env!("CARGO_PKG_VERSION"));
     println!("  exe:   {}", exe.display());
     println!("  data:  {}", data_dir.display());
     if !from_manifest.is_empty() {
@@ -606,8 +606,8 @@ mod tests {
         std::fs::copy(&me, d.0.join("xcl.exe")).unwrap();
         std::fs::copy(&me, d.0.join("renamed_copy.exe")).unwrap(); // byte-identical copy of XCL
         let e = resolve_target(&d.0).unwrap_err();
-        assert!(e.contains("xcl.exe") && e.contains("XCL itself"), "{e}");
-        assert!(resolve_target(&d.0.join("xcl.exe")).unwrap_err().contains("XCL itself"));
+        assert!(e.contains("bathyal.exe") && e.contains("Bathyal itself"), "{e}");
+        assert!(resolve_target(&d.0.join("xcl.exe")).unwrap_err().contains("Bathyal itself"));
         // a real game exe next to it wins
         std::fs::write(d.0.join("game.exe"), b"MZ not really a game").unwrap();
         let (_, exe, _) = resolve_target(&d.0).unwrap();
