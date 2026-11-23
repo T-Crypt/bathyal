@@ -3823,6 +3823,64 @@ fn gpu_uma_import_check_at_init() {
     assert!(s.starts_with("ok") || s.starts_with("off"), "{s}");
 }
 
+/// An address whose offset carries out of the low dword is in the next window: the base sits
+/// at 0xFFFF_F000 of window 0, base + offset in window 1 (s_load, s_buffer_load, buffer load /
+/// store, global with SADDR, global atomic).
+#[test]
+fn gpu_memory_window_carry() {
+    if !gpu_ready() {
+        return;
+    }
+    let arena = crate::gpu::uma::Uma::with_windows(2, 1 << 20).unwrap();
+    let (w0, w1) = (arena.window(0).0 as u64, arena.window(1).0 as u64);
+    assert_eq!((w1 - w0, w0 as u32), (1 << 32, 0));
+    let word = |a: u64| unsafe { &mut *(a as *mut u32) };
+    *word(w1 + 0x1000) = 0xC0FFEE;
+    *word(w1 + 0x1004) = 0x1234;
+    for l in 0..64u64 {
+        *word(w1 + 0x2000 + 4 * l) = 1000 + l as u32;
+        *word(w1 + 0x4000 + 4 * l) = 5000 + l as u32;
+    }
+    let list: Vec<(&str, &str, &[(&str, u64)], Option<u32>)> = vec![
+        ("S_LOAD_DWORDX2", "ENC_SMEM", &[("SDATA", 20), ("SBASE", 1), ("OFFSET", 0x2000)], None),
+        ("S_BUFFER_LOAD_DWORD", "ENC_SMEM", &[("SDATA", 22), ("SBASE", 4), ("OFFSET", 0x3000)], None),
+        ("BUFFER_LOAD_DWORD", "ENC_MUBUF", &[("VDATA", 10), ("VADDR", 0), ("SRSRC", 2), ("SOFFSET", 128), ("OFFEN", 1)], None),
+        ("BUFFER_STORE_DWORD", "ENC_MUBUF", &[("VDATA", 2), ("VADDR", 6), ("SRSRC", 3), ("SOFFSET", 128), ("OFFEN", 1)], None),
+        ("GLOBAL_LOAD_DWORD", "ENC_FLAT_GLBL", &[("VDST", 11), ("ADDR", 1), ("SADDR", 16), ("OFFSET", 0)], None),
+        ("GLOBAL_ATOMIC_ADD", "ENC_FLAT_GLBL", &[("VDST", 12), ("ADDR", 3), ("DATA", 13), ("SADDR", 16), ("OFFSET", 0), ("GLC", 1)], None),
+    ];
+    let p = prog(&list);
+    let t = translate(&p, &on_gpu(Options { mem_windows: 2, ..Default::default() })).unwrap();
+    // 32-bit adds and compares only: 64-bit integers here crashed the AMD shader compiler (#123)
+    let carries: Vec<&str> = t.hlsl.lines().filter(|l| l.contains("xcl_w =")).collect();
+    assert!(carries.len() >= 6 && carries.iter().all(|l| !l.contains("64")), "{carries:#?}");
+    let dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).map_err(|e| format!("{e}\n{}", t.hlsl)).unwrap();
+    let hi0 = (w0 >> 32) as u32;
+    let mut st = KernelState::default();
+    st.sgpr[2..4].copy_from_slice(&[0xFFFF_F000, hi0]);
+    st.sgpr[8..12].copy_from_slice(&[0xFFFF_F000, hi0 & 0xFFFF, 0x10000, 0]);
+    st.sgpr[12..16].copy_from_slice(&[0xFFFF_F000, hi0 & 0xFFFF, 0x10000, 0]);
+    st.sgpr[16..18].copy_from_slice(&[0xFFFF_F000, hi0]);
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        let l = l as u32;
+        r[0] = 0x3000 + 4 * l; // → w1 + 0x2000
+        r[1] = 0x5000 + 4 * l; // → w1 + 0x4000
+        r[2] = 7 * l;
+        r[3] = 0x7000; // → w1 + 0x6000, one counter
+        r[6] = 0x9000 + 4 * l; // → w1 + 0x8000
+        r[13] = 1;
+    }
+    let r = runner::run_in_arena(&dxil, &st, &arena).unwrap();
+    assert_eq!((r.sgpr[20], r.sgpr[21]), (0xC0FFEE, 0x1234), "s_load carried into window 1");
+    assert_eq!(r.sgpr[22], 1000, "s_buffer_load carried into window 1");
+    for l in 0..64u64 {
+        assert_eq!(r.vgpr[l as usize][10], 1000 + l as u32, "lane {l}: buffer_load carried into window 1");
+        assert_eq!(r.vgpr[l as usize][11], 5000 + l as u32, "lane {l}: global_load (SADDR) carried into window 1");
+        assert_eq!(*word(w1 + 0x8000 + 4 * l), 7 * l as u32, "lane {l}: buffer_store carried into window 1");
+    }
+    assert_eq!(*word(w1 + 0x6000), 64, "global_atomic_add carried into window 1");
+}
+
 /// End-to-end GPU test of the sparse-window VRAM runtime layout:
 /// - Window 0..2 = sparse VRAM (tiled reserved buffers on DEFAULT heaps)
 /// - Window 3 = committed coherent RAM (`OpenExistingHeapFromAddress`)

@@ -1469,8 +1469,8 @@ impl Em {
         if name.starts_with("s_buffer_load") {
             // V#: base = dw0 | dw1[15:0] << 32, stride = dw1[29:16], num_records = dw2
             let (d0, d1, d2) = (self.sreg(sbase), self.sreg(sbase + 1), self.sreg(sbase + 2));
-            self.window(&d1);
             self.line(&format!("uint {t}_off = {} + {soff};", hex(imm)));
+            self.window_at(&d1, &[d0.clone(), format!("{t}_off")], None);
             self.line(&format!("uint {t}_st = ({d1} >> 16) & 0x3FFFu;"));
             self.line(&format!("uint {t}_lim = select({t}_st == 0u, {d2}, {d2} * {t}_st);"));
             self.line(&format!("uint {t}_a = ({d0} + {t}_off) & ~3u;"));
@@ -1495,7 +1495,7 @@ impl Em {
             let imm = ((imm << 11) as i32 >> 11) as u32; // 21-bit signed
             let b = self.sreg(sbase);
             let hi = self.sreg(sbase + 1);
-            self.window(&hi);
+            self.window_at(&hi, &[b.clone(), soff.clone()], Some(imm));
             // the dwords are contiguous: Load2 / Load4 (one window switch per four dwords)
             self.line(&format!("uint {t}_a = ({b} + {} + {soff}) & ~3u;", hex(imm)));
             match count {
@@ -1541,13 +1541,48 @@ impl Em {
         }
     }
 
-    /// `window` for a FLAT / global address: SADDR pair (global with SADDR) or the 64-bit
-    /// VGPR address.
-    fn flat_window(&mut self, global: bool, saddr: u64, addr: u64) {
-        if self.opt.mem_windows > 1 {
-            let hi = if global && saddr != 0x7D && saddr != 0x7F { self.sreg(saddr + 1) } else { self.vreg(addr + 1) };
-            self.window(&hi);
+    /// `window` for the address `hi:lo + offsets`: `terms` are the low dword and the unsigned
+    /// 32-bit offsets, `signed` a sign-extended one. Their carry (or borrow) out of the low
+    /// dword moves the address to the next (previous) window, as it does on the console. 32-bit
+    /// adds and compares only (64-bit integers made the AMD shader compiler crash on a large
+    /// program, #123). One window: nothing (the single-window HLSL is unchanged).
+    fn window_at(&mut self, hi: &str, terms: &[String], signed: Option<u32>) {
+        if self.opt.mem_windows <= 1 {
+            return;
         }
+        let terms: Vec<&String> = terms.iter().filter(|t| t.as_str() != "0u").collect();
+        let Some((first, rest)) = terms.split_first() else {
+            return self.window(hi);
+        };
+        let mut body = format!("uint xcl_ws = {first}, xcl_wc = 0u, xcl_wt;");
+        for t in rest {
+            body += &format!(" xcl_wt = {t}; xcl_ws += xcl_wt; xcl_wc += (uint)(xcl_ws < xcl_wt);");
+        }
+        match signed.filter(|&o| o != 0) {
+            Some(o) if (o as i32) > 0 => body += &format!(" xcl_ws += {0}; xcl_wc += (uint)(xcl_ws < {0});", hex(o)),
+            Some(o) => body += &format!(" xcl_wc -= (uint)(xcl_ws < {0}); xcl_ws -= {0};", hex((o as i32).unsigned_abs())),
+            None => {}
+        }
+        self.line(&format!("{{ {body} xcl_w = (({hi}) + xcl_wc) & 3u; }}"));
+    }
+
+    /// `window_at` for a FLAT / global address: the SADDR pair plus the VGPR offset (global
+    /// with SADDR) or the 64-bit VGPR address, plus the signed instruction offset.
+    fn flat_window(&mut self, global: bool, saddr: u64, addr: u64, off: u32) {
+        if self.opt.mem_windows > 1 {
+            let (hi, terms) = if global && saddr != 0x7D && saddr != 0x7F {
+                (self.sreg(saddr + 1), vec![self.sreg(saddr), self.vreg(addr)])
+            } else {
+                (self.vreg(addr + 1), vec![self.vreg(addr)])
+            };
+            self.window_at(&hi, &terms, Some(off));
+        }
+    }
+
+    /// `window_at` for a MUBUF address: V# base + SOFFSET + `{t}_off` + `{t}_stride` · index.
+    fn buffer_window(&mut self, d0: &str, d1: &str, soff: &str, t: &str, index: &str) {
+        let terms = [d0.to_string(), soff.to_string(), format!("{t}_off"), format!("{t}_stride * ({index})")];
+        self.window_at(d1, &terms, None);
     }
 
     /// The sampler of the MIMG instruction at `pc`: a static sampler when its S# is constant
@@ -1597,13 +1632,13 @@ impl Em {
         let soff = self.code32(f("SOFFSET"), None, false).ok_or("op")?;
         let (offen, idxen) = (f("OFFEN") != 0, f("IDXEN") != 0);
         let (d0, d1, d2, d3) = (self.sreg(srsrc), self.sreg(srsrc + 1), self.sreg(srsrc + 2), self.sreg(srsrc + 3));
-        self.window(&d1);
         let index = if idxen { self.vreg(vaddr) } else { "0u".into() };
         let voff = if offen { self.vreg(vaddr + idxen as u64) } else { "0u".into() };
         let t = self.t();
         self.line(&format!("uint {t}_stride = ({d1} >> 16) & 0x3FFFu;"));
         self.line(&format!("uint {t}_off = {voff} + {}u;", f("OFFSET")));
         self.line(&format!("uint {t}_a = {d0} + {soff} + {t}_off + {t}_stride * {index};"));
+        self.buffer_window(&d0, &d1, &soff, &t, &index);
         let act = self.act();
         let in_range = |bytes: String| format!("select({t}_stride == 0u, {t}_off + {bytes} <= {d2}, {index} < {d2})");
         if let Some((n, signed, store)) = small {
@@ -3659,7 +3694,6 @@ impl Em {
         let soff = self.code32(f("SOFFSET"), None, false).ok_or("op")?;
         let (offen, idxen) = (f("OFFEN") != 0, f("IDXEN") != 0);
         let (d0, d1, d2) = (self.sreg(srsrc), self.sreg(srsrc + 1), self.sreg(srsrc + 2));
-        self.window(&d1);
         let index = if idxen { self.vreg(vaddr) } else { "0u".into() };
         let voff = if offen { self.vreg(vaddr + idxen as u64) } else { "0u".into() };
         let t = self.t();
@@ -3669,6 +3703,7 @@ impl Em {
         self.line(&format!("uint {t}_stride = ({d1} >> 16) & 0x3FFFu;"));
         self.line(&format!("uint {t}_off = {voff} + {}u;", f("OFFSET")));
         self.line(&format!("uint {t}_a = ({d0} + {soff} + {t}_off + {t}_stride * {index}) & ~{}u;", bytes - 1));
+        self.buffer_window(&d0, &d1, &soff, &t, &index);
         self.line(&format!("bool {t}_ok = select({t}_stride == 0u, {t}_off + {bytes}u <= {d2}, {index} < {d2});"));
         let act = self.act();
         if x2 {
@@ -3708,13 +3743,13 @@ impl Em {
         let soff = self.code32(f("SOFFSET"), None, false).ok_or("op")?;
         let (offen, idxen) = (f("OFFEN") != 0, f("IDXEN") != 0);
         let (d0, d1, d2) = (self.sreg(srsrc), self.sreg(srsrc + 1), self.sreg(srsrc + 2));
-        self.window(&d1);
         let index = if idxen { self.vreg(vaddr) } else { "0u".into() };
         let voff = if offen { self.vreg(vaddr + idxen as u64) } else { "0u".into() };
         let t = self.t();
         self.line(&format!("uint {t}_stride = ({d1} >> 16) & 0x3FFFu;"));
         self.line(&format!("uint {t}_off = {voff} + {}u;", f("OFFSET")));
         self.line(&format!("uint {t}_a = {d0} + {soff} + {t}_off + {t}_stride * {index};"));
+        self.buffer_window(&d0, &d1, &soff, &t, &index);
         let ok = format!("select({t}_stride == 0u, {t}_off + {n}u <= {d2}, {index} < {d2})");
         let act = self.act();
         let v = self.vreg(vdata);
@@ -3743,9 +3778,9 @@ impl Em {
             let addr = self.vreg(f("ADDR"));
             let saddr = f("SADDR");
             let base = if global && saddr != 0x7D && saddr != 0x7F { format!("{} + {addr}", self.sreg(saddr)) } else { addr };
-            self.flat_window(global, saddr, f("ADDR"));
             let raw = f("OFFSET") as u32;
             let off = if global { (((raw << 20) as i32) >> 20) as u32 } else { raw };
+            self.flat_window(global, saddr, f("ADDR"), off);
             let t = self.t();
             self.line(&format!("uint {t}_a = {base} + {};", hex(off)));
             let act = self.act();
@@ -3789,9 +3824,9 @@ impl Em {
                 addr
             }
         };
-        self.flat_window(global, saddr, f("ADDR"));
         let raw = f("OFFSET") as u32;
         let off = if global { (((raw << 20) as i32) >> 20) as u32 } else { raw };
+        self.flat_window(global, saddr, f("ADDR"), off);
         let t = self.t();
         self.line(&format!("uint {t}_a = {base} + {};", hex(off)));
         let act = self.act();
@@ -3861,9 +3896,9 @@ impl Em {
         let addr = self.vreg(f("ADDR"));
         let saddr = f("SADDR");
         let base = if global && saddr != 0x7D && saddr != 0x7F { format!("{} + {addr}", self.sreg(saddr)) } else { addr };
-        self.flat_window(global, saddr, f("ADDR"));
         let raw = f("OFFSET") as u32;
         let off = if global { (((raw << 20) as i32) >> 20) as u32 } else { raw };
+        self.flat_window(global, saddr, f("ADDR"), off);
         let t = self.t();
         let x2 = op.ends_with("_x2");
         let op = op.trim_end_matches("_x2");
