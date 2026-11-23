@@ -5933,11 +5933,11 @@ mod queue_tests {
         QUEUE_OLDER.store(true, Ordering::Release);
         unsafe {
             let mut out = [0xAAAA_AAAAu32; 4];
-            let r = queue_dispatch(18, obj, out.as_mut_ptr() as usize, 0, 0, 0);
+            let r = queue_dispatch(18, obj, out.as_mut_ptr() as usize, 0, 0, 0, 0);
             assert_eq!(r, out.as_ptr() as usize);
             assert_eq!(out, [1, 2, 3, 4], "PC order");
             let mut buf = [vtbl as u32, (vtbl >> 32) as u32, 0xAAAA_AAAA, 0xAAAA_AAAA];
-            let r = queue_dispatch(18, buf.as_mut_ptr() as *mut c_void, obj as usize, 0, 0, 0);
+            let r = queue_dispatch(18, buf.as_mut_ptr() as *mut c_void, obj as usize, 0, 0, 0, 0);
             assert_eq!(r, buf.as_ptr() as usize);
             assert_eq!(buf, [1, 2, 3, 4], "console order writes the description into the caller's buffer");
             assert_eq!((*(obj as *const [usize; 2]))[0], vtbl, "the queue object is untouched");
