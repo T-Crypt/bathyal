@@ -1,7 +1,13 @@
-# XCL – Xbox Series X|S → Windows compatibility layer
+# Bathyal – Xbox Series X|S → Windows compatibility layer
 
-[![Discord](https://img.shields.io/badge/Discord-join%20the%20server-5865F2?logo=discord&logoColor=white)](https://discord.gg/yB5tstRHrn)
-**Discord: <https://discord.gg/yB5tstRHrn>**
+Bathyal is a fork of [XCL](https://github.com/ivall/xcl) by ivall and its contributors, under the same
+GPL-2.0 license (see [`NOTICE.md`](NOTICE.md)). It follows XCL's `main` and adds work focused on NVIDIA
+GPUs (32-lane waves) and on running newer retail titles further. The binary, crate and `XCL_*` settings
+keep XCL's names so upstream changes merge cleanly.
+
+This repository holds code only: no game files, shaders, assets, keys or logs from any game, and no
+decryption or DRM workarounds. Bring your own legally obtained, unpacked game files.
+
 
 XCL runs Xbox Series X|S (GDK) game files on a Windows PC **without CPU emulation**: the game's
 x64 code runs natively and XCL stands in for the console libraries the PC does not have

@@ -258,7 +258,7 @@ NOTE:
 ### Console DLLs from the game pack (session 5, without the exe)
 The user provided 16 DLLs from chunk 1002 (`<samples>\*.dll`, ordinary PEs): the console CRT (vcruntime140(_1),
 msvcp140(_1/_2/_atomic_wait/_codecvt_ids), concrt140, vcomp140, vccorlib140), Bink2Scarlett, XCurl, libHttpClient.GDK,
-amd_fidelityfx_loader_xbox / amd_fidelityfx_upscaler_xbox, XboxBvhBuilder. The game exe (`game_scarlett_master.exe`) is still missing.
+amd_fidelityfx_loader_xbox / amd_fidelityfx_upscaler_xbox, XboxBvhBuilder. The game exe is still missing.
 - `xcl inspect`: after fixes **0 missing imports in all 16**. Added:
   - `XMemVirtualQuery(process, address, info) → BOOL` (signature from the call sites in XboxBvhBuilder, objdump from msys64):
     info = MEMORY_BASIC_INFORMATION + a field @48, bits 0–1 = memory readable by the CPU (message on error:
