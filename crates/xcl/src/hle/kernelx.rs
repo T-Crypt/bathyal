@@ -498,19 +498,19 @@ pub unsafe extern "system" fn XMemFreeDefault(p: *mut c_void, attrs: u64) {
     }
 }
 
-type XMemAllocFn = unsafe extern "system" fn(usize, u64) -> *mut c_void;
-type XMemFreeFn = unsafe extern "system" fn(*mut c_void, u64);
+type XMemAllocFn = unsafe extern "system-unwind" fn(usize, u64) -> *mut c_void;
+type XMemFreeFn = unsafe extern "system-unwind" fn(*mut c_void, u64);
 static XMEM_ALLOC_HOOK: AtomicUsize = AtomicUsize::new(0);
 static XMEM_FREE_HOOK: AtomicUsize = AtomicUsize::new(0);
 
-pub unsafe extern "system" fn XMemAlloc(size: usize, attrs: u64) -> *mut c_void {
+pub unsafe extern "system-unwind" fn XMemAlloc(size: usize, attrs: u64) -> *mut c_void {
     match XMEM_ALLOC_HOOK.load(Ordering::Acquire) {
         0 => XMemAllocDefault(size, attrs),
         f => std::mem::transmute::<usize, XMemAllocFn>(f)(size, attrs),
     }
 }
 
-pub unsafe extern "system" fn XMemFree(p: *mut c_void, attrs: u64) {
+pub unsafe extern "system-unwind" fn XMemFree(p: *mut c_void, attrs: u64) {
     match XMEM_FREE_HOOK.load(Ordering::Acquire) {
         0 => XMemFreeDefault(p, attrs),
         f => std::mem::transmute::<usize, XMemFreeFn>(f)(p, attrs),
@@ -1443,11 +1443,11 @@ fn load_library_impl(name: Option<String>) -> usize {
     }
 }
 
-pub unsafe extern "system" fn LoadLibraryW(name: *const u16) -> usize {
+pub unsafe extern "system-unwind" fn LoadLibraryW(name: *const u16) -> usize {
     load_library_impl(from_wide_ptr(name))
 }
 
-pub unsafe extern "system" fn LoadLibraryA(name: *const u8) -> usize {
+pub unsafe extern "system-unwind" fn LoadLibraryA(name: *const u8) -> usize {
     load_library_impl(from_ansi_ptr(name))
 }
 
@@ -1456,7 +1456,7 @@ unsafe fn load_as_data(name: &str, file: HANDLE, flags: u32) -> usize {
     ll::LoadLibraryExW(crate::util::wide(&real).as_ptr(), file, flags) as usize
 }
 
-pub unsafe extern "system" fn LoadLibraryExW(name: *const u16, file: HANDLE, flags: u32) -> usize {
+pub unsafe extern "system-unwind" fn LoadLibraryExW(name: *const u16, file: HANDLE, flags: u32) -> usize {
     if flags & LOAD_AS_DATA != 0 {
         let Some(name) = from_wide_ptr(name) else {
             fnd::SetLastError(fnd::ERROR_INVALID_PARAMETER);
@@ -1467,7 +1467,7 @@ pub unsafe extern "system" fn LoadLibraryExW(name: *const u16, file: HANDLE, fla
     load_library_impl(from_wide_ptr(name))
 }
 
-pub unsafe extern "system" fn LoadLibraryExA(name: *const u8, file: HANDLE, flags: u32) -> usize {
+pub unsafe extern "system-unwind" fn LoadLibraryExA(name: *const u8, file: HANDLE, flags: u32) -> usize {
     if flags & LOAD_AS_DATA != 0 {
         let Some(name) = from_ansi_ptr(name) else {
             fnd::SetLastError(fnd::ERROR_INVALID_PARAMETER);
@@ -1478,11 +1478,11 @@ pub unsafe extern "system" fn LoadLibraryExA(name: *const u8, file: HANDLE, flag
     load_library_impl(from_ansi_ptr(name))
 }
 
-pub unsafe extern "system" fn LoadPackagedLibrary(name: *const u16, _reserved: u32) -> usize {
+pub unsafe extern "system-unwind" fn LoadPackagedLibrary(name: *const u16, _reserved: u32) -> usize {
     load_library_impl(from_wide_ptr(name))
 }
 
-pub unsafe extern "system" fn GetProcAddress(h: usize, name: *const u8) -> usize {
+pub unsafe extern "system-unwind" fn GetProcAddress(h: usize, name: *const u8) -> usize {
     if name.is_null() {
         fnd::SetLastError(fnd::ERROR_INVALID_PARAMETER);
         return 0;
@@ -2367,5 +2367,87 @@ mod tests {
         let stub_h = modules::hle_handle("unit_stub_probe.dll");
         assert_ne!(stub_h, 0);
         assert_eq!(module_handle_in(&reg, "unit_stub_probe.dll"), stub_h);
+    }
+
+    #[test]
+    fn xmem_allocation_hooks_unwind_cleanly() {
+        use std::sync::atomic::AtomicU32;
+
+        // Unique sentinel attributes so concurrent unit tests calling XMemAlloc/XMemFree
+        // continue using the default allocator undisturbed.
+        const SENTINEL_ATTRS: u64 = 0xDEAD_BEEF_CAFE_0001;
+        static DROPS: AtomicU32 = AtomicU32::new(0);
+
+        struct DropProbe;
+        impl Drop for DropProbe {
+            fn drop(&mut self) {
+                DROPS.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        struct HookReset;
+        impl Drop for HookReset {
+            fn drop(&mut self) {
+                unsafe { XMemSetAllocationHooks(0, 0) };
+                TITLE_HOOKS[0].store(0, Ordering::Release);
+                TITLE_HOOKS[1].store(0, Ordering::Release);
+            }
+        }
+
+        unsafe extern "system-unwind" fn throwing_alloc(size: usize, attrs: u64) -> *mut c_void {
+            if attrs == SENTINEL_ATTRS {
+                let _probe = DropProbe;
+                panic!("guest XMemAlloc hook unwind");
+            }
+            XMemAllocDefault(size, attrs)
+        }
+
+        unsafe extern "system-unwind" fn throwing_free(p: *mut c_void, attrs: u64) {
+            if attrs == SENTINEL_ATTRS {
+                let _probe = DropProbe;
+                panic!("guest XMemFree hook unwind");
+            }
+            XMemFreeDefault(p, attrs);
+        }
+
+        // Separate title hooks whose non-sentinel fallback returns null / no-op (matching
+        // `TITLE_HOOKS == [0, 0]`) so concurrent D3D12 tests calling `runtime_alloc` do not
+        // receive `Memory::Title` allocations that would miss `TITLE_HOOKS[1]` after reset.
+        unsafe extern "system-unwind" fn throwing_title_alloc(_size: usize, attrs: u64) -> *mut c_void {
+            if attrs == SENTINEL_ATTRS {
+                let _probe = DropProbe;
+                panic!("guest title runtime_alloc hook unwind");
+            }
+            std::ptr::null_mut()
+        }
+
+        unsafe extern "system-unwind" fn throwing_title_free(_p: *mut c_void, attrs: u64) {
+            if attrs == SENTINEL_ATTRS {
+                let _probe = DropProbe;
+                panic!("guest title runtime_free hook unwind");
+            }
+        }
+
+        let _reset = HookReset;
+        DROPS.store(0, Ordering::SeqCst);
+
+        unsafe {
+            XMemSetAllocationHooks(throwing_alloc as usize, throwing_free as usize);
+            TITLE_HOOKS[0].store(throwing_title_alloc as usize, Ordering::Release);
+            TITLE_HOOKS[1].store(throwing_title_free as usize, Ordering::Release);
+
+            let r1 = std::panic::catch_unwind(|| XMemAlloc(64, SENTINEL_ATTRS));
+            assert!(r1.is_err(), "XMemAlloc should propagate unwind from guest alloc hook");
+
+            let r2 = std::panic::catch_unwind(|| XMemFree(0x1000 as *mut c_void, SENTINEL_ATTRS));
+            assert!(r2.is_err(), "XMemFree should propagate unwind from guest free hook");
+
+            let r3 = std::panic::catch_unwind(|| runtime_alloc(64, SENTINEL_ATTRS));
+            assert!(r3.is_err(), "runtime_alloc should propagate unwind from title alloc hook");
+
+            let r4 = std::panic::catch_unwind(|| runtime_free(0x1000, SENTINEL_ATTRS));
+            assert!(r4.is_err(), "runtime_free should propagate unwind from title free hook");
+        }
+        assert_eq!(DROPS.load(Ordering::SeqCst), 4, "Drop guards must run on every unwound FFI call");
     }
 }

@@ -7,7 +7,7 @@ use std::sync::atomic::Ordering;
 /// Our own TLS callback: ntdll calls it for every thread start/exit in the process.
 /// In host mode it initialises the game's static TLS for the new thread and forwards
 /// the notification to the game's TLS callbacks / DllMains.
-unsafe extern "system" fn xcl_tls_callback(_h: *mut c_void, reason: u32, _r: *mut c_void) {
+unsafe extern "system-unwind" fn xcl_tls_callback(_h: *mut c_void, reason: u32, _r: *mut c_void) {
     if xcl::host::HOST_MODE.load(Ordering::Acquire) {
         xcl::loader::on_tls_event(reason);
     }
@@ -15,7 +15,7 @@ unsafe extern "system" fn xcl_tls_callback(_h: *mut c_void, reason: u32, _r: *mu
 
 #[used]
 #[link_section = ".CRT$XLY"]
-static XCL_TLS_CALLBACK: unsafe extern "system" fn(*mut c_void, u32, *mut c_void) = xcl_tls_callback;
+static XCL_TLS_CALLBACK: unsafe extern "system-unwind" fn(*mut c_void, u32, *mut c_void) = xcl_tls_callback;
 
 const HELP: &str = "\
 XCL – Xbox Series X|S → Windows compatibility layer

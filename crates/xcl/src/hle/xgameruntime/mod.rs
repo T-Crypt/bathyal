@@ -476,7 +476,7 @@ pub unsafe extern "system" fn XPersistentLocalStorageGetSpaceInfo(info: *mut XPe
 
 static SAVE_FILES_IDENTITY: u8 = 0;
 
-pub unsafe extern "system" fn XGameSaveFilesGetFolderWithUiAsync(_user: *mut c_void, scid: *const u8, b: *mut XAsyncBlock) -> HRESULT {
+pub unsafe extern "system-unwind" fn XGameSaveFilesGetFolderWithUiAsync(_user: *mut c_void, scid: *const u8, b: *mut XAsyncBlock) -> HRESULT {
     let scid = crate::util::from_cstr_ptr(scid).unwrap_or_else(|| "default".into());
     let safe: String = scid.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '_' }).collect();
     begin_with(b, &SAVE_FILES_IDENTITY as *const u8 as usize, move || {
@@ -488,7 +488,7 @@ pub unsafe extern "system" fn XGameSaveFilesGetFolderWithUiAsync(_user: *mut c_v
     })
 }
 
-pub unsafe extern "system" fn XGameSaveFilesGetFolderWithUiResult(b: *mut XAsyncBlock, size: usize, buf: *mut u8) -> HRESULT {
+pub unsafe extern "system-unwind" fn XGameSaveFilesGetFolderWithUiResult(b: *mut XAsyncBlock, size: usize, buf: *mut u8) -> HRESULT {
     XAsyncGetResult(b, &SAVE_FILES_IDENTITY as *const u8 as *const c_void, size, buf as *mut c_void, std::ptr::null_mut())
 }
 
@@ -514,7 +514,7 @@ unsafe fn valid_user(h: *mut c_void) -> bool {
     h == user_ptr()
 }
 
-pub unsafe extern "system" fn XUserAddAsync(options: u32, b: *mut XAsyncBlock) -> HRESULT {
+pub unsafe extern "system-unwind" fn XUserAddAsync(options: u32, b: *mut XAsyncBlock) -> HRESULT {
     crate::xlog_info!("XUserAddAsync(options={options:#x}) → local offline user '{}'", crate::state::config().gamertag);
     begin_with(b, &USER_ADD_IDENTITY as *const u8 as usize, || {
         USER.refs.fetch_add(1, Ordering::AcqRel);
@@ -522,7 +522,7 @@ pub unsafe extern "system" fn XUserAddAsync(options: u32, b: *mut XAsyncBlock) -
     })
 }
 
-pub unsafe extern "system" fn XUserAddResult(b: *mut XAsyncBlock, out: *mut *mut c_void) -> HRESULT {
+pub unsafe extern "system-unwind" fn XUserAddResult(b: *mut XAsyncBlock, out: *mut *mut c_void) -> HRESULT {
     if out.is_null() {
         return E_INVALIDARG;
     }
@@ -753,7 +753,7 @@ fn note_token_request(method: &str, url: &str) -> Result<(), HRESULT> {
     }
 }
 
-pub unsafe extern "system" fn XUserGetTokenAndSignatureAsync(
+pub unsafe extern "system-unwind" fn XUserGetTokenAndSignatureAsync(
     user: *mut c_void,
     _options: u32,
     method: *const u8,
@@ -781,7 +781,7 @@ pub unsafe extern "system" fn XUserGetTokenAndSignatureResultSize(b: *mut XAsync
     XAsyncGetResultSize(b, size)
 }
 
-pub unsafe extern "system" fn XUserGetTokenAndSignatureResult(
+pub unsafe extern "system-unwind" fn XUserGetTokenAndSignatureResult(
     b: *mut XAsyncBlock,
     buffer_size: usize,
     buffer: *mut c_void,
@@ -795,7 +795,7 @@ pub unsafe extern "system" fn XUserGetTokenAndSignatureResult(
     hr
 }
 
-pub unsafe extern "system" fn XUserGetTokenAndSignatureUtf16Async(
+pub unsafe extern "system-unwind" fn XUserGetTokenAndSignatureUtf16Async(
     user: *mut c_void,
     _options: u32,
     method: *const u16,
@@ -823,7 +823,7 @@ pub unsafe extern "system" fn XUserGetTokenAndSignatureUtf16ResultSize(b: *mut X
     XAsyncGetResultSize(b, size)
 }
 
-pub unsafe extern "system" fn XUserGetTokenAndSignatureUtf16Result(
+pub unsafe extern "system-unwind" fn XUserGetTokenAndSignatureUtf16Result(
     b: *mut XAsyncBlock,
     buffer_size: usize,
     buffer: *mut c_void,
@@ -864,9 +864,9 @@ struct AssociationCall {
     change: DeviceAssociationChange,
 }
 
-unsafe extern "system" fn association_call(rec: *mut c_void, _canceled: bool) {
+unsafe extern "system-unwind" fn association_call(rec: *mut c_void, _canceled: bool) {
     let r = Box::from_raw(rec as *mut AssociationCall);
-    let f: unsafe extern "system" fn(*mut c_void, *const DeviceAssociationChange) = std::mem::transmute(r.cb);
+    let f: unsafe extern "system-unwind" fn(*mut c_void, *const DeviceAssociationChange) = std::mem::transmute(r.cb);
     f(r.ctx as *mut c_void, &r.change);
 }
 
@@ -888,7 +888,7 @@ unsafe fn notify_association(queue: usize, ctx: usize, cb: usize) {
 /// title hears of it here: Minecraft marks its controller "connected" only from this
 /// callback (device arrival alone just attaches the device to the user's player), and its
 /// Ore UI screens take gamepad input only from a connected controller.
-pub unsafe extern "system" fn XUserRegisterForDeviceAssociationChanged(queue: *mut c_void, ctx: *mut c_void, cb: usize, token: *mut u64) -> HRESULT {
+pub unsafe extern "system-unwind" fn XUserRegisterForDeviceAssociationChanged(queue: *mut c_void, ctx: *mut c_void, cb: usize, token: *mut u64) -> HRESULT {
     if token.is_null() || cb == 0 {
         return E_INVALIDARG;
     }
@@ -932,14 +932,14 @@ pub unsafe extern "system" fn XUserFindForDevice(_device: *const c_void, out: *m
     S_OK
 }
 
-pub unsafe extern "system" fn XUserFindControllerForUserWithUiAsync(user: *mut c_void, b: *mut XAsyncBlock) -> HRESULT {
+pub unsafe extern "system-unwind" fn XUserFindControllerForUserWithUiAsync(user: *mut c_void, b: *mut XAsyncBlock) -> HRESULT {
     if !valid_user(user) {
         return E_INVALIDARG;
     }
     begin_with(b, &FIND_CONTROLLER_ID as *const u8 as usize, || Ok(crate::hle::gameinput::gamepad_device_id().to_vec()))
 }
 
-pub unsafe extern "system" fn XUserFindControllerForUserWithUiResult(b: *mut XAsyncBlock, device_id: *mut [u8; 32]) -> HRESULT {
+pub unsafe extern "system-unwind" fn XUserFindControllerForUserWithUiResult(b: *mut XAsyncBlock, device_id: *mut [u8; 32]) -> HRESULT {
     if device_id.is_null() {
         return E_INVALIDARG;
     }

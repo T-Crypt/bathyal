@@ -72,11 +72,11 @@ pub unsafe extern "system" fn XNetworkingQueryPreferredLocalUdpMultiplayerPort(p
     S_OK
 }
 
-pub unsafe extern "system" fn XNetworkingQueryPreferredLocalUdpMultiplayerPortAsync(b: *mut XAsyncBlock) -> HRESULT {
+pub unsafe extern "system-unwind" fn XNetworkingQueryPreferredLocalUdpMultiplayerPortAsync(b: *mut XAsyncBlock) -> HRESULT {
     begin_with(b, &UDP_PORT_ID as *const u8 as usize, || Ok(DEFAULT_UDP_PORT.to_le_bytes().to_vec()))
 }
 
-pub unsafe extern "system" fn XNetworkingQueryPreferredLocalUdpMultiplayerPortAsyncResult(
+pub unsafe extern "system-unwind" fn XNetworkingQueryPreferredLocalUdpMultiplayerPortAsyncResult(
     b: *mut XAsyncBlock,
     port: *mut u16,
 ) -> HRESULT {
@@ -119,7 +119,7 @@ fn default_security_info_bytes() -> Vec<u8> {
     out
 }
 
-pub unsafe extern "system" fn XNetworkingQuerySecurityInformationForUrlAsync(
+pub unsafe extern "system-unwind" fn XNetworkingQuerySecurityInformationForUrlAsync(
     url: *const u8,
     b: *mut XAsyncBlock,
 ) -> HRESULT {
@@ -137,7 +137,7 @@ pub unsafe extern "system" fn XNetworkingQuerySecurityInformationForUrlAsyncResu
 }
 
 /// Note the GDK parameter order: `buffer_used` precedes `buffer` and `out_ptr`.
-pub unsafe extern "system" fn XNetworkingQuerySecurityInformationForUrlAsyncResult(
+pub unsafe extern "system-unwind" fn XNetworkingQuerySecurityInformationForUrlAsyncResult(
     b: *mut XAsyncBlock,
     buffer_size: usize,
     buffer_used: *mut usize,
@@ -147,7 +147,7 @@ pub unsafe extern "system" fn XNetworkingQuerySecurityInformationForUrlAsyncResu
     security_info_result(&SEC_INFO_ID as *const u8 as *const c_void, b, buffer_size, buffer_used, buffer, out_ptr)
 }
 
-pub unsafe extern "system" fn XNetworkingQuerySecurityInformationForUrlUtf16Async(
+pub unsafe extern "system-unwind" fn XNetworkingQuerySecurityInformationForUrlUtf16Async(
     url: *const u16,
     b: *mut XAsyncBlock,
 ) -> HRESULT {
@@ -164,7 +164,7 @@ pub unsafe extern "system" fn XNetworkingQuerySecurityInformationForUrlUtf16Asyn
     XAsyncGetResultSize(b, size)
 }
 
-pub unsafe extern "system" fn XNetworkingQuerySecurityInformationForUrlUtf16AsyncResult(
+pub unsafe extern "system-unwind" fn XNetworkingQuerySecurityInformationForUrlUtf16AsyncResult(
     b: *mut XAsyncBlock,
     buffer_size: usize,
     buffer_used: *mut usize,

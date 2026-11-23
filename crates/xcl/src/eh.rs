@@ -61,7 +61,7 @@ pub fn set_title_filter(f: usize) -> usize {
     TITLE_FILTER.swap(f, Ordering::AcqRel)
 }
 
-unsafe extern "system" fn unhandled_filter(info: *const EXCEPTION_POINTERS) -> i32 {
+unsafe extern "system-unwind" fn unhandled_filter(info: *const EXCEPTION_POINTERS) -> i32 {
     crate::hle::d3d12x::real::log_device_removed();
     if !info.is_null() && !(*info).ExceptionRecord.is_null() {
         let rec = &*(*info).ExceptionRecord;
@@ -114,7 +114,7 @@ unsafe extern "system" fn unhandled_filter(info: *const EXCEPTION_POINTERS) -> i
     }
     match TITLE_FILTER.load(Ordering::Acquire) {
         0 => 0, // EXCEPTION_CONTINUE_SEARCH
-        f => std::mem::transmute::<usize, unsafe extern "system" fn(*const EXCEPTION_POINTERS) -> i32>(f)(info),
+        f => std::mem::transmute::<usize, unsafe extern "system-unwind" fn(*const EXCEPTION_POINTERS) -> i32>(f)(info),
     }
 }
 
@@ -146,7 +146,11 @@ pub fn install_crash_handler() {
         if let Err(e) = hooks::hook("ntdll.dll", "NtTerminateProcess", hk_nt_terminate_process as usize, &ORIG_NT_TERMINATE) {
             crate::xlog_warn!("{e}");
         }
-        SetUnhandledExceptionFilter(Some(unhandled_filter));
+        // SAFETY: `extern "system-unwind"` and `extern "system"` share the identical Win64 ABI;
+        // Windows `UnhandledExceptionFilter` guards the filter call with SEH.
+        let filter: unsafe extern "system" fn(*const EXCEPTION_POINTERS) -> i32 =
+            std::mem::transmute::<unsafe extern "system-unwind" fn(*const EXCEPTION_POINTERS) -> i32, _>(unhandled_filter);
+        SetUnhandledExceptionFilter(Some(filter));
         install_invalid_parameter_handler();
         windows_sys::Win32::System::Diagnostics::Debug::AddVectoredExceptionHandler(0, Some(cpp_exception_logger));
     }
@@ -1124,5 +1128,27 @@ mod tests {
             modules::unregister_mapped(page as usize);
             VirtualFree(page as _, 0, MEM_RELEASE);
         }
+    }
+
+    static TITLE_FILTER_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn unhandled_filter_unwinds_cleanly_from_title_filter() {
+        let _serial = TITLE_FILTER_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        struct ResetFilter(usize);
+        impl Drop for ResetFilter {
+            fn drop(&mut self) {
+                set_title_filter(self.0);
+            }
+        }
+
+        unsafe extern "system-unwind" fn throwing_title_filter(_info: *const EXCEPTION_POINTERS) -> i32 {
+            panic!("guest unhandled exception filter unwind");
+        }
+
+        let prev = set_title_filter(throwing_title_filter as usize);
+        let _reset = ResetFilter(prev);
+        let r = std::panic::catch_unwind(|| unsafe { unhandled_filter(std::ptr::null()) });
+        assert!(r.is_err(), "unhandled_filter must propagate unwind from guest title filter");
     }
 }

@@ -534,13 +534,13 @@ struct DecodedVoiceHandle {
 // IXAudio2VoiceCallback vtable (7 methods, no IUnknown).
 #[repr(C)]
 struct VoiceCallbackVtbl {
-    pass_start: unsafe extern "system" fn(*mut c_void, u32),
-    pass_end: unsafe extern "system" fn(*mut c_void),
-    stream_end: unsafe extern "system" fn(*mut c_void),
-    buffer_start: unsafe extern "system" fn(*mut c_void, *mut c_void),
-    buffer_end: unsafe extern "system" fn(*mut c_void, *mut c_void),
-    loop_end: unsafe extern "system" fn(*mut c_void, *mut c_void),
-    voice_error: unsafe extern "system" fn(*mut c_void, *mut c_void, HRESULT),
+    pass_start: unsafe extern "system-unwind" fn(*mut c_void, u32),
+    pass_end: unsafe extern "system-unwind" fn(*mut c_void),
+    stream_end: unsafe extern "system-unwind" fn(*mut c_void),
+    buffer_start: unsafe extern "system-unwind" fn(*mut c_void, *mut c_void),
+    buffer_end: unsafe extern "system-unwind" fn(*mut c_void, *mut c_void),
+    loop_end: unsafe extern "system-unwind" fn(*mut c_void, *mut c_void),
+    voice_error: unsafe extern "system-unwind" fn(*mut c_void, *mut c_void, HRESULT),
 }
 
 #[repr(C)]
@@ -561,28 +561,28 @@ unsafe fn title_cb_vtbl(cb: usize) -> Option<(*mut c_void, *const VoiceCallbackV
     Some((obj, vtbl))
 }
 
-unsafe extern "system" fn decoded_cb_pass_start(this: *mut c_void, bytes: u32) {
+unsafe extern "system-unwind" fn decoded_cb_pass_start(this: *mut c_void, bytes: u32) {
     let cb = &*(this as *const DecodedCallback);
     if let Some((obj, vt)) = title_cb_vtbl(cb.state.title_cb) {
         ((*vt).pass_start)(obj, bytes);
     }
 }
 
-unsafe extern "system" fn decoded_cb_pass_end(this: *mut c_void) {
+unsafe extern "system-unwind" fn decoded_cb_pass_end(this: *mut c_void) {
     let cb = &*(this as *const DecodedCallback);
     if let Some((obj, vt)) = title_cb_vtbl(cb.state.title_cb) {
         ((*vt).pass_end)(obj);
     }
 }
 
-unsafe extern "system" fn decoded_cb_stream_end(this: *mut c_void) {
+unsafe extern "system-unwind" fn decoded_cb_stream_end(this: *mut c_void) {
     let cb = &*(this as *const DecodedCallback);
     if let Some((obj, vt)) = title_cb_vtbl(cb.state.title_cb) {
         ((*vt).stream_end)(obj);
     }
 }
 
-unsafe extern "system" fn decoded_cb_buffer_start(this: *mut c_void, ctx: *mut c_void) {
+unsafe extern "system-unwind" fn decoded_cb_buffer_start(this: *mut c_void, ctx: *mut c_void) {
     let cb = &*(this as *const DecodedCallback);
     let orig = cb
         .state
@@ -597,7 +597,7 @@ unsafe extern "system" fn decoded_cb_buffer_start(this: *mut c_void, ctx: *mut c
     }
 }
 
-unsafe extern "system" fn decoded_cb_buffer_end(this: *mut c_void, ctx: *mut c_void) {
+unsafe extern "system-unwind" fn decoded_cb_buffer_end(this: *mut c_void, ctx: *mut c_void) {
     let cb = &*(this as *const DecodedCallback);
     // Remove and drop the decoded PCM buffer before invoking the title's callback so
     // the lock is released and no double-free or deadlock can occur.
@@ -609,7 +609,7 @@ unsafe extern "system" fn decoded_cb_buffer_end(this: *mut c_void, ctx: *mut c_v
     }
 }
 
-unsafe extern "system" fn decoded_cb_loop_end(this: *mut c_void, ctx: *mut c_void) {
+unsafe extern "system-unwind" fn decoded_cb_loop_end(this: *mut c_void, ctx: *mut c_void) {
     let cb = &*(this as *const DecodedCallback);
     let orig = cb
         .state
@@ -624,7 +624,7 @@ unsafe extern "system" fn decoded_cb_loop_end(this: *mut c_void, ctx: *mut c_voi
     }
 }
 
-unsafe extern "system" fn decoded_cb_voice_error(this: *mut c_void, ctx: *mut c_void, hr: HRESULT) {
+unsafe extern "system-unwind" fn decoded_cb_voice_error(this: *mut c_void, ctx: *mut c_void, hr: HRESULT) {
     let cb = &*(this as *const DecodedCallback);
     let orig = cb
         .state
@@ -1314,19 +1314,19 @@ mod tests {
         static STARTED: AtomicUsize = AtomicUsize::new(0);
         static STREAM_END: AtomicUsize = AtomicUsize::new(0);
 
-        unsafe extern "system" fn on_pass_start(_: *mut c_void, _: u32) {}
-        unsafe extern "system" fn on_nothing(_: *mut c_void) {}
-        unsafe extern "system" fn on_stream_end(_: *mut c_void) {
+        unsafe extern "system-unwind" fn on_pass_start(_: *mut c_void, _: u32) {}
+        unsafe extern "system-unwind" fn on_nothing(_: *mut c_void) {}
+        unsafe extern "system-unwind" fn on_stream_end(_: *mut c_void) {
             STREAM_END.fetch_add(1, Ordering::SeqCst);
         }
-        unsafe extern "system" fn on_buf_start(_: *mut c_void, ctx: *mut c_void) {
+        unsafe extern "system-unwind" fn on_buf_start(_: *mut c_void, ctx: *mut c_void) {
             STARTED.fetch_add(ctx as usize, Ordering::SeqCst);
         }
-        unsafe extern "system" fn on_buf_end(_: *mut c_void, ctx: *mut c_void) {
+        unsafe extern "system-unwind" fn on_buf_end(_: *mut c_void, ctx: *mut c_void) {
             ENDED.fetch_add(ctx as usize, Ordering::SeqCst);
         }
-        unsafe extern "system" fn on_loop(_: *mut c_void, _: *mut c_void) {}
-        unsafe extern "system" fn on_err(_: *mut c_void, _: *mut c_void, _: HRESULT) {}
+        unsafe extern "system-unwind" fn on_loop(_: *mut c_void, _: *mut c_void) {}
+        unsafe extern "system-unwind" fn on_err(_: *mut c_void, _: *mut c_void, _: HRESULT) {}
 
         static TEST_VTBL: VoiceCallbackVtbl = VoiceCallbackVtbl {
             pass_start: on_pass_start,
@@ -1461,19 +1461,19 @@ mod tests {
         static STARTED: AtomicUsize = AtomicUsize::new(0);
         static STREAM_END: AtomicUsize = AtomicUsize::new(0);
 
-        unsafe extern "system" fn on_pass_start(_: *mut c_void, _: u32) {}
-        unsafe extern "system" fn on_nothing(_: *mut c_void) {}
-        unsafe extern "system" fn on_stream_end(_: *mut c_void) {
+        unsafe extern "system-unwind" fn on_pass_start(_: *mut c_void, _: u32) {}
+        unsafe extern "system-unwind" fn on_nothing(_: *mut c_void) {}
+        unsafe extern "system-unwind" fn on_stream_end(_: *mut c_void) {
             STREAM_END.fetch_add(1, Ordering::SeqCst);
         }
-        unsafe extern "system" fn on_buf_start(_: *mut c_void, ctx: *mut c_void) {
+        unsafe extern "system-unwind" fn on_buf_start(_: *mut c_void, ctx: *mut c_void) {
             STARTED.fetch_add(ctx as usize, Ordering::SeqCst);
         }
-        unsafe extern "system" fn on_buf_end(_: *mut c_void, ctx: *mut c_void) {
+        unsafe extern "system-unwind" fn on_buf_end(_: *mut c_void, ctx: *mut c_void) {
             ENDED.fetch_add(ctx as usize, Ordering::SeqCst);
         }
-        unsafe extern "system" fn on_loop(_: *mut c_void, _: *mut c_void) {}
-        unsafe extern "system" fn on_err(_: *mut c_void, _: *mut c_void, _: HRESULT) {}
+        unsafe extern "system-unwind" fn on_loop(_: *mut c_void, _: *mut c_void) {}
+        unsafe extern "system-unwind" fn on_err(_: *mut c_void, _: *mut c_void, _: HRESULT) {}
 
         static TEST_VTBL: VoiceCallbackVtbl = VoiceCallbackVtbl {
             pass_start: on_pass_start,
@@ -1756,5 +1756,55 @@ mod tests {
             assert_eq!(submit(guard.voice, &sb2, std::ptr::null()), S_OK);
             assert_eq!(flush(guard.voice), S_OK);
         }
+    }
+
+    #[test]
+    fn decoded_voice_callback_unwinds_cleanly_and_frees_buffer() {
+        unsafe extern "system-unwind" fn noop_u32(_: *mut c_void, _: u32) {}
+        unsafe extern "system-unwind" fn noop(_: *mut c_void) {}
+        unsafe extern "system-unwind" fn noop_ptr(_: *mut c_void, _: *mut c_void) {}
+        unsafe extern "system-unwind" fn throwing_buf_end(_: *mut c_void, ctx: *mut c_void) {
+            assert_eq!(ctx as usize, 0xCAFE_BABE);
+            panic!("guest IXAudio2VoiceCallback::OnBufferEnd unwind");
+        }
+        unsafe extern "system-unwind" fn noop_err(_: *mut c_void, _: *mut c_void, _: HRESULT) {}
+
+        static THROW_VTBL: VoiceCallbackVtbl = VoiceCallbackVtbl {
+            pass_start: noop_u32,
+            pass_end: noop,
+            stream_end: noop,
+            buffer_start: noop_ptr,
+            buffer_end: throwing_buf_end,
+            loop_end: noop_ptr,
+            voice_error: noop_err,
+        };
+        #[repr(C)]
+        struct ThrowCb {
+            vtbl: &'static VoiceCallbackVtbl,
+        }
+        static THROW_CB: ThrowCb = ThrowCb { vtbl: &THROW_VTBL };
+
+        let mut xma_fmt = xma2(1, 48_000, 6080, 2048, 1);
+        xma_fmt.num_streams = 1;
+        let dec = xma2::Decoder::new(unsafe { xma_stream_config(&xma_fmt.wfx).unwrap().unwrap() }).unwrap();
+        let state = Arc::new(DecodedVoiceState {
+            decoder: Mutex::new(VoiceDecoder::Xma { decoder: dec, info: XmaInfo::default() }),
+            block_align: 2048,
+            channels: 1,
+            rate: 48_000,
+            avg_bytes: 6080,
+            title_cb: &THROW_CB as *const ThrowCb as usize,
+            live_buffers: Mutex::new(HashMap::new()),
+        });
+        let buf = Box::new(DecodedBuffer { orig_context: 0xCAFE_BABE, _pcm: vec![0u8; 64].into_boxed_slice() });
+        let tok = &*buf as *const DecodedBuffer as usize;
+        state.live_buffers.lock().unwrap().insert(tok, buf);
+
+        let wrapped = DecodedCallback { vtbl: &DECODED_CALLBACK_VTBL, state: Arc::clone(&state) };
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+            decoded_cb_buffer_end(&wrapped as *const DecodedCallback as *mut c_void, tok as *mut c_void);
+        }));
+        assert!(r.is_err(), "decoded_cb_buffer_end must propagate unwind from guest OnBufferEnd");
+        assert!(state.live_buffers.lock().unwrap().is_empty(), "decoded buffer must be freed and lock unpoisoned on unwind");
     }
 }
