@@ -26,7 +26,15 @@
 //! Textures the CPU fills (kept in step with the title's memory, `title_textures`) go on pages
 //! the same way, in a space of their own (`Space`): a title streaming its world places new
 //! textures over memory it used before and lets few of the old ones go, and a committed texture
-//! per placement held the sum of every texture ever placed (#248).
+//! per placement held the sum of every texture ever placed (#248). A texture whose address is
+//! not 64 KiB aligned goes on pages too: each of its tiles is shared by the title address it
+//! starts at, so placements at one address share and the memory is that of the addresses the
+//! title placed textures at, not of the placements. Two placements at different sub-page
+//! offsets of one page take a tile each, because a tile of a PC resource starts at the
+//! resource's own base and cannot show a page at another offset.
+//!
+//! `usage` tells the memory line what XCL's own video memory is taken by (pages of kept
+//! textures and of targets, own tiles, pool heaps, arenas, committed copies).
 
 use std::collections::HashSet;
 use std::ffi::c_void;
@@ -123,6 +131,9 @@ pub(super) fn is_placed_texture(resource: usize) -> bool {
 }
 
 pub(super) fn forget(resource: usize) {
+    if let Some(m) = COMMITTED.lock().unwrap().as_mut() {
+        m.remove(&resource);
+    }
     let placed = PLACED_TEXTURES.lock().unwrap().as_mut().is_some_and(|textures| textures.remove(&resource));
     if placed {
         forget_pages(resource);
@@ -162,7 +173,7 @@ unsafe fn arena_heap(dev: &ID3D12Device, va: usize, size: usize, align: usize) -
 }
 
 /// bytes of a page – of the title's addresses and of a tile
-const PAGE: usize = 0x1_0000;
+pub(super) const PAGE: usize = 0x1_0000;
 /// pages of a video-memory pool heap (64 MiB)
 const POOL_PAGES: u32 = 1024;
 /// a page no target uses any more is kept this long for the next target at its address (with
@@ -309,6 +320,16 @@ impl Book {
     fn bytes(&self) -> usize {
         (self.pages.len() + self.users.values().map(|u| u.2.len()).sum::<usize>()) * PAGE
     }
+
+    /// bytes of the pages of `space` (idle ones included)
+    fn pages_of(&self, space: Space) -> usize {
+        self.pages.keys().filter(|(s, _)| *s == space).count() * PAGE
+    }
+
+    /// bytes of the tiles past the title's memory that resources hold
+    fn own_tiles(&self) -> usize {
+        self.users.values().map(|u| u.2.len()).sum::<usize>() * PAGE
+    }
 }
 
 /// The title's pages of video memory for textures in its memory (see the module's comment).
@@ -415,10 +436,12 @@ fn heap_ranges(heap: u32, tiles: &[Tile]) -> Vec<(bool, u32, u32)> {
 
 /// A texture at `va` as a reserved resource on the title's pages there in `space`
 /// (`console_bytes`: its size on the console – the pages it covers; tiles past them are its
-/// own). None: it cannot be (the caller tries an arena or a resource of its own).
+/// own). `va` may be unaligned to a page: each tile is then shared by the title address it
+/// starts at (see the module's comment). None: it cannot be (the caller tries an arena or a
+/// resource of its own).
 #[allow(clippy::too_many_arguments)]
 unsafe fn place_on_pages(dev: &ID3D12Device, this: *mut c_void, space: Space, va: usize, desc: &D3D12_RESOURCE_DESC, state: u32, clear: *const c_void, console_bytes: Option<u64>, riid: *const windows_sys::core::GUID, ppv: *mut *mut c_void) -> Option<HRESULT> {
-    if va % PAGE != 0 || desc.Layout != D3D12_TEXTURE_LAYOUT_UNKNOWN {
+    if desc.Layout != D3D12_TEXTURE_LAYOUT_UNKNOWN {
         return None;
     }
     let mut g = PAGES.lock().unwrap();
@@ -461,6 +484,14 @@ fn forget_pages(resource: usize) {
     pages.book.release(resource, std::time::Instant::now());
 }
 
+/// A kept-in-step texture a newer placement shares its tiles with (a supersede): the book no
+/// longer counts its pages as used and its own tiles go back to the pools. The resource stays
+/// mapped onto the tiles it shares, as on the console, and reads what the newer placement and
+/// its uploads write there.
+pub(super) fn release_pages(resource: usize) {
+    forget_pages(resource)
+}
+
 /// A texture the title placed at `va` whose texels the CPU writes (kept in step with the memory,
 /// `title_textures`) as a reserved resource on the title's pages of such textures (`desc`: the PC
 /// description, `console_bytes` its size on the console). A title streams its world by placing
@@ -498,6 +529,68 @@ pub fn page_bytes() -> (usize, usize) {
     let g = PAGES.lock().unwrap();
     let Some(Some(p)) = g.as_ref() else { return (0, 0) };
     (p.book.bytes(), p.pools.len() * POOL_PAGES as usize * PAGE)
+}
+
+/// Committed PC copies of textures the title placed (`device_x`): resource → its bytes. They are
+/// the ones that cannot go on pages (an address the driver does not reserve, a description it
+/// refuses), and each one is a placement's own memory until the title releases it.
+static COMMITTED: Mutex<Option<std::collections::HashMap<usize, usize>>> = Mutex::new(None);
+
+/// A placed texture got a committed PC copy of its own (`bytes`: what the driver gave it).
+pub(super) unsafe fn note_committed_texture(this: *mut c_void, resource: usize) {
+    let Some(dev) = ID3D12Device::from_raw_borrowed(&this) else { return };
+    let Some(r) = ID3D12Resource::from_raw_borrowed(&resource) else { return };
+    let desc = r.GetDesc();
+    let bytes = dev.GetResourceAllocationInfo(0, &[desc]).SizeInBytes as usize;
+    if bytes == 0 || bytes == usize::MAX {
+        return;
+    }
+    COMMITTED.lock().unwrap().get_or_insert_with(std::collections::HashMap::new).insert(resource, bytes);
+}
+
+/// What XCL's own video memory is taken by, in bytes.
+#[derive(Clone, Copy, Default, Debug)]
+pub struct Usage {
+    /// pages in use by textures kept in step with the title's memory
+    pub kept_pages: usize,
+    /// pages in use by GPU-owned targets (render targets, depth buffers, UAV textures)
+    pub target_pages: usize,
+    /// tiles past the title's memory that resources hold
+    pub own_tiles: usize,
+    /// video memory of the pool heaps the pages come from
+    pub pool_heaps: usize,
+    /// of `pool_heaps`: tiles free or cooling down
+    pub pool_unused: usize,
+    /// video memory of the arenas (placements the driver will not make reserved)
+    pub arenas: usize,
+    /// committed PC copies of placed textures (not on pages)
+    pub committed: usize,
+    /// how many committed copies there are
+    pub committed_count: usize,
+}
+
+/// The video memory XCL holds now, by category (the memory line, `memstat`). Takes no lock that
+/// a title's thread may hold for long: what is busy reads as 0.
+pub fn usage() -> Usage {
+    let mut u = Usage::default();
+    if let Ok(a) = ARENAS.try_lock() {
+        u.arenas = a.bytes();
+    }
+    if let Ok(c) = COMMITTED.try_lock() {
+        if let Some(m) = c.as_ref() {
+            u.committed = m.values().sum();
+            u.committed_count = m.len();
+        }
+    }
+    let Ok(g) = PAGES.try_lock() else { return u };
+    if let Some(Some(p)) = g.as_ref() {
+        u.kept_pages = p.book.pages_of(Space::Textures);
+        u.target_pages = p.book.pages_of(Space::Targets);
+        u.own_tiles = p.book.own_tiles();
+        u.pool_heaps = p.pools.len() * POOL_PAGES as usize * PAGE;
+        u.pool_unused = (p.book.free.len() + p.book.cooling.len()) * PAGE;
+    }
+    u
 }
 
 /// Heaps of every kind of resource in one (resource heap tier 2) – else no arenas.
@@ -606,6 +699,44 @@ mod tests {
         }
         assert!(placed > 30 * SPAN, "the test places {placed} bytes");
         assert!(b.bytes() <= SPAN, "{} bytes of pages for a span of {SPAN}", b.bytes());
+    }
+
+    /// Textures at an address that is not 64 KiB aligned (the retail game packs most of its
+    /// streamed textures at 4 KiB): each tile is shared by the address it starts at, so
+    /// placements at one address are one memory and the cost is the addresses the title used,
+    /// not the placements. A placement at another sub-page offset takes tiles of its own (a PC
+    /// tile starts at its resource's base and cannot show a page at another offset).
+    #[test]
+    fn unaligned_textures_share_the_tiles_of_their_addresses() {
+        const SPAN: usize = 32 * MIB;
+        let (t, va) = (Instant::now(), 0x6_0000_0000usize);
+        let mut b = Book::new();
+        let mut grow = heaps();
+        // 4 KiB aligned, 16 pages (1 MiB): the same address placed many times, one memory
+        let a = va + 0x1000;
+        let first = b.claim(Space::Textures, 1, a, 16, 16, t, &mut grow).unwrap();
+        assert_eq!(b.claim(Space::Textures, 2, a, 16, 16, t, &mut grow).unwrap(), first, "placed again at the same address: the same memory");
+        assert_eq!(b.pages_of(Space::Textures), 16 * PAGE);
+        // a texture over it one page further on shares none of its tiles …
+        let over = b.claim(Space::Textures, 3, a + PAGE, 4, 4, t, &mut grow).unwrap();
+        assert!(over.iter().all(|x| !first.contains(x)), "tiles of another offset are its own");
+        // … and two page-aligned ones share every page: one address, one tile
+        let aligned = b.claim(Space::Textures, 4, va, 4, 4, t, &mut grow).unwrap();
+        assert!(aligned.iter().all(|x| !first.contains(x)), "a page-aligned base is another set of addresses");
+        assert_eq!(b.claim(Space::Textures, 5, va, 4, 4, t, &mut grow).unwrap(), aligned);
+        assert_eq!(b.claim(Space::Textures, 6, va + PAGE, 4, 4, t, &mut grow).unwrap()[..3], aligned[1..], "the pages both cover");
+        // 8000 streamed placements over 4 sub-page offsets of a span: the cost is the addresses
+        let mut placed = 0usize;
+        for res in 10..8010usize {
+            let pages = 1 + (res % 6);
+            let at = ((res * 4096 * 37) % (SPAN / PAGE - 8)) * PAGE + (res % 4) * 0x1000;
+            b.claim(Space::Textures, res, va + at, pages, pages, t, &mut grow).unwrap();
+            placed += pages * PAGE;
+        }
+        let pages = b.pages_of(Space::Textures);
+        println!("{placed} bytes placed, {pages} bytes of pages");
+        assert!(pages <= placed / 8, "{pages} bytes of pages for {placed} bytes placed");
+        assert!(pages <= 4 * SPAN, "{pages} bytes of pages for a span of {SPAN}");
     }
 
     /// A page no resource uses keeps its tile (and what it holds) for 2 s, then the tile cools

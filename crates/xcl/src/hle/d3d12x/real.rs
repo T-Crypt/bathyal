@@ -1777,7 +1777,8 @@ unsafe extern "system" fn res_gpu_va_x(this: *mut c_void) -> u64 {
 /// texels of the PC description (+ a third for mips and 64 KiB of padding), its pages committed
 /// as the title writes them (`kernelx::lazy`): the clears of GPU-written targets seen so far
 /// cost nothing until done. What the title writes there is not uploaded to the texture, and the
-/// memory stays with the address (not freed with the resource).
+/// memory stays with the address (not freed with the resource) – `texture_memory_bytes` counts
+/// it for the memory line.
 unsafe fn texture_memory(res: *mut c_void) -> Option<usize> {
     use windows_sys::Win32::System::Memory::{VirtualAlloc, MEM_RESERVE, PAGE_READWRITE};
     static LOCK: Mutex<()> = Mutex::new(());
@@ -1799,6 +1800,8 @@ unsafe fn texture_memory(res: *mut c_void) -> Option<usize> {
     if p == 0 {
         return None;
     }
+    RESERVED_BYTES.fetch_add(bytes as usize, Ordering::Relaxed);
+    RESERVED_N.fetch_add(1, Ordering::Relaxed);
     for page in (p..p + bytes as usize).step_by(0x1_0000) {
         crate::hle::kernelx::lazy::mark(page);
     }
@@ -1814,6 +1817,16 @@ unsafe fn texture_memory(res: *mut c_void) -> Option<usize> {
         );
     }
     Some(p)
+}
+
+/// Reserved address space for the GPU addresses of committed textures (`texture_memory`): bytes
+/// and how many, for the memory line. They are never given back (see `texture_memory`).
+static RESERVED_BYTES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static RESERVED_N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// (bytes of reserved address space for textures' GPU addresses, how many) – the memory line
+pub fn texture_memory_bytes() -> (usize, usize) {
+    (RESERVED_BYTES.load(Ordering::Relaxed), RESERVED_N.load(Ordering::Relaxed))
 }
 
 fn note_buffer_view() {

@@ -1034,7 +1034,7 @@ unsafe fn create_placed_resource_inner(this: *mut c_void, va: u64, desc: *const 
         if let Some(hr) = super::vram::place_title_texture(this, va as usize, &pc, state, console_bytes, riid, ppv) {
             let res = *ppv;
             let tex = std::mem::replace(&mut kept, Err(String::new()));
-            if tex.and_then(|t| super::title_textures::register(this, res, va as usize, t, D3D12_RESOURCE_STATES(state as i32))).is_ok() {
+            if tex.and_then(|t| super::title_textures::register(this, res, va as usize, t, D3D12_RESOURCE_STATES(state as i32), true)).is_ok() {
                 real::note_title_address(res as usize, va as usize);
                 return hr;
             }
@@ -1049,8 +1049,11 @@ unsafe fn create_placed_resource_inner(this: *mut c_void, va: u64, desc: *const 
     let heap = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() };
     let hr = real::dev_create_committed_resource(this, &heap as *const _ as usize, 0, d.as_ptr() as usize, state as usize, clear as usize, riid, ppv);
     if hr >= 0 && !buffer && !(*ppv).is_null() {
+        // a texture that is not on the title's pages: a committed copy of its own, which the
+        // title's release frees (`vram::forget`) – the memory line counts them
+        super::vram::note_committed_texture(this, *ppv as usize);
         static M: AtomicU64 = AtomicU64::new(0);
-        match kept.and_then(|tex| super::title_textures::register(this, *ppv, va as usize, tex, D3D12_RESOURCE_STATES(state as i32))) {
+        match kept.and_then(|tex| super::title_textures::register(this, *ppv, va as usize, tex, D3D12_RESOURCE_STATES(state as i32), false)) {
             Ok(()) => {
                 real::note_title_address(*ppv as usize, va as usize);
                 return hr;

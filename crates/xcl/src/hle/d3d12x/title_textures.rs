@@ -137,11 +137,13 @@ pub(super) fn layout(desc: &[u8; 0x38]) -> Result<xg::Texture, String> {
 }
 
 /// A texture the title placed at `va` (its console layout `tex`, from `layout`): kept in step
-/// with the memory.
-pub(super) unsafe fn register(device: *mut c_void, res: *mut c_void, va: usize, tex: xg::Texture, state: D3D12_RESOURCE_STATES) -> Result<(), String> {
+/// with the memory. `shares_pages`: its video memory is the title's pages there (`vram`), so a
+/// newer placement over the same addresses shares it and supersedes this one (see `supersede`).
+pub(super) unsafe fn register(device: *mut c_void, res: *mut c_void, va: usize, tex: xg::Texture, state: D3D12_RESOURCE_STATES, shares_pages: bool) -> Result<(), String> {
     if ID3D12Resource::from_raw_borrowed(&res).is_none() {
         return Err("no resource".into());
     }
+    let len = tex.size() as usize;
     let src = mirror_source(va);
     if src != va {
         static N: AtomicU64 = AtomicU64::new(0);
@@ -164,7 +166,40 @@ pub(super) unsafe fn register(device: *mut c_void, res: *mut c_void, va: usize, 
         PENDING.fetch_add(1, Ordering::Relaxed);
     }
     TEXTURES_GEN.fetch_add(1, Ordering::Release);
+    if shares_pages {
+        supersede(va, len, res as usize);
+    }
     Ok(())
+}
+
+/// Older kept-in-step textures whose memory the placement of `len` bytes at `va` covers, on the
+/// same tile grid: their tiles are the new placement's tiles, so what the memory holds is the
+/// new texture's texels (as on the console, where the placement overwrites the memory). They
+/// are no longer uploaded and give their own tiles back; their objects stay mapped onto the
+/// shared tiles. An older texture at another sub-page offset keeps a copy of its own: its tiles
+/// are not the new one's.
+fn supersede(va: usize, len: usize, keep: usize) {
+    let dead: Vec<usize> = {
+        let t = TEXTURES.lock().unwrap();
+        t.iter()
+            .filter(|(&res, e)| {
+                res != keep && e.va >= va && e.va % super::vram::PAGE == va % super::vram::PAGE && (e.va - va) + e.tex.size() as usize <= len
+            })
+            .map(|(&res, _)| res)
+            .collect()
+    };
+    if dead.is_empty() {
+        return;
+    }
+    static N: AtomicU64 = AtomicU64::new(0);
+    let n = N.fetch_add(dead.len() as u64, Ordering::Relaxed) + dead.len() as u64;
+    if n <= 16 || n.is_power_of_two() {
+        crate::xlog_info!("D3D12.X: {n} kept-in-step textures superseded by placements over their memory; tiles given back");
+    }
+    for res in dead {
+        forget(res);
+        super::vram::release_pages(res);
+    }
 }
 
 /// Where a texture at `va` is read from: the CPU view behind a GPU view (`kernelx::mirrors`)
@@ -1020,6 +1055,52 @@ mod tests {
         assert_eq!(states()[4], D3D12_RESOURCE_STATE_COPY_SOURCE, "a reset list has nothing to apply");
         forget(res);
         assert!(LIST_NOTES.lock().unwrap().get(&l1).is_none());
+    }
+
+    /// A kept-in-step texture whose memory a newer placement at the same tile grid covers is
+    /// superseded: no longer uploaded (the memory holds the newer texture's texels, as on the
+    /// console) and no longer counted as using the pages. One at another sub-page offset is
+    /// not: its tiles are not the newer placement's.
+    #[test]
+    fn a_placement_over_an_older_kept_texture_supersedes_it() {
+        // RGBA8 512×512, one mip (1 MiB, 16 pages)
+        let mut d = [0u8; 0x38];
+        d[0..4].copy_from_slice(&3u32.to_le_bytes());
+        d[0x10..0x18].copy_from_slice(&512u64.to_le_bytes());
+        d[0x18..0x1C].copy_from_slice(&512u32.to_le_bytes());
+        d[0x1C..0x1E].copy_from_slice(&1u16.to_le_bytes());
+        d[0x1E..0x20].copy_from_slice(&1u16.to_le_bytes());
+        d[0x20..0x24].copy_from_slice(&28u32.to_le_bytes());
+        d[0x24..0x28].copy_from_slice(&1u32.to_le_bytes());
+        d[0x2C..0x30].copy_from_slice(&0x105u32.to_le_bytes());
+        let tex = || Arc::new(xg::Texture::new(&d).unwrap());
+        let len = tex().size() as usize;
+        let small = {
+            let mut s = d;
+            s[0x10..0x18].copy_from_slice(&64u64.to_le_bytes());
+            s[0x18..0x1C].copy_from_slice(&64u32.to_le_bytes());
+            Arc::new(xg::Texture::new(&s).unwrap())
+        };
+        let va = 0x7E57_1000_0000usize;
+        let entry = |at: usize, tex: Arc<xg::Texture>| Entry { device: 0, va: at, src: at, in_gpu_view: false, tex, states: vec![D3D12_RESOURCE_STATE_COMMON], pending: false, gpu_written: false, seq: 0 };
+        // fake resource keys, never dereferenced by `supersede` (no device: no pages to give back)
+        let (old, old_other_phase, new) = (0x7E57_2000_1000usize, 0x7E57_2000_2000usize, 0x7E57_2000_3000usize);
+        {
+            let mut t = TEXTURES.lock().unwrap();
+            t.insert(old, entry(va, tex()));
+            t.insert(old_other_phase, entry(va + 0x1000, small));
+            t.insert(new, entry(va, tex()));
+            TEXTURES_LEN.store(t.len(), Ordering::Relaxed);
+        }
+        supersede(va, len, new);
+        let t = TEXTURES.lock().unwrap();
+        assert!(!t.contains_key(&old), "covered at the same tile grid: superseded");
+        assert!(t.contains_key(&old_other_phase), "another sub-page offset: a copy of its own");
+        assert!(t.contains_key(&new));
+        drop(t);
+        for r in [old_other_phase, new] {
+            forget(r);
+        }
     }
 
     /// Only the wanted parts of the watched regions are scanned, merged, one region each.

@@ -2042,3 +2042,33 @@ Three behaviours measured on the console side of a large retail title, re-implem
   the process's commit capped at it – the numbers `XMemGetWorkingSetStatistics` and `TitleMemoryStatus` report.
   Titles size pools and streaming from them. Test added to `system_info`.
 - `XMemIsToolsMemAvailable` answers FALSE (no development-kit tools memory on a PC).
+
+## Video memory during world streaming: unaligned kept textures on pages, supersede, accounting (2026-11-23)
+
+Measured on an RTX 4090 during a retail title's world load (13 min in): local video memory 19.5 GiB of 22.8 GiB,
+while the title's own graphics memory was 2.4 GiB and the sparse windows 3.2 GiB. The rest was XCL's: the PC copies
+of textures the title places in its own memory.
+
+- **What put them there.** `vram::place_on_pages` (`#269`'s shared 64 KiB pages) refused an address that was not
+  64 KiB aligned, and the title packs most of its streamed textures at 4 KiB: each such placement fell back to a
+  committed PC texture of its own (`device_x::create_placed_resource_inner`), one per placement, and the title
+  releases almost none of them (`#248`). The memory was the sum of every texture ever placed, not the memory the
+  title covers.
+- **Fixed: unaligned addresses go on pages too** (`place_on_pages`). Each tile of a placement is shared by the
+  title address it starts at, so placements at one address are one memory. Two placements at different sub-page
+  offsets of one page take a tile each: a PC tile starts at its resource's base and cannot show a page at another
+  offset (a property of tiled resources, not a choice). The cost is the addresses the title used, not the
+  placements: in `streamed_textures_cost_the_memory_they_cover`'s pattern at 4 KiB offsets, `placed / 8`.
+- **Superseded kept textures let go** (`title_textures::supersede`, called from `register`): a newer placement that
+  covers an older kept-in-step texture on the same tile grid ends the older one's uploads (the memory holds the
+  newer texture's texels, as on the console) and gives its own tiles back (`vram::release_pages`). The older
+  object stays mapped onto the shared tiles. An older texture at another sub-page offset keeps a copy of its own.
+- **Accounting on the memory line** (`vram::usage`, `real::texture_memory_bytes`): `xcl video: kept-texture pages
+  X, target pages X, own tiles X, pools X (X free), arenas X, committed copies X (n)` and `gpu-address
+  reservations for committed textures X (n)` – the two categories that were invisible before. Committed copies are
+  remembered per resource (`vram::note_committed_texture`) and dropped at the title's release (`vram::forget`).
+- Tests: `unaligned_textures_share_the_tiles_of_their_addresses`, `a_placement_over_an_older_kept_texture_supersedes_it`
+  (bookkeeping, no GPU).
+- Still open: `Pages`' pool heaps are never retired (high-water of the addresses used stays); `texture_memory`'s
+  reservations for committed textures never go back (now counted); the title's own committed resources are not
+  XCL's to account.

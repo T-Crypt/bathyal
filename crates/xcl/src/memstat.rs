@@ -104,6 +104,26 @@ pub fn line() -> String {
     if let Some((tiles, pools)) = crate::hle::d3d12x::sparse::stats() {
         parts.push(format!("sparse windows {tiles} tiles ({}) in {pools} pools", gib((tiles as u64) << 16)));
     }
+    // What XCL holds in video memory itself: the numbers above are the title's (its committed
+    // graphics memory) and the driver's (the card).
+    let u = crate::hle::d3d12x::vram::usage();
+    if u.pool_heaps + u.arenas + u.committed + u.own_tiles > 0 {
+        parts.push(format!(
+            "xcl video: kept-texture pages {}, target pages {}, own tiles {}, pools {} ({} free), arenas {}, committed copies {} ({})",
+            gib(u.kept_pages as u64),
+            gib(u.target_pages as u64),
+            gib(u.own_tiles as u64),
+            gib(u.pool_heaps as u64),
+            gib(u.pool_unused as u64),
+            gib(u.arenas as u64),
+            gib(u.committed as u64),
+            u.committed_count
+        ));
+    }
+    let (reserved, reserved_n) = crate::hle::d3d12x::real::texture_memory_bytes();
+    if reserved > 0 {
+        parts.push(format!("gpu-address reservations for committed textures {} ({reserved_n})", gib(reserved as u64)));
+    }
     format!("memory: {}", parts.join("; "))
 }
 
