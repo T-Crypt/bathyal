@@ -12,6 +12,13 @@ use xcl::gpu::texture::{self, Subresource};
 
 const SRV: D3D12_RESOURCE_STATES = texture::SHADER_READ;
 
+/// `SKIPPED <test>: <reason>` straight to stderr: libtest captures `println!` / `eprintln!`, so
+/// the line would show only with `--nocapture` and `scripts/test.ps1` would not count it.
+fn skipped(reason: &str) {
+    use std::io::Write;
+    let _ = writeln!(std::io::stderr(), "SKIPPED uploads_start_from_each_subresources_state: {reason}");
+}
+
 /// The debug layer's error and corruption messages since the last call (then cleared).
 unsafe fn errors(q: &ID3D12InfoQueue) -> Vec<String> {
     let mut out = Vec::new();
@@ -51,16 +58,16 @@ fn uploads_start_from_each_subresources_state() {
         match xcl::gpu::agility::configuration_interface::<ID3D12Debug>(&CLSID_D3D12Debug) {
             Ok(d) => d.EnableDebugLayer(),
             Err(e) => {
-                println!("SKIPPED uploads_start_from_each_subresources_state: no D3D12 debug layer ({e})");
+                skipped(&format!("no D3D12 debug layer ({e})"));
                 return;
             }
         }
         let Ok(dev) = xcl::gpu::agility::create_device(None, D3D_FEATURE_LEVEL_11_0) else {
-            println!("SKIPPED uploads_start_from_each_subresources_state: no GPU");
+            skipped("no GPU");
             return;
         };
         let Ok(q) = dev.cast::<ID3D12InfoQueue>() else {
-            println!("SKIPPED uploads_start_from_each_subresources_state: the device has no debug layer");
+            skipped("the device has no debug layer");
             return;
         };
         let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() }).unwrap();

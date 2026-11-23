@@ -248,7 +248,9 @@ fn test_title_draws_with_a_root_signature_under_the_debug_layer() {
     let sys = PathBuf::from(std::env::var_os("SystemRoot").unwrap_or_else(|| r"C:\Windows".into())).join("System32");
     for dll in ["d3d12SDKLayers.dll", "xgameruntime.dll"] {
         if !sys.join(dll).is_file() {
-            eprintln!("SKIPPED test_title_draws_with_a_root_signature_under_the_debug_layer: no {dll}");
+            // straight to stderr: libtest captures eprintln!, and scripts/test.ps1 counts this line
+            use std::io::Write;
+            let _ = writeln!(std::io::stderr(), "SKIPPED test_title_draws_with_a_root_signature_under_the_debug_layer: no {dll}");
             return;
         }
     }
