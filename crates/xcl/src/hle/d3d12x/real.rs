@@ -1600,6 +1600,7 @@ unsafe extern "system" fn res_release(this: *mut c_void) -> u32 {
         super::sparse::forget_buffer(this as usize);
         super::vram::forget(this as usize);
         super::title_textures::forget(this as usize);
+        super::console_heap::forget_resource(this as usize);
         let gone = UMA_BUFFERS.lock().unwrap().as_mut().and_then(|m| m.remove(&(this as usize)));
         if let (Some((p, _, true)), Some(u)) = (gone, crate::gpu::uma::get()) {
             if u.is_sparse(p) {
@@ -2010,6 +2011,17 @@ fn pc_srv(created: Option<u32>, rd: &D3D12_RESOURCE_DESC, v: Option<&D3D12_SHADE
     Some(out)
 }
 
+/// `desc` for a view of `res`: a null resource takes a null description. The PC makes no view
+/// of the other pair, and the driver then reads the null resource's fields (nvwgf2umx:
+/// `test byte [res+0x3c],1`) – a fault inside the driver instead of an invalid call.
+pub(super) fn null_swapped<T>(res: *mut c_void, desc: *const T) -> *const T {
+    if res.is_null() {
+        std::ptr::null()
+    } else {
+        desc
+    }
+}
+
 unsafe extern "system" fn dev_create_srv_x(this: *mut c_void, res: *mut c_void, desc: *const D3D12_SHADER_RESOURCE_VIEW_DESC, cpu: u64) {
     let f: unsafe extern "system" fn(*mut c_void, *mut c_void, *const D3D12_SHADER_RESOURCE_VIEW_DESC, u64) = std::mem::transmute(orig_fn(this, 18));
     let mut copy = desc.as_ref().copied();
@@ -2022,7 +2034,7 @@ unsafe extern "system" fn dev_create_srv_x(this: *mut c_void, res: *mut c_void, 
         copy = Some(v);
     }
     let desc = copy.as_ref().map_or(desc, |c| c as *const _);
-    let Some(slot) = super::console_heap::slot(cpu) else { return f(this, res, desc, cpu) };
+    let Some(slot) = super::console_heap::slot(cpu) else { return f(this, res, null_swapped(res, desc), cpu) };
     // Raytracing acceleration structure SRV (pResource == NULL, Location == console GPU VA):
     // translated shaders read BVH nodes from UMA (`bvh_intersect`), never from a PC DXR SRV,
     // so write the RDNA2 BVH descriptor directly and skip forwarding the console VA to PC.
@@ -2043,7 +2055,7 @@ unsafe extern "system" fn dev_create_srv_x(this: *mut c_void, res: *mut c_void, 
     // view becomes the cube array of that one cube (a dimension mismatch is undefined in D3D12)
     let cube = desc.as_ref().and_then(cube_as_cube_array);
     let desc = cube.as_ref().map_or(desc, |v| v as *const _);
-    f(this, res, desc, slot.pc_srv);
+    f(this, res, null_swapped(res, desc), slot.pc_srv);
     super::console_heap::publish(&slot, false);
     super::console_heap::note_resource(&slot, res as usize);
     if super::present::trace_frame() && super::title_textures::address(res as usize).is_some() {
@@ -2260,14 +2272,15 @@ unsafe extern "system" fn dev_create_uav_x(this: *mut c_void, res: *mut c_void, 
     // refuses the pair, `device_x::pc_resource_desc`): a null view – a UAV of it is an invalid
     // call, and the device is removed (0x887A0001)
     let no_uav = ID3D12Resource::from_raw_borrowed(&res).is_some_and(|r| r.GetDesc().Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0);
-    let null_desc = D3D12_UNORDERED_ACCESS_VIEW_DESC { Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32_FLOAT, ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2D, ..Default::default() };
     let pc_uav = |at: u64| {
         if no_uav {
             static N: AtomicU64 = AtomicU64::new(0);
             if N.fetch_add(1, Ordering::Relaxed) < 4 {
                 crate::xlog_warn!("D3D12.X: a UAV of a resource that cannot have one on the PC (a depth buffer) – a null view");
             }
-            f(this, std::ptr::null_mut(), std::ptr::null_mut(), &null_desc, at)
+            // a null resource takes a null description: a real texture description beside a null
+            // resource is not a view the PC makes, and the driver reads the null resource
+            f(this, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null(), at)
         } else {
             f(this, res, counter, desc, at)
         }
@@ -6127,5 +6140,21 @@ mod console_pso_guard_tests {
         assert_eq!(rtv, [10, 10, 28, 28, 28, 0, 0, 0]);
         let dsv = u32::from_le_bytes(out[dsv_off..dsv_off + 4].try_into().unwrap());
         assert_eq!(dsv, 45);
+    }
+}
+
+#[cfg(test)]
+mod null_view_tests {
+    use super::null_swapped;
+
+    /// A view of no resource is made with no description: the PC makes none of the other pair
+    /// (a resource checked at once inside the driver, where null is a fault).
+    #[test]
+    fn a_view_of_no_resource_carries_no_description() {
+        let desc = 0x1234usize as *const u32;
+        assert!(null_swapped(std::ptr::null_mut(), desc).is_null());
+        assert_eq!(null_swapped(0x5678usize as *mut std::ffi::c_void, desc), desc);
+        // a view of no resource without a description stays without one
+        assert!(null_swapped::<u32>(std::ptr::null_mut(), std::ptr::null()).is_null());
     }
 }
