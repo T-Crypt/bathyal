@@ -23,29 +23,21 @@ extern "system" {
     fn real_connect(s: usize, name: *const u8, len: i32) -> i32;
     #[link_name = "sendto"]
     fn real_sendto(s: usize, buf: *const u8, len: i32, flags: i32, to: *const u8, tolen: i32) -> i32;
-    fn WSASetLastError(e: i32);
     #[link_name = "getaddrinfo"]
     fn real_getaddrinfo(node: *const u8, service: *const u8, hints: *const c_void, out: *mut *mut c_void) -> i32;
     #[link_name = "GetAddrInfoW"]
     fn real_getaddrinfo_w(node: *const u16, service: *const u16, hints: *const c_void, out: *mut *mut c_void) -> i32;
-    #[link_name = "gethostname"]
-    fn real_gethostname(name: *mut u8, len: i32) -> i32;
+    #[link_name = "GetAddrInfoExW"]
+    fn real_getaddrinfo_ex(n: *const u16, s: *const u16, ns: u32, id: *const c_void, hints: *const c_void, out: *mut *mut c_void, t: *const c_void, ov: *mut c_void, cb: *const c_void, h: *mut c_void) -> i32;
+    #[link_name = "freeaddrinfo"]
+    fn real_freeaddrinfo(p: *mut c_void);
+    fn WSASetLastError(e: i32);
+    fn WSAStartup(version: u16, data: *mut u8) -> i32;
 }
 
-/// A name that resolves without a network: none (the local addresses), this machine's own
-/// name, localhost – a console without a network still answers these (a retail game asks for
-/// its own name and none at start).
-fn local_name(name: &str) -> bool {
-    if name.is_empty() || name.eq_ignore_ascii_case("localhost") || name.starts_with("127.") || name == "::1" {
-        return true;
-    }
-    let mut buf = [0u8; 256];
-    let own = unsafe { real_gethostname(buf.as_mut_ptr(), buf.len() as i32) } == 0;
-    own && {
-        let n = buf.iter().position(|&b| b == 0).unwrap_or(0);
-        std::str::from_utf8(&buf[..n]).is_ok_and(|h| h.eq_ignore_ascii_case(name))
-    }
-}
+/// Numeric loopback. Resolving this does not ask DNS.
+const LOOPBACK: &[u8] = b"127.0.0.1\0";
+const LOOPBACK_W: &[u16] = &[b'1' as u16, b'2' as u16, b'7' as u16, b'.' as u16, b'0' as u16, b'.' as u16, b'0' as u16, b'.' as u16, b'1' as u16, 0];
 
 pub fn enabled() -> bool {
     std::env::var("XCL_NETWORK").is_ok_and(|v| v.trim() == "0")
@@ -74,11 +66,15 @@ pub fn ordinals() -> Vec<(u16, &'static str)> {
     table().into_iter().filter(|t| t.2 != 0).map(|(n, _, o)| (o, n)).collect()
 }
 
-fn note(what: &str) {
+fn note_msg(msg: &str) {
     static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 16 {
-        crate::xlog_info!("XCL_NETWORK=0: {what} fails (no network)");
+        crate::xlog_info!("XCL_NETWORK=0: {msg}");
     }
+}
+
+fn note(what: &str) {
+    note_msg(&format!("{what} fails (no network)"));
 }
 
 /// 127.0.0.0/8 or ::1 (sockaddr_in / sockaddr_in6)
@@ -137,37 +133,95 @@ unsafe extern "system" fn gethostbyname(_name: *const u8) -> *mut c_void {
     std::ptr::null_mut()
 }
 
-unsafe extern "system" fn getaddrinfo(node: *const c_void, _service: *const c_void, _hints: *const c_void, out: *mut *mut c_void) -> i32 {
-    let name = if node.is_null() { String::new() } else { crate::util::from_ansi_ptr(node as *const u8).unwrap_or_default() };
-    if local_name(&name) {
-        return real_getaddrinfo(node as *const u8, _service as *const u8, _hints, out);
+unsafe fn ansi_bytes<'a>(node: *const u8) -> &'a [u8] {
+    if node.is_null() {
+        return b"";
     }
-    note(&format!("getaddrinfo({name})"));
-    if !out.is_null() {
-        *out = std::ptr::null_mut();
+    let mut n = 0;
+    while n < 255 && *node.add(n) != 0 {
+        n += 1;
     }
-    WSAHOST_NOT_FOUND
+    std::slice::from_raw_parts(node, n)
 }
 
-unsafe extern "system" fn getaddrinfo_w(node: *const u16, _service: *const u16, _hints: *const c_void, out: *mut *mut c_void) -> i32 {
-    let name = if node.is_null() { String::new() } else { crate::util::from_wide_ptr(node).unwrap_or_default() };
-    if local_name(&name) {
-        return real_getaddrinfo_w(node, _service, _hints, out);
+fn local_ansi(node: *const u8) -> bool {
+    let s = unsafe { ansi_bytes(node) };
+    node.is_null() || s.is_empty() || s.eq_ignore_ascii_case(b"localhost") || s == b"127.0.0.1" || s == b"::1"
+}
+
+unsafe fn wide_bytes<'a>(node: *const u16) -> &'a [u16] {
+    if node.is_null() {
+        return &[];
     }
-    note(&format!("GetAddrInfoW({name})"));
+    let mut n = 0;
+    while n < 255 && *node.add(n) != 0 {
+        n += 1;
+    }
+    std::slice::from_raw_parts(node, n)
+}
+
+fn wide_is(s: &[u16], ascii: &[u8]) -> bool {
+    s.len() == ascii.len() && s.iter().zip(ascii).all(|(c, a)| *c < 128 && (*c as u8).eq_ignore_ascii_case(a))
+}
+
+fn local_wide(node: *const u16) -> bool {
+    let s = unsafe { wide_bytes(node) };
+    node.is_null() || s.is_empty() || wide_is(s, b"localhost") || wide_is(s, b"127.0.0.1") || wide_is(s, b"::1")
+}
+
+/// A name that is not local, answered as loopback. The real resolver does this without DNS,
+/// so a title that retries a failed lookup does not sit there. `connect` still refuses it
+/// unless the title is talking to itself.
+unsafe fn loopback_ansi(service: *const u8, hints: *const c_void, out: *mut *mut c_void) -> i32 {
+    let hr = real_getaddrinfo(LOOPBACK.as_ptr(), service, hints, out);
+    if hr == 0 {
+        return 0;
+    }
+    let hr6 = real_getaddrinfo(b"::1\0".as_ptr(), service, hints, out);
+    if hr6 == 0 {
+        return 0;
+    }
     if !out.is_null() {
         *out = std::ptr::null_mut();
     }
-    WSAHOST_NOT_FOUND
+    hr
+}
+
+unsafe extern "system" fn getaddrinfo(node: *const u8, service: *const u8, hints: *const c_void, out: *mut *mut c_void) -> i32 {
+    if local_ansi(node) {
+        return real_getaddrinfo(node, service, hints, out);
+    }
+    note_msg("getaddrinfo answers 127.0.0.1");
+    loopback_ansi(service, hints, out)
+}
+
+unsafe extern "system" fn getaddrinfo_w(node: *const u16, service: *const u16, hints: *const c_void, out: *mut *mut c_void) -> i32 {
+    if local_wide(node) {
+        return real_getaddrinfo_w(node, service, hints, out);
+    }
+    note_msg("GetAddrInfoW answers 127.0.0.1");
+    let hr = real_getaddrinfo_w(LOOPBACK_W.as_ptr(), service, hints, out);
+    if hr == 0 {
+        return 0;
+    }
+    const LOOPBACK6_W: &[u16] = &[b':' as u16, b':' as u16, b'1' as u16, 0];
+    let hr6 = real_getaddrinfo_w(LOOPBACK6_W.as_ptr(), service, hints, out);
+    if hr6 == 0 {
+        return 0;
+    }
+    if !out.is_null() {
+        *out = std::ptr::null_mut();
+    }
+    hr
 }
 
 #[allow(clippy::too_many_arguments)]
-unsafe extern "system" fn getaddrinfo_ex(_n: *const u16, _s: *const u16, _ns: u32, _id: *const c_void, _hints: *const c_void, out: *mut *mut c_void, _t: *const c_void, _ov: *mut c_void, _cb: *const c_void, _h: *mut c_void) -> i32 {
-    note("GetAddrInfoExW");
-    if !out.is_null() {
-        *out = std::ptr::null_mut();
+unsafe extern "system" fn getaddrinfo_ex(n: *const u16, s: *const u16, ns: u32, id: *const c_void, hints: *const c_void, out: *mut *mut c_void, t: *const c_void, ov: *mut c_void, cb: *const c_void, h: *mut c_void) -> i32 {
+    let name = if local_wide(n) { n } else { LOOPBACK_W.as_ptr() };
+    if name != n {
+        note_msg("GetAddrInfoExW answers 127.0.0.1");
     }
-    WSAHOST_NOT_FOUND
+    real_getaddrinfo_ex(name, s, ns, id, hints, out, t, ov, cb, h)
 }
 
 #[cfg(test)]
@@ -188,6 +242,12 @@ mod tests {
             assert!(!loopback(v6.as_ptr(), 28));
             assert_eq!(connect(usize::MAX, v4([8, 8, 8, 8]).as_ptr(), 16), -1);
             assert_eq!(send_request(std::ptr::null_mut(), std::ptr::null(), 0, std::ptr::null(), 0, 0, 0), 0);
+            let mut wsa = [0u8; 512];
+            assert_eq!(WSAStartup(0x0202, wsa.as_mut_ptr()), 0);
+            let mut out = std::ptr::null_mut();
+            assert_eq!(getaddrinfo(b"example.invalid\0".as_ptr(), std::ptr::null(), std::ptr::null(), &mut out), 0);
+            assert!(!out.is_null());
+            real_freeaddrinfo(out);
         }
     }
 }

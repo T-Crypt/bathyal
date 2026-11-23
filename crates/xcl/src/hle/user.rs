@@ -71,6 +71,15 @@ unsafe fn name(p: *const u8, keep: &mut Vec<Vec<u16>>) -> *const u16 {
     keep.last().unwrap().as_ptr()
 }
 
+#[link(name = "kernel32")]
+extern "system" {
+    fn GetLastError() -> u32;
+}
+
+/// Atoms this process registered, so a second RegisterClassExA of the same name still returns
+/// the atom. Windows answers the second call with 0, and the title stops on that.
+static CLASS_ATOMS: std::sync::Mutex<Vec<(Vec<u16>, u16)>> = std::sync::Mutex::new(Vec::new());
+
 pub unsafe extern "system" fn RegisterClassExA(c: *const WndClassEx<u8>) -> u16 {
     if c.is_null() {
         return 0;
@@ -95,7 +104,28 @@ pub unsafe extern "system" fn RegisterClassExA(c: *const WndClassEx<u8>) -> u16 
         class_name: name(c.class_name, &mut keep),
         icon_small: c.icon_small,
     };
-    RegisterClassExW(&w)
+    let class_key = ((c.class_name as usize) >= 0x1_0000).then(|| keep.last().cloned().unwrap_or_default()).unwrap_or_default();
+    if !class_key.is_empty() {
+        if let Some(atom) = CLASS_ATOMS.lock().unwrap().iter().find(|(n, _)| n == &class_key).map(|(_, a)| *a) {
+            return atom;
+        }
+    }
+    let atom = RegisterClassExW(&w);
+    if atom != 0 {
+        if !class_key.is_empty() {
+            CLASS_ATOMS.lock().unwrap().push((class_key, atom));
+        }
+        return atom;
+    }
+    let err = GetLastError();
+    // ERROR_CLASS_ALREADY_EXISTS: the class is registered, the title only tests the atom is non-zero
+    if err == 1410 {
+        crate::xlog_info!("user: RegisterClassExA: class already registered");
+        return 1;
+    }
+    let shown = if class_key.is_empty() { String::new() } else { String::from_utf16_lossy(&class_key) };
+    crate::xlog_warn!("user: RegisterClassExA failed ({err}) for '{shown}'");
+    0
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -148,8 +178,14 @@ unsafe fn console_window(ex_style: u32, class: *const u16, title: *const u16, st
     }
     let style = style & !WS_FRAME | WS_POPUP;
     let ex_style = ex_style & !WS_EX_FRAME & !WS_EX_APPWINDOW | WS_EX_TOOLWINDOW;
-    let hwnd = CreateWindowExW(ex_style, class, title, style, 0, 0, CONSOLE_W, CONSOLE_H, parent, menu, instance, param);
+    let mut hwnd = CreateWindowExW(ex_style, class, title, style, 0, 0, CONSOLE_W, CONSOLE_H, parent, menu, instance, param);
     if hwnd.is_null() {
+        let err = GetLastError();
+        crate::xlog_warn!("user: CreateWindowEx failed ({err:#x}) style {style:#x} parent {parent:p}; retrying without a parent");
+        hwnd = CreateWindowExW(ex_style, class, title, style, 0, 0, CONSOLE_W, CONSOLE_H, std::ptr::null_mut(), std::ptr::null_mut(), instance, param);
+    }
+    if hwnd.is_null() {
+        crate::xlog_warn!("user: CreateWindowEx retry failed ({:#x})", GetLastError());
         return hwnd;
     }
     let cloak: i32 = 1;

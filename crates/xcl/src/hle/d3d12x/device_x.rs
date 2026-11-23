@@ -645,6 +645,75 @@ pub(super) unsafe extern "system" fn create_sampler_x(this: *mut c_void, x: *con
     real::dev_create_sampler_x(this, &d, dest);
 }
 
+/// Xbox colour formats a PC driver rejects.
+pub fn pc_color_format(format: u32) -> u32 {
+    match format {
+        116 | 117 => 10, // R10G10B10_*E*_A2_FLOAT → R16G16B16A16_FLOAT
+        // A8_UNORM is not a render-target format on this GPU. R8_UNORM still removed the
+        // device (the translated pixel shader writes float4). R8G8B8A8_UNORM matches that.
+        65 => 28,
+        other => other,
+    }
+}
+
+/// Xbox depth formats. 118 is `D16_UNORM_S8_UINT`; the PC depth format with stencil is D24.
+pub fn pc_dsv_format(format: u32) -> u32 {
+    match format {
+        118 | 119 => 45, // D16_UNORM_S8_UINT / its depth read → D24_UNORM_S8_UINT
+        other => other,
+    }
+}
+
+/// A resource's format. The typeless parent of D16+S8 becomes the typeless parent of D24+S8,
+/// so a depth view of 118 still matches.
+pub fn pc_resource_format(format: u32) -> u32 {
+    match format {
+        116 | 117 => 10,
+        118 => 45,
+        119 | 120 => 44, // R16_UNORM_X8 / X16_G8 → R24G8_TYPELESS
+        other => other,
+    }
+}
+
+/// A shader view of that depth family (depth plane, or the stencil plane).
+pub fn pc_srv_format(format: u32) -> u32 {
+    match format {
+        116 | 117 => 10,
+        118 | 119 => 46, // R24_UNORM_X8_TYPELESS
+        120 => 47,       // X24_TYPELESS_G8_UINT
+        other => other,
+    }
+}
+
+/// A clear value in the same depth family (typed, which is what a typeless resource's clear uses).
+pub unsafe fn pc_clear_value(clear: *const c_void, storage: &mut [u8; 20]) -> *const c_void {
+    // a pointer the title did not fill in must not reach the driver: it removes the device
+    if clear.is_null() || !crate::gpu::shader::readable(clear as usize, 20) {
+        return std::ptr::null();
+    }
+    let format = (clear as *const u32).read_unaligned();
+    let mapped = if matches!(format, 118 | 119 | 120) { 45 } else { pc_color_format(format) };
+    if mapped == format {
+        return clear;
+    }
+    std::ptr::copy_nonoverlapping(clear as *const u8, storage.as_mut_ptr(), 20);
+    storage[..4].copy_from_slice(&mapped.to_le_bytes());
+    storage.as_ptr() as *const c_void
+}
+
+/// Copy resource-desc bytes into an aligned `D3D12_RESOURCE_DESC`. A `[u8; 0x38]` is only
+/// 1-byte aligned; the driver loads the desc with aligned reads, and an unaligned pointer
+/// removes the device (`0x887A0001`) instead of returning `E_INVALIDARG`.
+fn aligned_desc(bytes: &[u8; 0x38]) -> D3D12_RESOURCE_DESC {
+    unsafe { std::ptr::read_unaligned(bytes.as_ptr().cast()) }
+}
+
+/// 0 while the device is alive. The first call that changes that is the one to fix;
+/// later creates only repeat `0x887A0005`.
+unsafe fn removed_reason(this: *mut c_void) -> i32 {
+    ID3D12Device::from_raw_borrowed(&this).and_then(|dev| dev.GetDeviceRemovedReason().err().map(|e| e.code().0)).unwrap_or(0)
+}
+
 /// the console resource desc (0x38 bytes, D3D12_RESOURCE_DESC) as a PC one: its tile layouts
 /// and console flag bits mean nothing to a PC driver
 pub fn pc_resource_desc(x: &[u8; 0x38]) -> [u8; 0x38] {
@@ -686,9 +755,19 @@ pub fn pc_resource_desc(x: &[u8; 0x38]) -> [u8; 0x38] {
         flags &= !4;
     }
     d[8..16].fill(0); // alignment: the driver's
+    let raw_format = u32::from_le_bytes(d[0x20..0x24].try_into().unwrap());
+    let pc_flags = pc_resource_flags(raw_format, flags);
+    // R16_TYPELESS shadow maps carry the depth flag and a UAV flag. The PC resource is D16.
+    let format = if raw_format == 53 && pc_flags & 0x2 != 0 { 55 } else { pc_resource_format(raw_format) };
+    d[0x20..0x24].copy_from_slice(&format.to_le_bytes());
+    // a console desc leaves SampleDesc at 0, or a quality the PC rejects when the count is 1
+    if u32::from_le_bytes(d[0x24..0x28].try_into().unwrap()) <= 1 {
+        d[0x24..0x28].copy_from_slice(&1u32.to_le_bytes());
+        d[0x28..0x2C].fill(0);
+    }
     let layout = if dim == D3D12_RESOURCE_DIMENSION_BUFFER.0 as u32 { D3D12_TEXTURE_LAYOUT_ROW_MAJOR.0 } else { D3D12_TEXTURE_LAYOUT_UNKNOWN.0 };
     d[0x2C..0x30].copy_from_slice(&(layout as u32).to_le_bytes());
-    d[0x30..0x34].copy_from_slice(&(flags & 0xFF).to_le_bytes());
+    d[0x30..0x34].copy_from_slice(&pc_flags.to_le_bytes());
     d
 }
 
@@ -766,6 +845,68 @@ pub(super) unsafe fn pc_clear(clear: *const c_void, buf: &mut [u8; 24]) -> *cons
     buf.as_ptr() as *const c_void
 }
 
+/// PC resource flags. Console-only bits are dropped. Depth cannot share a resource with a
+/// render target or a UAV. A real depth format keeps depth. A typeless format that is also a
+/// UAV keeps the UAV, because the title creates those in a shader-resource or unordered state.
+fn pc_resource_flags(format: u32, flags: u32) -> u32 {
+    const RT: u32 = 0x1;
+    const DS: u32 = 0x2;
+    const UAV: u32 = 0x4;
+    let mut f = flags & 0xFF;
+    let depth = matches!(format, 19..=22 | 44..=47 | 53 | 55 | 118..=120);
+    if f & DS != 0 && f & (RT | UAV) != 0 {
+        f &= if depth { !(RT | UAV) } else { !DS };
+    }
+    f
+}
+
+/// A depth resource is refused unless it is born in a depth state. Anything else (shader
+/// resource, unordered, common) stays as the title asked.
+fn born_state(flags: u32, state: u32) -> u32 {
+    if flags & 0x2 != 0 && state & (0x10 | 0x20) == 0 { 0x10 } else { state }
+}
+
+/// A typeless resource that is not a render target or a depth buffer may only be born in
+/// COMMON. Unordered-access on R16_TYPELESS removed the device (INVALID_CALL).
+fn initial_state(format: u32, flags: u32, state: u32) -> u32 {
+    const TYPELESS: &[u32] = &[1, 5, 9, 15, 19, 23, 27, 33, 39, 44, 48, 53, 60, 70, 73, 76, 79, 82, 90, 92, 94, 97];
+    if flags & 0x3 == 0 && TYPELESS.contains(&format) { 0 } else { state }
+}
+
+/// A placement the title can store in 32 bits when the driver reports the resource as unsizable.
+fn finite_allocation(d: &[u8; 0x38]) -> Option<(u64, u64)> {
+    let dim = u32::from_le_bytes(d[0..4].try_into().ok()?);
+    let width = u64::from_le_bytes(d[0x10..0x18].try_into().ok()?).max(1);
+    let height = u32::from_le_bytes(d[0x18..0x1C].try_into().ok()?).max(1) as u64;
+    let layers = u16::from_le_bytes(d[0x1C..0x1E].try_into().ok()?).max(1) as u64;
+    let mips = u16::from_le_bytes(d[0x1E..0x20].try_into().ok()?).clamp(1, 16) as u64;
+    let format = u32::from_le_bytes(d[0x20..0x24].try_into().ok()?);
+    let align = 0x1_0000u64;
+    if dim <= 1 {
+        let size = width.div_ceil(align) * align;
+        return (size <= u32::MAX as u64).then_some((size, align));
+    }
+    let bpp: u64 = match format {
+        118 | 119 | 120 | 19..=22 | 44..=47 => 5,
+        116 | 117 => 8,
+        _ => 4,
+    };
+    let slices = if dim == 4 { 1 } else { layers };
+    let mut depth = if dim == 4 { layers } else { 1 };
+    let (mut w, mut h) = (width, height);
+    let mut size = 0u64;
+    for _ in 0..mips {
+        size = size.saturating_add(w.saturating_mul(h).saturating_mul(depth).saturating_mul(slices).saturating_mul(bpp));
+        w = (w / 2).max(1);
+        h = (h / 2).max(1);
+        if dim == 4 {
+            depth = (depth / 2).max(1);
+        }
+    }
+    let size = size.saturating_mul(2).div_ceil(align).saturating_mul(align);
+    (size > 0 && size <= u32::MAX as u64).then_some((size, align))
+}
+
 /// device #25 GetResourceAllocationInfo(visible mask, count, descs) → {size, alignment},
 /// returned through a hidden pointer. Called the C way – (return buffer, device, …), XDefiant –
 /// or the C++ way – (device, return buffer, …): whichever argument is the device is `this`.
@@ -787,10 +928,26 @@ pub(super) unsafe extern "system" fn get_resource_allocation_info_x(a: *mut c_vo
                 (r[0], r[1])
             }
         };
-        if s == u64::MAX || a == 0 {
-            size = u64::MAX;
-            break;
-        }
+        let (s, a) = if s == u64::MAX || a == 0 || s > u32::MAX as u64 {
+            // the title asserts the size's high half is 0 (game+0x344196). A driver
+            // rejection is all-ones, which trips that. A finite placement does not.
+            match finite_allocation(&x) {
+                Some(p) => {
+                    static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                    if N.fetch_add(1, Ordering::Relaxed) < 4 {
+                        let format = u32::from_le_bytes(x[0x20..0x24].try_into().unwrap());
+                        crate::xlog_warn!("D3D12.X: GetResourceAllocationInfo format {format} had no driver size – using {p:?}");
+                    }
+                    p
+                }
+                None => {
+                    size = u64::MAX;
+                    break;
+                }
+            }
+        } else {
+            (s, a)
+        };
         size = size.div_ceil(a) * a + s;
         align = align.max(a);
     }
@@ -846,18 +1003,20 @@ pub(super) unsafe extern "system" fn get_custom_heap_properties_x(a: *mut c_void
 
 /// Resources the title placed at an address an earlier one was placed at: on the console they
 /// share that memory (aliasing – transient render targets reuse it). Logged (first 16).
-fn note_alias(va: usize, x: &[u8; 0x38]) {
+fn note_alias(va: usize, x: &[u8; 0x38]) -> bool {
     static SEEN: std::sync::Mutex<Option<std::collections::HashMap<usize, String>>> = std::sync::Mutex::new(None);
     static N: AtomicU64 = AtomicU64::new(0);
     let u = |o: usize| u32::from_le_bytes(x[o..o + 4].try_into().unwrap());
     let what = format!("dimension {} {}x{} format {} flags {:#x}", u(0), u64::from_le_bytes(x[0x10..0x18].try_into().unwrap()), u(0x18), u(0x20), u(0x30));
     let mut g = SEEN.lock().unwrap();
     let m = g.get_or_insert_with(std::collections::HashMap::new);
-    if let Some(prev) = m.insert(va, what.clone()) {
+    let prev = m.insert(va, what.clone());
+    if let Some(prev) = prev.as_ref() {
         if N.fetch_add(1, Ordering::Relaxed) < 16 {
             crate::xlog_info!("D3D12.X: CreatePlacedResourceX at {va:#x} ({what}) – aliases an earlier resource there ({prev})");
         }
     }
+    prev.is_some()
 }
 
 /// device #44 CreatePlacedResourceX(address, desc, initial state, clear value, riid, resource):
@@ -870,9 +1029,23 @@ pub(super) unsafe extern "system" fn create_placed_resource_x(this: *mut c_void,
         return E_INVALIDARG;
     }
     let x: [u8; 0x38] = (desc as *const [u8; 0x38]).read_unaligned();
-    let d = pc_resource_desc(&x);
+    static ENTER: AtomicU64 = AtomicU64::new(0);
+    if ENTER.fetch_add(1, Ordering::Relaxed) < 8 {
+        let w = |o: usize| u32::from_le_bytes(x[o..o + 4].try_into().unwrap());
+        crate::xlog_info!(
+            "D3D12.X: placed enter va {va:#x} dim {} {}x{} format {} flags {:#x} state {state:#x}",
+            w(0),
+            u64::from_le_bytes(x[0x10..0x18].try_into().unwrap()),
+            w(0x18),
+            w(0x20),
+            w(0x30)
+        );
+    }
+    let mut d = pc_resource_desc(&x);
     let buffer = u32::from_le_bytes(d[0..4].try_into().unwrap()) == D3D12_RESOURCE_DIMENSION_BUFFER.0 as u32;
-    note_alias(va as usize, &x);
+    // a second resource at an address already placed overlaps the first one in the arena.
+    // That overlap is an invalid call on this GPU and removes the device.
+    let aliased = note_alias(va as usize, &x);
     // console-only state bits (Unicorn Overlord's 4K display target: 0x100000) are not the
     // PC's: the PC refused the resource (E_INVALIDARG) and the title threw
     let mut state = state & real::PC_RESOURCE_STATES;
@@ -882,14 +1055,16 @@ pub(super) unsafe extern "system" fn create_placed_resource_x(this: *mut c_void,
     }
     let mut clear_buf = [0u8; 24];
     let clear = pc_clear(clear, &mut clear_buf);
+    let flags = u32::from_le_bytes(d[0x30..0x34].try_into().unwrap());
+    let format = u32::from_le_bytes(d[0x20..0x24].try_into().unwrap());
     if buffer {
         if let Some(hr) = real::place_at_title_address(this, va as usize, &d, state, clear, riid, ppv) {
             return hr;
         }
     }
     // render targets, depth buffers, UAV textures: in video memory, aliased by address (`vram`)
-    let flags = u32::from_le_bytes(d[0x30..0x34].try_into().unwrap());
-    if !buffer && super::vram::gpu_owned(flags) {
+    let before = removed_reason(this);
+    if !buffer && !aliased && super::vram::gpu_owned(flags) {
         let pc = std::ptr::read_unaligned(d.as_ptr() as *const D3D12_RESOURCE_DESC);
         let console_bytes = crate::hle::xg::Texture::new(&x).ok().map(|t| t.size()).filter(|&s| s != u64::MAX && s != 0);
         if let Some(hr) = super::vram::place(this, va as usize, &pc, state, clear, console_bytes, riid, ppv) {
@@ -899,8 +1074,78 @@ pub(super) unsafe extern "system" fn create_placed_resource_x(this: *mut c_void,
             return hr;
         }
     }
-    let heap = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() };
-    let hr = real::dev_create_committed_resource(this, &heap as *const _ as usize, 0, d.as_ptr() as usize, state as usize, clear as usize, riid, ppv);
+    let mid = removed_reason(this);
+    if before == 0 && mid != 0 {
+        let w = |o: usize| u32::from_le_bytes(d[o..o + 4].try_into().unwrap());
+        crate::xlog_warn!("D3D12.X: placing removed the device ({mid:#x}) before its own resource: {}x{} format {} flags {:#x} state {state:#x}", w(0x10), w(0x18), format, flags);
+    }
+    let original_format = u32::from_le_bytes(x[0x20..0x24].try_into().unwrap());
+    if original_format == 53 {
+        // Alignment 0 is legal. This driver still removes the device for a texture array
+        // created that way; 64 KiB is the alignment it fills in when the field is 0.
+        d[8..16].copy_from_slice(&0x1_0000u64.to_le_bytes());
+        let layers = u16::from_le_bytes(d[0x1C..0x1E].try_into().unwrap());
+        let words: Vec<u32> = (0..14).map(|k| u32::from_le_bytes(d[k * 4..k * 4 + 4].try_into().unwrap())).collect();
+        let prior = ID3D12Device::from_raw_borrowed(&this).and_then(|dev| dev.GetDeviceRemovedReason().ok().map(|_| 0).or_else(|| dev.GetDeviceRemovedReason().err().map(|e| e.code().0)));
+        crate::xlog_warn!("D3D12.X: R16 texture state {state:#x} device {prior:?} layers {layers} desc {words:08x?}");
+    }
+    let heap = D3D12_HEAP_PROPERTIES {
+        Type: D3D12_HEAP_TYPE_DEFAULT,
+        CreationNodeMask: 1,
+        VisibleNodeMask: 1,
+        ..Default::default()
+    };
+    // `[u8; 0x38]` is not 8-aligned. The driver loads the desc with aligned reads; an
+    // unaligned pointer removes the device (0x887A0001) instead of returning E_INVALIDARG.
+    let desc = aligned_desc(&d);
+    let mut hr = real::dev_create_committed_resource(this, &heap as *const _ as usize, 0, &desc as *const _ as usize, state as usize, clear as usize, riid, ppv);
+    let committed_after = removed_reason(this);
+    if mid == 0 && committed_after != 0 {
+        let words: Vec<u32> = (0..14).map(|k| u32::from_le_bytes(d[k * 4..k * 4 + 4].try_into().unwrap())).collect();
+        crate::xlog_warn!("D3D12.X: committed resource removed the device ({committed_after:#x}) hr {hr:#x} state {state:#x} desc {words:08x?}");
+    }
+    if original_format == 53 {
+        let after = ID3D12Device::from_raw_borrowed(&this).and_then(|dev| dev.GetDeviceRemovedReason().ok());
+        crate::xlog_warn!("D3D12.X: R16 texture create {hr:#x} device afterwards {after:?}");
+    }
+    // a clear value whose format the PC will not pair with this desc (typeless, or a console
+    // format the remap did not cover) is the usual E_INVALIDARG after the flags are legal
+    // 0x887Axxxx is device-removed: another create only repeats it
+    let removed = |hr: HRESULT| (hr as u32) & 0xFFFF_0000 == 0x887A_0000;
+    if hr < 0 && !removed(hr) && !clear.is_null() {
+        let desc = aligned_desc(&d);
+        hr = real::dev_create_committed_resource(this, &heap as *const _ as usize, 0, &desc as *const _ as usize, state as usize, 0, riid, ppv);
+    }
+    // depth and UAV were both set: the first choice can still be the wrong one for this state
+    if hr < 0 && !removed(hr) && u32::from_le_bytes(x[0x30..0x34].try_into().unwrap()) & 0x6 == 0x6 {
+        let mut alt = d;
+        let flipped = if flags & 0x2 != 0 { (flags & !0x2) | 0x4 } else { (flags & !0x4) | 0x2 };
+        alt[0x30..0x34].copy_from_slice(&flipped.to_le_bytes());
+        let st = born_state(flipped, state & !0xC8);
+        let desc = aligned_desc(&alt);
+        hr = real::dev_create_committed_resource(this, &heap as *const _ as usize, 0, &desc as *const _ as usize, st as usize, 0, riid, ppv);
+    }
+    // last: one sample, one mip, one layer, no depth flag. A console desc the PC still
+    // rejects (MSAA with a UAV, a 0 layer count, a depth state on a UAV) was an int3.
+    if hr < 0 && !removed(hr) && !buffer {
+        let words: Vec<u32> = (0..14).map(|k| u32::from_le_bytes(d[k * 4..k * 4 + 4].try_into().unwrap())).collect();
+        crate::xlog_warn!("D3D12.X: CreatePlacedResourceX refused ({hr:#x}) state {state:#x} desc {words:08x?}");
+        let mut plain = d;
+        let h = u32::from_le_bytes(plain[0x18..0x1C].try_into().unwrap()).max(1);
+        plain[0x18..0x1C].copy_from_slice(&h.to_le_bytes());
+        plain[0x1C..0x1E].copy_from_slice(&1u16.to_le_bytes());
+        plain[0x1E..0x20].copy_from_slice(&1u16.to_le_bytes());
+        plain[0x24..0x28].copy_from_slice(&1u32.to_le_bytes());
+        plain[0x28..0x2C].fill(0);
+        plain[0x30..0x34].copy_from_slice(&4u32.to_le_bytes());
+        let desc = aligned_desc(&plain);
+        hr = real::dev_create_committed_resource(this, &heap as *const _ as usize, 0, &desc as *const _ as usize, 0, 0, riid, ppv);
+        if hr < 0 {
+            plain[0x30..0x34].fill(0);
+            let desc = aligned_desc(&plain);
+            hr = real::dev_create_committed_resource(this, &heap as *const _ as usize, 0, &desc as *const _ as usize, 0, 0, riid, ppv);
+        }
+    }
     if hr >= 0 && !buffer && !(*ppv).is_null() {
         static M: AtomicU64 = AtomicU64::new(0);
         match super::title_textures::register(this, *ppv, va as usize, &x, D3D12_RESOURCE_STATES(state as i32)) {
@@ -1010,6 +1255,11 @@ pub(super) unsafe extern "system" fn create_command_signature_x(this: *mut c_voi
     let needs_root = list.iter().any(|a| (5..=8).contains(&a[0]));
     pc[8..16].copy_from_slice(&(if list.is_empty() { 0 } else { list.as_ptr() as u64 }).to_le_bytes());
     let hr = real::dev_create_command_signature(this, pc.as_ptr() as usize, if needs_root { root } else { 0 }, riid, ppv);
+    static N: AtomicU64 = AtomicU64::new(0);
+    if hr < 0 && N.fetch_add(1, Ordering::Relaxed) < 6 {
+        let kinds: Vec<u32> = list.iter().map(|a| a[0]).collect();
+        crate::xlog_warn!("D3D12.X: CreateCommandSignature {hr:#x} args {kinds:?} root {root:#x}");
+    }
     if hr >= 0 && !ppv.is_null() && needs_root {
         super::bind::note_root_changing_signature(*ppv as usize);
     }
@@ -1033,8 +1283,30 @@ mod tests {
         x[0x30..0x34].copy_from_slice(&0x1234u32.to_le_bytes());
         let d = pc_resource_desc(&x);
         assert_eq!((d[8], u32::from_le_bytes(d[0x2C..0x30].try_into().unwrap()), u32::from_le_bytes(d[0x30..0x34].try_into().unwrap())), (0, 1, 0x34));
+        x[0x20..0x24].copy_from_slice(&53u32.to_le_bytes());
+        x[0x30..0x34].copy_from_slice(&0x8030_0006u32.to_le_bytes());
+        let made = pc_resource_desc(&x);
+        // depth and UAV together: R16_TYPELESS becomes a D16 depth buffer
+        assert_eq!(u32::from_le_bytes(made[0x30..0x34].try_into().unwrap()), 2);
+        assert_eq!(u32::from_le_bytes(made[0x20..0x24].try_into().unwrap()), 55);
+        assert_eq!(born_state(0x2, 0xC0), 0x10);
+        assert_eq!(born_state(0x4, 0xC0), 0xC0);
+        assert_eq!(initial_state(53, 0x4, 0x8), 0);
         x[0] = 3; // texture 2D
         assert_eq!(u32::from_le_bytes(pc_resource_desc(&x)[0x2C..0x30].try_into().unwrap()), 0);
+        x[0x20..0x24].copy_from_slice(&118u32.to_le_bytes());
+        let mapped = pc_resource_desc(&x);
+        assert_eq!(u32::from_le_bytes(mapped[0x20..0x24].try_into().unwrap()), 45);
+        assert_eq!(u32::from_le_bytes(mapped[0x24..0x28].try_into().unwrap()), 1);
+        x[0x10..0x18].copy_from_slice(&256u64.to_le_bytes());
+        x[0x18..0x1C].copy_from_slice(&256u32.to_le_bytes());
+        x[0x1C..0x1E].copy_from_slice(&1u16.to_le_bytes());
+        let (size, align) = finite_allocation(&x).unwrap();
+        assert!(size > 0 && size <= u32::MAX as u64 && align == 0x10000);
+        x[0x20..0x24].copy_from_slice(&119u32.to_le_bytes());
+        assert_eq!(u32::from_le_bytes(pc_resource_desc(&x)[0x20..0x24].try_into().unwrap()), 44);
+        assert_eq!((pc_dsv_format(118), pc_srv_format(119), pc_srv_format(120)), (45, 46, 47));
+        assert_eq!(pc_color_format(65), 28);
     }
 
     /// Console depth buffers become PC ones a shader can view: typeless, the D16S8 family as
