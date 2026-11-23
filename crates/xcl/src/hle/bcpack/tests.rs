@@ -445,8 +445,8 @@ fn bc5_block_rebuild() {
     // and 2, channel 1's by 0 and 3; every index pair is symbol 0, which the test table maps
     // to (0, 0)
     s[0][2] = 2;
-    s[0][3] = 4;
-    s[0][5] = 6;
+    s[0][14] = 4;
+    s[0][15] = 6;
     // block 1: one block back, the same endpoints; lane 4's E symbol 58 names (2, 7)
     let (e1, o1) = bc5_distance_symbols(1);
     assert_eq!((e1, o1), (0, 1));

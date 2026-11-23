@@ -99,9 +99,9 @@ pub fn assemble(symbols: &[u8], tables: &Tables) -> Result<Vec<u8>, Error> {
         };
         let e = [
             endpoint(base[0], s[2]),
-            endpoint(base[1], s[3]),
-            endpoint(base[2], s[4]),
-            endpoint(base[3], s[5]),
+            endpoint(base[1], s[14]),
+            endpoint(base[2], s[3]),
+            endpoint(base[3], s[15]),
         ];
         for ch in 0..2 {
             let mut bits = 0u64;
