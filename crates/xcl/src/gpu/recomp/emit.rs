@@ -43,6 +43,9 @@ pub(super) struct Em {
     /// split wave64: pc → SGPRs whose whole value may be read after that instruction
     /// (`x64_masks`); a mask written to none of them stays in its half (no exchange)
     pub x64_whole_live: BTreeMap<u64, u128>,
+    /// compute mode: the group is padded to whole console waves (`partial_waves`), the
+    /// padding lanes inactive at the start
+    pub cs_pad: bool,
     /// wave64 VS / PS on a GPU with 32-lane waves only: what the console's lanes 32..63 hold
     /// where the program reads them (`upper_lanes`), used when the wave has 32 lanes
     pub upper: Option<super::upper_lanes::UpperLanes>,
@@ -477,6 +480,7 @@ impl Em {
             uses_scratch: false,
             x64_words: 1,
             x64_whole_live: BTreeMap::new(),
+            cs_pad: false,
             upper: None,
             cur_pc: 0,
             static_ss: BTreeMap::new(),
@@ -4024,10 +4028,21 @@ impl Em {
 
     // ---------------------------------------------------------------- whole shader
 
-    /// Split wave64: threads of the console's thread group.
+    /// Compute mode: the threads of the PC group – the console's, or whole console waves of
+    /// them (`cs_pad`).
+    fn cs_threads(&self, cs: &super::CsInterface) -> u32 {
+        let threads: u32 = cs.threads.iter().product();
+        if self.cs_pad {
+            threads.next_multiple_of(if self.opt.wave64 { 64 } else { 32 })
+        } else {
+            threads
+        }
+    }
+
+    /// Split wave64: threads of the thread group.
     fn x64_threads(&self) -> u32 {
         match &self.opt.mode {
-            Mode::Compute(cs) => cs.threads.iter().product(),
+            Mode::Compute(cs) => self.cs_threads(cs),
             Mode::Mesh(ms) => ms.threads,
             _ => 64,
         }
@@ -4227,7 +4242,10 @@ impl Em {
                 // thread indices (AMD RDNA4 lays them out in 2 x 2 quads: lanes 0, 1, 4, 5, 8 …
                 // of an 8 x 8 group; NVIDIA differs too), the console does – a hardware wave
                 // takes the next `lanes` console threads as it arrives, lane l the l-th of them
-                let reorder = !self.x64() && y * z > 1;
+                // a padded group (`cs_pad`) is declared 1-D and takes its threads the same
+                // way, so the lanes of its last wave that the console launches are its first
+                let padded = self.cs_pad.then(|| self.cs_threads(cs));
+                let reorder = !self.x64() && (y * z > 1 || padded.is_some());
                 if reorder {
                     // console threads handed to waves so far: the program's top LDS word while
                     // the waves take their threads (the console's LDS starts undefined; D3D12's
@@ -4238,16 +4256,17 @@ impl Em {
                         h.push_str("groupshared uint xcl_wt;\n#define XCL_WT xcl_wt\n");
                     }
                 }
+                let [nx, ny, nz] = padded.map_or([x, y, z], |t| [t, 1, 1]);
                 let _ = writeln!(
                     h,
-                    "[WaveSize({hw_lanes})]\n[numthreads({x}, {y}, {z})]\nvoid main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint gi : SV_GroupIndex)\n{{"
+                    "[WaveSize({hw_lanes})]\n[numthreads({nx}, {ny}, {nz})]\nvoid main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint gi : SV_GroupIndex)\n{{"
                 );
                 if self.x64() {
                     // the console thread's ids (`xcl_x_thread`), not this hardware thread's
                     self.x64_entry(&mut h);
                     let _ = writeln!(h, "    gtid = uint3(xcl_tid % {x}u, (xcl_tid / {x}u) % {y}u, xcl_tid / {}u);\n    gi = xcl_tid;", x * y);
                 } else if reorder {
-                    let t = x * y * z;
+                    let t = padded.unwrap_or(x * y * z);
                     let _ = writeln!(
                         h,
                         "    if (gi == 0u) XCL_WT = 0u;\n    GroupMemoryBarrierWithGroupSync();\n    lane_id = WaveGetLaneIndex();\n    {{\n        bool full = WaveActiveCountBits(true) == {lanes}u;\n        uint base = {}u;\n        if (WaveIsFirstLane() && full) InterlockedAdd(XCL_WT, {lanes}u, base);\n        uint xcl_tid = WaveReadLaneFirst(base) + lane_id;\n        gtid = uint3(xcl_tid % {x}u, (xcl_tid / {x}u) % {y}u, xcl_tid / {}u);\n        gi = xcl_tid;\n    }}\n    GroupMemoryBarrierWithGroupSync(); // all waves have their threads before the program writes LDS",
@@ -4272,7 +4291,10 @@ impl Em {
                     // waves in the group: a last, partial wave counts (96 threads: 2 of 64)
                     let _ = writeln!(h, "    {} = {}u | ((gi / {lanes}u) << 6);", sname(next).unwrap(), (x * y * z).div_ceil(lanes));
                 }
-                let _ = writeln!(h, "    uint scc = 0u;\n    {{ uint2 e0 = {}(true); exec_lo = e0.x; exec_hi = e0.y; }}", self.ballot_fn());
+                // a padded group: the lanes past the console's threads start inactive (`gi` is
+                // the console thread's index here)
+                let launched = if padded.is_some() { format!("gi < {}u", x * y * z) } else { "true".into() };
+                let _ = writeln!(h, "    uint scc = 0u;\n    {{ uint2 e0 = {}({launched}); exec_lo = e0.x; exec_hi = e0.y; }}", self.ballot_fn());
                 for &v in &self.vgprs {
                     let init = match v {
                         0 => "gtid.x",

@@ -484,7 +484,7 @@ fn evaluate(d: &Decoded, st: &State, vdst: u64) -> Option<[Hi; 32]> {
 }
 
 /// SGPRs an instruction may write (first register, count), from its output operands.
-fn sgpr_outputs(d: &Decoded) -> Vec<(u64, u64)> {
+pub(super) fn sgpr_outputs(d: &Decoded) -> Vec<(u64, u64)> {
     let mut out = Vec::new();
     for o in d.ienc.operands.iter().filter(|o| o.output) {
         let n = (o.size as u64).div_ceil(32).max(1);
@@ -512,7 +512,7 @@ fn sgpr_outputs(d: &Decoded) -> Vec<(u64, u64)> {
     out
 }
 
-fn is_valu(d: &Decoded) -> bool {
+pub(super) fn is_valu(d: &Decoded) -> bool {
     d.enc.name.starts_with("ENC_VOP") || d.enc.name.starts_with("VOP")
 }
 
@@ -713,7 +713,7 @@ fn classify(d: &Decoded, st: &State) -> Option<(Read, Option<(u64, u32)>)> {
 }
 
 /// Successors of each instruction (index); None: unknown (an indirect jump).
-fn successors(insts: &[Decoded], pcs: &BTreeMap<u64, usize>) -> Vec<Option<Vec<usize>>> {
+pub(super) fn successors(insts: &[Decoded], pcs: &BTreeMap<u64, usize>) -> Vec<Option<Vec<usize>>> {
     insts
         .iter()
         .enumerate()
