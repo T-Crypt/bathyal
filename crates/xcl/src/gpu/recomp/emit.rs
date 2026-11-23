@@ -3159,7 +3159,7 @@ impl Em {
                     }
                     _ => return Err("VALU 64-bit"),
                 };
-                // omod, then clamp (DXIL has a double saturate)
+                // omod, then clamp (clamp to [0.0, 1.0] since HLSL SM 6.6 has no double saturate overload)
                 let mut e = match m.omod {
                     1 => format!("(({e}) * 2.0)"),
                     2 => format!("(({e}) * 4.0)"),
@@ -3167,7 +3167,7 @@ impl Em {
                     _ => e,
                 };
                 if m.clamp {
-                    e = format!("saturate({e})");
+                    e = format!("clamp({e}, 0.0, 1.0)");
                 }
                 self.line(&format!("double {t}_d = {e}; uint {t}_l, {t}_h; asuint({t}_d, {t}_l, {t}_h);"));
                 self.write64(&dst, &format!("{t}_l"), &format!("{t}_h"));

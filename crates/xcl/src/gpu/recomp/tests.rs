@@ -7840,6 +7840,24 @@ fn sdwa_f16_inline_constants_hlsl() {
 }
 
 #[test]
+fn valu64_clamp_and_omod_hlsl() {
+    let code = prog(&[
+        ("V_ADD_F64", "ENC_VOP3", &[("VDST", 2), ("SRC0", V), ("SRC1", V + 2), ("CLAMP", 1)], None),
+        ("V_MUL_F64", "ENC_VOP3", &[("VDST", 4), ("SRC0", V), ("SRC1", V + 2), ("OMOD", 1)], None),
+        ("V_FMA_F64", "ENC_VOP3", &[("VDST", 6), ("SRC0", V), ("SRC1", V + 2), ("SRC2", V + 4), ("OMOD", 2), ("CLAMP", 1)], None),
+    ]);
+    let t = translate(&code, &Options { wave64: false, ..Default::default() }).unwrap();
+    assert!(t.complete(), "{:?}", t.unsupported_why);
+    assert!(t.hlsl.contains("double t1_d = clamp(asdouble(v0, v1) + asdouble(v2, v3), 0.0, 1.0);"), "{}", t.hlsl);
+    assert!(t.hlsl.contains("double t2_d = ((asdouble(v0, v1) * asdouble(v2, v3)) * 2.0);"), "{}", t.hlsl);
+    assert!(t.hlsl.contains("double t3_d = clamp(((fma(asdouble(v0, v1), asdouble(v2, v3), asdouble(v4, v5))) * 4.0), 0.0, 1.0);"), "{}", t.hlsl);
+    assert!(!t.hlsl.contains("saturate(asdouble"), "{}", t.hlsl);
+    if super::dxc::location().is_ok() {
+        super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl));
+    }
+}
+
+#[test]
 fn gpu_wave32_and_wave64_src_vccz_execz() {
     if !gpu_ready() {
         return;
