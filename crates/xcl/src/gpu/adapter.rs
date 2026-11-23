@@ -115,6 +115,20 @@ pub(crate) fn select_indices<S: AsRef<str>>(names: &[S], sel: &Selector) -> Vec<
     Vec::new()
 }
 
+/// Microsoft's Basic Render Driver (vendor 0x1414, device 0x008C): the adapter Windows
+/// provides when no GPU driver is installed. It has a D3D12 device, but no GPU behind it.
+pub fn basic_render_driver(desc: &DXGI_ADAPTER_DESC1) -> bool {
+    desc.VendorId == 0x1414 && desc.DeviceId == 0x008c
+}
+
+/// Whether the adapter is a software renderer: WARP (which DXGI flags as software) or the
+/// Basic Render Driver (not flagged, so recognized by vendor and device id). A software
+/// device runs kernels, but it does not have the hardware features the GPU tests check
+/// (sparse reservations, mesh pipelines, a 4 GiB aperture).
+pub fn software(desc: &DXGI_ADAPTER_DESC1) -> bool {
+    desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0 || basic_render_driver(desc)
+}
+
 /// The adapter's name from its description.
 pub fn name(desc: &DXGI_ADAPTER_DESC1) -> String {
     let n = desc.Description.iter().position(|&c| c == 0).unwrap_or(desc.Description.len());

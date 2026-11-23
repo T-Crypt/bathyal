@@ -411,8 +411,17 @@ pub fn stats() -> D3d12Stats {
 
 static DEVICE: AtomicUsize = AtomicUsize::new(0);
 
+/// The backend device runs on a software adapter (WARP or the Basic Render Driver).
+static SOFTWARE_ADAPTER: AtomicBool = AtomicBool::new(false);
+
 pub fn device_raw() -> *mut c_void {
     DEVICE.load(Ordering::Acquire) as *mut c_void
+}
+
+/// Whether the backend device is a software renderer: it draws, but it has no sparse
+/// reservations, real mesh pipeline or 4 GiB aperture, so tests that check those skip.
+pub fn software_adapter() -> bool {
+    SOFTWARE_ADAPTER.load(Ordering::Relaxed)
 }
 
 /// The process's video memory on the device's adapter: (local, non-local) bytes in use.
@@ -517,6 +526,7 @@ pub fn init() -> Result<String, String> {
                 if let Ok(dev) = crate::gpu::agility::create_device(&adapter, D3D_FEATURE_LEVEL_12_0) {
                     device = Some(dev);
                     name = format!("{} ({} MiB VRAM)", crate::gpu::adapter::name(&desc), desc.DedicatedVideoMemory >> 20);
+                    SOFTWARE_ADAPTER.store(crate::gpu::adapter::software(&desc), Ordering::Relaxed);
                     break;
                 }
             }
@@ -528,6 +538,7 @@ pub fn init() -> Result<String, String> {
                 let d = crate::gpu::agility::create_device(&warp, D3D_FEATURE_LEVEL_11_0)
                     .map_err(|e| format!("D3D12 device (WARP): {e}"))?;
                 name = "WARP (software renderer)".into();
+                SOFTWARE_ADAPTER.store(true, Ordering::Relaxed);
                 d
             }
         };
