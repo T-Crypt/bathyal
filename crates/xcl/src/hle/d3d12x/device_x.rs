@@ -645,6 +645,25 @@ pub(super) unsafe extern "system" fn create_sampler_x(this: *mut c_void, x: *con
     real::dev_create_sampler_x(this, &d, dest);
 }
 
+/// Xbox colour formats a PC driver rejects.
+pub fn pc_color_format(format: u32) -> u32 {
+    match format {
+        116 | 117 => 10, // R10G10B10_*E*_A2_FLOAT → R16G16B16A16_FLOAT
+        // A8_UNORM is not a render-target format on this GPU. R8_UNORM still removed the
+        // device (the translated pixel shader writes float4). R8G8B8A8_UNORM matches that.
+        65 => 28,
+        other => other,
+    }
+}
+
+/// Xbox depth formats. 118 is `D16_UNORM_S8_UINT`; the PC depth format with stencil is D24.
+pub fn pc_dsv_format(format: u32) -> u32 {
+    match format {
+        118 | 119 => 45, // D16_UNORM_S8_UINT / its depth read → D24_UNORM_S8_UINT
+        other => other,
+    }
+}
+
 /// the console resource desc (0x38 bytes, D3D12_RESOURCE_DESC) as a PC one: its tile layouts
 /// and console flag bits mean nothing to a PC driver
 pub fn pc_resource_desc(x: &[u8; 0x38]) -> [u8; 0x38] {
@@ -679,6 +698,14 @@ pub fn pc_resource_desc(x: &[u8; 0x38]) -> [u8; 0x38] {
     // E_INVALIDARG, then its assertion) – half floats hold every shared-exponent value exactly
     if format == 67 && flags & 5 != 0 {
         d[0x20..0x24].copy_from_slice(&10u32.to_le_bytes());
+    }
+    // sRGB textures the console also lets shaders write: the PC has no sRGB unordered access
+    // (a retail game's 2048x2048 R8G8B8A8 one: E_INVALIDARG) – typeless, so the UAV views are
+    // the UNORM format (`pc_unorm_format`) and the SRV / RTV views keep the sRGB one
+    if flags & 4 != 0 {
+        if let Some(t) = srgb_typeless(format) {
+            d[0x20..0x24].copy_from_slice(&t.to_le_bytes());
+        }
     }
     // a depth buffer the console also lets shaders write (a retail game's: ALLOW_DEPTH_STENCIL |
     // ALLOW_UNORDERED_ACCESS): the PC refuses the pair – the depth buffer stays
@@ -726,6 +753,38 @@ pub fn pc_target_format(f: u32) -> u32 {
     }
 }
 
+/// The typeless format of an sRGB one that a UAV has to reach (`pc_resource_desc`): the
+/// uncompressed ones, the only ones a UAV can name. None: not one of those.
+fn srgb_typeless(f: u32) -> Option<u32> {
+    Some(match f {
+        29 => 27, // R8G8B8A8_UNORM_SRGB
+        91 => 90, // B8G8R8A8_UNORM_SRGB
+        93 => 92, // B8G8R8X8_UNORM_SRGB
+        _ => return None,
+    })
+}
+
+/// The UNORM format of an sRGB one: what a UAV view of an sRGB texture is on the PC, which has
+/// no sRGB unordered access.
+pub fn pc_unorm_format(f: u32) -> u32 {
+    match f {
+        29 => 28,
+        72 => 71,
+        75 => 74,
+        78 => 77,
+        91 => 87,
+        93 => 88,
+        99 => 98,
+        f => f,
+    }
+}
+
+/// Whether a format is typeless: its views name the typed formats of its family, so a resource
+/// in it needs one (`pc_shader_view_format`).
+pub fn typeless_format(f: u32) -> bool {
+    matches!(f, 1 | 5 | 9 | 15 | 19 | 23 | 27 | 33 | 39 | 44 | 48 | 53 | 60 | 70 | 73 | 76 | 79 | 82 | 90 | 92 | 94 | 97)
+}
+
 /// The format a shader's view of a resource whose PC format is `resource` has on the PC (`view`
 /// 0: the resource's own). The console names depth buffers' views plainly (R16_UNORM of a D16S8
 /// buffer, R32_FLOAT of a D32 one, even the depth format itself); the PC wants its family's
@@ -746,6 +805,10 @@ pub fn pc_shader_view_format(resource: u32, view: u32) -> u32 {
         (28, 86 | 115) => 28,
         // an R9G9B9E5 target made half floats
         (10, 67) => 10,
+        // an sRGB texture made typeless for its UAVs: its own views stay sRGB
+        (27, 0) => 29,
+        (90, 0) => 91,
+        (92, 0) => 93,
         (_, v) => v,
     }
 }
@@ -784,6 +847,13 @@ pub(super) unsafe extern "system" fn get_resource_allocation_info_x(a: *mut c_vo
                 let d = pc_resource_desc(&x);
                 let mut r = [0u64; 2];
                 pc(this, &mut r, mask, 1, &d);
+                // a format the PC has no layout for (it answers u64::MAX, and a title asserts):
+                // the console's layout of a format of the same bits per texel
+                if r[0] == u64::MAX || r[1] == 0 {
+                    if let Some(t) = standin_texture(&x) {
+                        r = [t.size(), t.alignment()];
+                    }
+                }
                 (r[0], r[1])
             }
         };
@@ -798,6 +868,44 @@ pub(super) unsafe extern "system" fn get_resource_allocation_info_x(a: *mut c_vo
         *ret = [size, align];
     }
     ret
+}
+
+/// The console's layout of a texture in a format that XG does not model, by a stand-in of the
+/// same bits per texel (`pc_standin_format`): a title's allocation queries must not fail on a
+/// format the PC has no layout for. None: no such format.
+fn standin_texture(x: &[u8; 0x38]) -> Option<crate::hle::xg::Texture> {
+    let mut s = *x;
+    let f = u32::from_le_bytes(s[0x20..0x24].try_into().unwrap());
+    s[0x20..0x24].copy_from_slice(&pc_standin_format(f)?.to_le_bytes());
+    crate::hle::xg::Texture::new(&s).ok()
+}
+
+/// A PC format whose console layout stands in for one that the PC has none for, of the same
+/// bits per texel: R1 (8), the packed 4:2:2 pair (16 a pixel), and the 96-bit ones, which take
+/// the smallest the PC has above them (128). None: not one of those.
+pub fn pc_standin_format(f: u32) -> Option<u32> {
+    Some(match f {
+        5..=8 => 2,    // R32G32B32 family: R32G32B32A32_FLOAT
+        66 => 61,      // R1_UNORM: R8_UNORM
+        68 | 69 => 56, // R8G8_B8G8 / G8R8_G8B8 (2 bytes a pixel): R16_UNORM
+        _ => return None,
+    })
+}
+
+/// The desc a texture is created with: `pc_resource_desc`, and a format the PC has no layout
+/// for (the allocation query's stand-in, `pc_standin_format`) – the same stand-in, so creation
+/// does not fail once the query has answered. Buffers: as `pc_resource_desc` has them (their
+/// format field is a structure stride).
+pub fn pc_creation_desc(x: &[u8; 0x38]) -> [u8; 0x38] {
+    let mut d = pc_resource_desc(x);
+    if u32::from_le_bytes(d[0..4].try_into().unwrap()) == D3D12_RESOURCE_DIMENSION_BUFFER.0 as u32 {
+        return d;
+    }
+    let f = u32::from_le_bytes(d[0x20..0x24].try_into().unwrap());
+    if let Some(t) = pc_standin_format(f) {
+        d[0x20..0x24].copy_from_slice(&t.to_le_bytes());
+    }
+    d
 }
 
 /// device #108 (a retail game) GetResourceAllocationInfo2(visible mask, count, D3D12_RESOURCE_DESC1s,
@@ -865,12 +973,30 @@ fn note_alias(va: usize, x: &[u8; 0x38]) {
 /// memory (placed in its UMA heap); a texture gets a PC texture kept in step with the memory
 /// (`title_textures`: detiled as the console lays it out, uploaded again after CPU writes).
 pub(super) unsafe extern "system" fn create_placed_resource_x(this: *mut c_void, va: u64, desc: *const u8, state: u32, clear: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+    let hr = create_placed_resource_inner(this, va, desc, state, clear, riid, ppv);
+    // the format the title named, for a shader view of it that names none (`real::title_format`)
+    if hr >= 0 && !desc.is_null() && crate::gpu::shader::readable(desc as usize, 0x38) {
+        record_title_format(ppv, &(desc as *const [u8; 0x38]).read_unaligned());
+    }
+    hr
+}
+
+/// The format `x` names on the resource `ppv` just created, unless it is a buffer (its format
+/// field is a structure stride) or `ppv` holds none.
+pub(super) unsafe fn record_title_format(ppv: *mut *mut c_void, x: &[u8; 0x38]) {
+    if ppv.is_null() || (*ppv).is_null() || u32::from_le_bytes(x[0..4].try_into().unwrap()) == D3D12_RESOURCE_DIMENSION_BUFFER.0 as u32 {
+        return;
+    }
+    real::note_title_format(*ppv as usize, u32::from_le_bytes(x[0x20..0x24].try_into().unwrap()));
+}
+
+unsafe fn create_placed_resource_inner(this: *mut c_void, va: u64, desc: *const u8, state: u32, clear: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
     static N: AtomicU64 = AtomicU64::new(0);
     if desc.is_null() || ppv.is_null() || !crate::gpu::shader::readable(desc as usize, 0x38) {
         return E_INVALIDARG;
     }
     let x: [u8; 0x38] = (desc as *const [u8; 0x38]).read_unaligned();
-    let d = pc_resource_desc(&x);
+    let d = pc_creation_desc(&x);
     let buffer = u32::from_le_bytes(d[0..4].try_into().unwrap()) == D3D12_RESOURCE_DIMENSION_BUFFER.0 as u32;
     note_alias(va as usize, &x);
     // console-only state bits (Unicorn Overlord's 4K display target: 0x100000) are not the
@@ -1084,6 +1210,7 @@ mod tests {
         assert_eq!(desc(&x), (10, 0x5));
         x[0x30..0x34].copy_from_slice(&0x0u32.to_le_bytes()); // a sampled one stays R9G9B9E5
         assert_eq!(desc(&x), (67, 0));
+        // its views are the half floats' (the same values, exactly)
         assert_eq!((pc_shader_view_format(10, 67), pc_shader_view_format(67, 67), pc_target_format(67)), (10, 67, 10));
         // views: a D24S8 format or R16_UNORM of the D16S8 buffer read depth; stencil formats plane 1
         assert_eq!(pc_shader_view_format(44, 45), 46);
@@ -1096,6 +1223,83 @@ mod tests {
         assert_eq!(pc_shader_view_format(28, 86), 28);
         assert_eq!(pc_shader_view_format(86, 86), 86, "a B5G5R5A1 texture that stayed one");
         assert_eq!((pc_target_format(86), pc_target_format(118), pc_view_format(117)), (28, 45, 10));
+    }
+
+    /// sRGB textures the console also lets shaders write are typeless on the PC (it has no sRGB
+    /// unordered access): their UAV views are the UNORM format, their own views still sRGB. A
+    /// format the PC has no layout for gets the console's layout of the same bits a texel.
+    #[test]
+    fn srgb_uavs_and_unsupported_allocation_formats() {
+        let mut x = [0u8; 0x38];
+        x[0..4].copy_from_slice(&3u32.to_le_bytes());
+        x[0x10..0x18].copy_from_slice(&2048u64.to_le_bytes());
+        x[0x18..0x1C].copy_from_slice(&2048u32.to_le_bytes());
+        x[0x1C..0x1E].copy_from_slice(&1u16.to_le_bytes());
+        x[0x1E..0x20].copy_from_slice(&1u16.to_le_bytes());
+        x[0x24..0x28].copy_from_slice(&1u32.to_le_bytes());
+        let format = |x: &[u8; 0x38]| u32::from_le_bytes(pc_resource_desc(x)[0x20..0x24].try_into().unwrap());
+        x[0x20..0x24].copy_from_slice(&29u32.to_le_bytes()); // R8G8B8A8_UNORM_SRGB, a UAV
+        x[0x30..0x34].copy_from_slice(&0x4u32.to_le_bytes());
+        assert_eq!(format(&x), 27);
+        assert_eq!((pc_shader_view_format(27, 0), pc_unorm_format(pc_shader_view_format(27, 29))), (29, 28));
+        x[0x30..0x34].copy_from_slice(&0x5u32.to_le_bytes()); // and a target
+        assert_eq!(format(&x), 27);
+        x[0x30..0x34].copy_from_slice(&0x1u32.to_le_bytes()); // a target alone stays sRGB
+        assert_eq!(format(&x), 29);
+        x[0x20..0x24].copy_from_slice(&91u32.to_le_bytes()); // B8G8R8A8_UNORM_SRGB, a UAV
+        x[0x30..0x34].copy_from_slice(&0x4u32.to_le_bytes());
+        assert_eq!(format(&x), 90);
+        assert_eq!((pc_shader_view_format(90, 0), pc_unorm_format(91)), (91, 87));
+        x[0x20..0x24].copy_from_slice(&72u32.to_le_bytes()); // BC1_UNORM_SRGB has no UAV
+        x[0x30..0x34].copy_from_slice(&0x4u32.to_le_bytes());
+        assert_eq!(format(&x), 72);
+
+        // a format the PC has no layout for: a stand-in of the same bits a texel
+        assert_eq!((pc_standin_format(68), pc_standin_format(66), pc_standin_format(6)), (Some(56), Some(61), Some(2)));
+        assert_eq!((pc_standin_format(28), pc_standin_format(0), pc_standin_format(89)), (None, None, None));
+        for f in [68u32, 66, 6] {
+            x[0x20..0x24].copy_from_slice(&f.to_le_bytes());
+            x[0x30..0x34].copy_from_slice(&0x1u32.to_le_bytes());
+            assert!(crate::hle::xg::Texture::new(&x).is_err(), "XG should not model {f}");
+            let t = standin_texture(&x).unwrap_or_else(|| panic!("no stand-in for {f}"));
+            let (size, align) = (t.size(), t.alignment());
+            assert!(size >= 2048 * 2048 && align.is_power_of_two(), "{f}: {size:#x} {align:#x}");
+        }
+        // a format XG models is left to XG (`standin_texture` is only for the PC's refusals)
+        x[0x20..0x24].copy_from_slice(&28u32.to_le_bytes());
+        assert!(standin_texture(&x).is_none());
+    }
+
+    /// The texture a title places (`CreatePlacedResourceX`) in a format the PC has no layout for
+    /// is created with the stand-in its allocation query answered for: the query's answer and
+    /// the creation ask the PC the same format. Buffers keep their stride field.
+    #[test]
+    fn unsupported_formats_are_created_with_the_query_standin() {
+        let mut x = [0u8; 0x38];
+        x[0..4].copy_from_slice(&3u32.to_le_bytes());
+        x[0x10..0x18].copy_from_slice(&2048u64.to_le_bytes());
+        x[0x18..0x1C].copy_from_slice(&2048u32.to_le_bytes());
+        x[0x1C..0x1E].copy_from_slice(&1u16.to_le_bytes());
+        x[0x1E..0x20].copy_from_slice(&1u16.to_le_bytes());
+        let format = |x: &[u8; 0x38]| u32::from_le_bytes(pc_creation_desc(x)[0x20..0x24].try_into().unwrap());
+        for (f, stand_in) in [(68u32, 56u32), (69, 56), (66, 61), (6, 2), (8, 2)] {
+            x[0x20..0x24].copy_from_slice(&f.to_le_bytes());
+            x[0x30..0x34].copy_from_slice(&0x1u32.to_le_bytes());
+            assert_eq!(format(&x), stand_in, "format {f}");
+            // the stand-in is what the query's console layout was taken in
+            let t = standin_texture(&x).unwrap_or_else(|| panic!("no stand-in for {f}"));
+            assert!(t.size() > 0, "{f}");
+        }
+        // a format the PC has, and one the rewrite made typeless, as `pc_resource_desc` has them
+        x[0x20..0x24].copy_from_slice(&28u32.to_le_bytes());
+        assert_eq!(format(&x), 28);
+        x[0x20..0x24].copy_from_slice(&29u32.to_le_bytes());
+        x[0x30..0x34].copy_from_slice(&0x4u32.to_le_bytes()); // sRGB with UAVs
+        assert_eq!(format(&x), 27);
+        // a buffer: its format field is a stride, left alone
+        x[0..4].copy_from_slice(&1u32.to_le_bytes());
+        x[0x20..0x24].copy_from_slice(&6u32.to_le_bytes());
+        assert_eq!(format(&x), 6);
     }
 
     #[test]

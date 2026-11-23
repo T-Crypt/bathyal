@@ -47,6 +47,8 @@ pub struct Found {
     /// the DXC in that folder, for its version
     pub dxc_toolchain: crate::gpu::recomp::dxc::Toolchain,
     pub xgameruntime: bool,
+    /// Whether the title's WinHTTP and Winsock imports are blocked.
+    pub network_off: bool,
     pub gpu: Result<Gpu, String>,
 }
 
@@ -91,7 +93,10 @@ pub fn checks(f: &Found) -> Vec<Check> {
         Err(_) => v.push(check(Level::Error, "no DXC (dxcompiler.dll + dxil.dll): no shader can be compiled, the game draws nothing", Some("install the Windows SDK, or put dxcompiler.dll and dxil.dll next to xcl.exe (or in %XCL_DXC_DIR%)"))),
     }
     if !f.xgameruntime {
-        v.push(check(Level::Warning, "no System32\\xgameruntime.dll: XCL's own XGameRuntime parts work, the rest (task queues, networking, dialogs) is missing", Some("install Gaming Services (Microsoft Store)")));
+        v.push(check(Level::Warning, "no System32\\xgameruntime.dll: dialogs, text entry, game invites and game streaming are missing (XCL's own task queues, async and networking are used)", Some("install Gaming Services (Microsoft Store)")));
+    }
+    if !f.network_off {
+        v.push(check(Level::Warning, "title network access is enabled: a crash reporter may upload process memory", Some("set XCL_NETWORK=0 to block title network access (loopback remains available)")));
     }
     v
 }
@@ -159,6 +164,7 @@ pub fn run(setting: &str) -> Vec<Check> {
         dxc: crate::gpu::recomp::dxc::location().map(|p| p.display().to_string()),
         dxc_toolchain: crate::gpu::recomp::dxc::toolchain(),
         xgameruntime: xgameruntime_present(),
+        network_off: crate::hle::netoff::enabled(),
         gpu: probe_gpu(setting),
     };
     checks(&found)
@@ -190,7 +196,7 @@ mod tests {
     }
 
     fn found(gpu: Gpu) -> Found {
-        Found { dxc: Ok(r"C:\dxc".into()), dxc_toolchain: dxc(1, 9), xgameruntime: true, gpu: Ok(gpu) }
+        Found { dxc: Ok(r"C:\dxc".into()), dxc_toolchain: dxc(1, 9), xgameruntime: true, network_off: true, gpu: Ok(gpu) }
     }
 
     fn dxc(major: u32, minor: u32) -> crate::gpu::recomp::dxc::Toolchain {
@@ -215,6 +221,9 @@ mod tests {
         let c = checks(&f);
         assert_eq!(c.iter().map(|c| c.level).collect::<Vec<_>>(), [Level::Ok, Level::Error, Level::Warning, Level::Error, Level::Warning]);
         assert!(c[1].what.contains("has 6.5"), "{:?}", c[1]);
+        // XCL's own task queues and networking stand in for the PC runtime's: not missing
+        let missing = c[4].what.split(" missing").next().unwrap();
+        assert!(missing.contains("dialogs") && !missing.contains("task queues") && !missing.contains("networking"), "{:?}", c[4]);
         assert!(c.iter().filter(|c| c.level != Level::Ok).all(|c| c.fix.is_some()), "{c:?}");
     }
 
@@ -243,6 +252,15 @@ mod tests {
         assert_eq!(levels(&found(Gpu { warp: true, ..gpu() }))[0], Level::Warning);
         let f = Found { gpu: Err("DXGI: E_FAIL".into()), ..found(gpu()) };
         assert_eq!(checks(&f)[0].level, Level::Error);
+    }
+
+    #[test]
+    fn network_access_is_a_warning_until_explicitly_disabled() {
+        let c = checks(&Found { network_off: false, ..found(gpu()) });
+        let network = c.last().unwrap();
+        assert_eq!(network.level, Level::Warning);
+        assert!(network.what.contains("network access is enabled"), "{network:?}");
+        assert_eq!(network.fix.as_deref(), Some("set XCL_NETWORK=0 to block title network access (loopback remains available)"));
     }
 
     #[test]

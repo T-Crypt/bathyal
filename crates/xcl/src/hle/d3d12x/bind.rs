@@ -254,11 +254,8 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
 /// (the caller draws the three vertices as a triangle – half of each rectangle).
 ///
 /// The PC has no rect lists. The fourth corner is made here, on the CPU, from the title's
-/// vertex data: v3 = v0 + v2 − v1 (seen in a retail title's full-screen passes: (−1,1) (−1,−1)
-/// (1,−1) with texture coordinates (0,0) (0,1) (1,1) – the missing corner is (1,1), (1,0)).
-/// The vertex layout is not looked at: each 4-byte word that is the same in all three vertices
-/// is kept (a packed colour), any other is taken as a float. Vertices a shader makes from the
-/// vertex index alone (no vertex buffer) are not expanded.
+/// vertex data (`expand_rect`). Vertices a shader makes from the vertex index alone (no vertex
+/// buffer) are not expanded.
 unsafe fn draw_rects(this: *mut c_void, list: &ID3D12GraphicsCommandList, vertices: u32, instances: u32, first_vertex: u32, first_instance: u32) -> bool {
     if !cpu_rect_expansion(with(this, |s| s.pso)) {
         return false;
@@ -279,19 +276,12 @@ unsafe fn draw_rects(this: *mut c_void, list: &ID3D12GraphicsCommandList, vertic
         if p.is_null() {
             return false;
         }
-        let word = |v: usize, w: usize| (at as *const u8).add(v * s + w * 4).cast::<u32>().read_unaligned();
+        let out = std::slice::from_raw_parts_mut(p, rects * 6 * s);
+        // (a copy of each rect: the title may be writing its vertices)
+        let mut rect = vec![0u8; 3 * s];
         for r in 0..rects {
-            let out = p.add(r * 6 * s);
-            let src = (at as *const u8).add(r * 3 * s);
-            // v0 v1 v2, then v0 v2 v3
-            std::ptr::copy_nonoverlapping(src, out, 3 * s);
-            std::ptr::copy_nonoverlapping(src, out.add(3 * s), s);
-            std::ptr::copy_nonoverlapping(src.add(2 * s), out.add(4 * s), s);
-            for w in 0..s / 4 {
-                let (a, b, c) = (word(r * 3, w), word(r * 3 + 1, w), word(r * 3 + 2, w));
-                let d = if a == b && b == c { a } else { (f32::from_bits(a) + f32::from_bits(c) - f32::from_bits(b)).to_bits() };
-                out.add(5 * s + w * 4).cast::<u32>().write_unaligned(d);
-            }
+            std::ptr::copy_nonoverlapping((at as *const u8).add(r * 3 * s), rect.as_mut_ptr(), 3 * s);
+            expand_rect(&rect, s, &mut out[r * 6 * s..][..6 * s]);
         }
         views.push((slot, D3D12_VERTEX_BUFFER_VIEW { BufferLocation: super::list_x::pc_va_of(p as u64), SizeInBytes: (rects * 6 * s) as u32, StrideInBytes: stride }));
     }
@@ -309,6 +299,69 @@ unsafe fn draw_rects(this: *mut c_void, list: &ID3D12GraphicsCommandList, vertic
         crate::xlog_info!("D3D12.X: rect lists are drawn as two triangles a rectangle, the fourth corner made on the CPU");
     }
     true
+}
+
+/// The corner of a rect list's rect – the vertex between the other two – from its three
+/// vertices (`v`, `s` bytes each). It is not always the same vertex: (x1,y1) (x1,y2) (x2,y1)
+/// has it at v0 (Mesa's r600 and radeonsi blits), (x1,y1) (x1,y2) (x2,y2) at v1
+/// (xf86-video-ati's r600 EXA; a retail title's full-screen passes: (−1,1) (−1,−1) (1,−1)).
+/// The vertex layout is not looked at. A word two of the vertices share (an x or a y, and what
+/// goes with it – a texture coordinate) differs in the third, the far end of one of the
+/// corner's edges: the corner is the vertex that differs alone in the fewest words. No single
+/// such vertex (not three corners of a screen-aligned rect): v1.
+fn rect_corner(v: &[u8], s: usize) -> usize {
+    let word = |i: usize, w: usize| u32::from_le_bytes(v[i * s + w * 4..][..4].try_into().unwrap());
+    let mut alone = [0u32; 3];
+    for w in 0..s / 4 {
+        let (a, b, c) = (word(0, w), word(1, w), word(2, w));
+        if a == b && b != c {
+            alone[2] += 1;
+        } else if a == c && a != b {
+            alone[1] += 1;
+        } else if b == c && a != b {
+            alone[0] += 1;
+        }
+    }
+    let least = alone.into_iter().min().unwrap_or(0);
+    match alone.iter().filter(|&&n| n == least).count() {
+        1 => alone.iter().position(|&n| n == least).unwrap_or(1),
+        _ => 1,
+    }
+}
+
+/// One rect of a rect list (`v`: its three vertices, `s` bytes each) as two triangles (`out`:
+/// six vertices). The fourth corner is the one opposite the rect's corner (`rect_corner`):
+/// a + b − corner of the other two vertices a and b, each 4-byte word that is not the same in
+/// all three vertices (those are kept – a packed colour) taken as a float. Both triangles
+/// start with v0 and wind as v0 v1 v2 does: what a pixel shader reads flat (on the PC a
+/// triangle's first vertex's value) is v0's in both halves.
+fn expand_rect(v: &[u8], s: usize, out: &mut [u8]) {
+    let k = rect_corner(v, s);
+    let word = |i: usize, w: usize| u32::from_le_bytes(v[i * s + w * 4..][..4].try_into().unwrap());
+    let fourth = |w: usize| {
+        let (c, a, b) = (word(k, w), word((k + 1) % 3, w), word((k + 2) % 3, w));
+        if c == a && a == b {
+            c
+        } else {
+            (f32::from_bits(a) + f32::from_bits(b) - f32::from_bits(c)).to_bits()
+        }
+    };
+    // 3: the fourth corner d. (corner, a, b) is v0 v1 v2 in its order or rotated, and (corner,
+    // a, d), (corner, d, b) and (a, d, b) wind as it does
+    let order: [usize; 6] = match k {
+        0 => [0, 1, 3, 0, 3, 2],
+        1 => [0, 1, 2, 0, 2, 3],
+        _ => [0, 1, 2, 0, 3, 1],
+    };
+    for (to, from) in out.chunks_exact_mut(s).zip(order) {
+        if from < 3 {
+            to.copy_from_slice(&v[from * s..][..s]);
+        } else {
+            for (w, word) in to.chunks_exact_mut(4).enumerate() {
+                word.copy_from_slice(&fourth(w).to_le_bytes());
+            }
+        }
+    }
 }
 
 /// Whether a rect list drawn with the bound pipeline `pso` is expanded on the CPU (`draw_rects`):
@@ -1183,6 +1236,62 @@ mod tests {
         assert!(cpu_rect_expansion(without) && cpu_rect_expansion(0));
         real::forget_pso_for_test(with_gs);
         assert!(cpu_rect_expansion(with_gs));
+    }
+
+    /// `expand_rect` on vertices of position (x, y, 0, 1), texture coordinate (u, v) and a packed
+    /// colour: the six vertices' positions and texture coordinates, and whether every vertex kept
+    /// the position's z and w and the colour.
+    fn expanded(corners: [[f32; 2]; 3], uv: impl Fn([f32; 2]) -> [f32; 2]) -> (Vec<([f32; 2], [f32; 2])>, bool) {
+        const STRIDE: usize = 28;
+        let mut v = Vec::new();
+        for p in corners {
+            let t = uv(p);
+            for f in [p[0], p[1], 0.0, 1.0, t[0], t[1]] {
+                v.extend_from_slice(&f.to_le_bytes());
+            }
+            v.extend_from_slice(&0xFF33_6699u32.to_le_bytes());
+        }
+        let mut out = vec![0u8; 6 * STRIDE];
+        expand_rect(&v, STRIDE, &mut out);
+        let f = |b: &[u8], w: usize| f32::from_le_bytes(b[w * 4..][..4].try_into().unwrap());
+        let kept = out.chunks_exact(STRIDE).all(|b| f(b, 2) == 0.0 && f(b, 3) == 1.0 && b[24..] == 0xFF33_6699u32.to_le_bytes());
+        (out.chunks_exact(STRIDE).map(|b| ([f(b, 0), f(b, 1)], [f(b, 4), f(b, 5)])).collect(), kept)
+    }
+
+    /// A rect list's rect on the CPU, for each vertex its corner can be: (x1,y1) (x1,y2) (x2,y1)
+    /// – v0, as Mesa's r600 and radeonsi blits send it –, (x1,y1) (x1,y2) (x2,y2) – v1, as
+    /// xf86-video-ati's r600 EXA does –, and v2. The two triangles are the rect's halves along
+    /// one diagonal, wind as v0 v1 v2 does and start with v0; the fourth corner continues the
+    /// texture coordinate. Synthetic: the rect is the expectation, not a measurement of hardware.
+    #[test]
+    fn rects_expanded_on_the_cpu_have_the_corner_opposite_their_own() {
+        let (x1, x2, y1, y2) = (16.0f32, 48.0, 8.0, 24.0);
+        let uv = |[x, y]: [f32; 2]| [(x - x1) / (x2 - x1), (y - y1) / (y2 - y1)];
+        let area = |t: &[([f32; 2], [f32; 2])]| (t[1].0[0] - t[0].0[0]) * (t[2].0[1] - t[0].0[1]) - (t[2].0[0] - t[0].0[0]) * (t[1].0[1] - t[0].0[1]);
+        for (name, corners) in [
+            ("corner v0", [[x1, y1], [x1, y2], [x2, y1]]),
+            ("corner v1", [[x1, y1], [x1, y2], [x2, y2]]),
+            ("corner v1, the other way round", [[x1, y2], [x1, y1], [x2, y1]]),
+            ("corner v2", [[x1, y2], [x2, y1], [x1, y1]]),
+        ] {
+            let (v, kept) = expanded(corners, uv);
+            let pos: Vec<[f32; 2]> = v.iter().map(|p| p.0).collect();
+            assert!(kept, "{name}: z, w and the colour are kept");
+            for corner in [[x1, y1], [x1, y2], [x2, y1], [x2, y2]] {
+                assert!(pos.contains(&corner), "{name}: no vertex at {corner:?} in {pos:?}");
+            }
+            assert!(v.iter().all(|&(p, t)| t == uv(p)), "{name}: texture coordinates {v:?}");
+            // each triangle is half the rect, in the winding of the title's three vertices
+            let first = area(&[(corners[0], [0.0; 2]), (corners[1], [0.0; 2]), (corners[2], [0.0; 2])]);
+            assert_eq!(first.abs(), (x2 - x1) * (y2 - y1));
+            assert_eq!([area(&v[..3]), area(&v[3..])], [first, first], "{name}: {pos:?}");
+            // … on either side of a diagonal, and both start with v0
+            assert_eq!(pos[..3].iter().filter(|p| pos[3..].contains(p)).count(), 2, "{name}: {pos:?}");
+            assert_eq!([pos[0], pos[3]], [corners[0], corners[0]], "{name}: {pos:?}");
+        }
+        // not three corners of a screen-aligned rect: as before, v0 + v2 − v1
+        let (v, _) = expanded([[0.0, 0.0], [8.0, 2.0], [10.0, 9.0]], |p| p);
+        assert_eq!(v.iter().map(|p| p.0).collect::<Vec<_>>(), [[0.0, 0.0], [8.0, 2.0], [10.0, 9.0], [0.0, 0.0], [10.0, 9.0], [2.0, 7.0]]);
     }
 
     /// Minimal RTS0 v2 root signature blob with one 4-constant parameter.

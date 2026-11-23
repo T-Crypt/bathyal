@@ -67,6 +67,7 @@ const CO_E_NOTINITIALIZED: HRESULT = 0x8004_01F0u32 as i32;
 const ENGINE_CREATE_SOURCE_VOICE: usize = 5;
 const ENGINE_CREATE_MASTERING_VOICE: usize = 7;
 const VOICE_DESTROY: usize = 18;
+const VOICE_START: usize = 19;
 const VOICE_SUBMIT_SOURCE_BUFFER: usize = 21;
 const VOICE_FLUSH_SOURCE_BUFFERS: usize = 22;
 const VOICE_GET_STATE: usize = 25;
@@ -171,6 +172,7 @@ pub fn exports() -> Vec<(&'static str, usize)> {
 // ---------------------------------------------------------------------------------------
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct AudioStats {
     pub engines: u64,
     pub engine_errors: u64,
@@ -197,6 +199,19 @@ pub struct AudioStats {
     pub source_voice_errors: u64,
     /// console-only flags we dropped, e.g. "XAudio2Create:0x1"
     pub dropped_flags: Vec<String>,
+    /// the console's decoder (xapu, `hle::acphal`): Opus packets decoded, packets that failed (silence
+    /// went out), frames produced, samples that are not 0
+    pub xapu_packets_decoded: u64,
+    pub xapu_decode_errors: u64,
+    pub xapu_frames: u64,
+    pub xapu_nonzero_samples: u64,
+    /// the console decoder's PCM played here: voices, samples (and the non-zero ones) submitted to
+    /// XAudio2, buffers dropped (queue full or no device), errors
+    pub console_pcm_voices: u64,
+    pub console_pcm_samples: u64,
+    pub console_pcm_nonzero_samples: u64,
+    pub console_pcm_dropped: u64,
+    pub console_pcm_errors: u64,
 }
 
 static ENGINES: AtomicU64 = AtomicU64::new(0);
@@ -236,6 +251,15 @@ pub fn stats() -> AudioStats {
         buffers_silenced: SILENCED.load(Ordering::Relaxed),
         source_voice_errors: SOURCE_ERRORS.load(Ordering::Relaxed),
         dropped_flags: DROPPED.lock().map(|d| d.clone()).unwrap_or_default(),
+        xapu_packets_decoded: PCM_PACKETS.load(Ordering::Relaxed),
+        xapu_decode_errors: PCM_PACKET_ERRORS.load(Ordering::Relaxed),
+        xapu_frames: PCM_DECODED_FRAMES.load(Ordering::Relaxed),
+        xapu_nonzero_samples: PCM_NONZERO.load(Ordering::Relaxed),
+        console_pcm_voices: SINK_VOICES.load(Ordering::Relaxed),
+        console_pcm_samples: SINK_SAMPLES.load(Ordering::Relaxed),
+        console_pcm_nonzero_samples: SINK_NONZERO.load(Ordering::Relaxed),
+        console_pcm_dropped: SINK_DROPPED.load(Ordering::Relaxed),
+        console_pcm_errors: SINK_ERRORS.load(Ordering::Relaxed),
     }
 }
 
@@ -1165,6 +1189,176 @@ unsafe extern "system" fn destroy_voice(this: *mut c_void) {
     if let Some(h) = decoded_handle {
         h.state.live_buffers.lock().unwrap().clear();
         drop(Box::from_raw(h.cb_ptr as *mut DecodedCallback));
+    }
+}
+
+// ---------------------------------------------------------------------------------------
+// the console audio processor's PCM out (hle::acphal): decoded streams played on the PC
+// ---------------------------------------------------------------------------------------
+//
+// A title that uses the console's audio hardware (xapu decoder, SHAPE mixer) has no XAudio2
+// engine of its own. What xapu decodes is played here: one float32 source voice per decoder
+// stream on an engine of this module's own (system XAudio2), mixed by Windows. It runs on a thread
+// of its own (COM, the device and the queue never hold up the title's audio thread). The SHAPE
+// mixer's volumes, panning and effects are not applied – the decoded stream plays as it is.
+
+use std::sync::mpsc::{channel, Sender};
+
+/// float32 samples a title's decoder stream hands over: (decoder stream, channels, interleaved samples)
+type SinkItem = (u32, u16, Vec<f32>);
+
+/// buffers of one sink voice: a queue deeper than this drops the newest samples
+const SINK_RING: usize = 24;
+
+static SINK: OnceLock<Mutex<Option<Sender<SinkItem>>>> = OnceLock::new();
+static SINK_SAMPLES: AtomicU64 = AtomicU64::new(0);
+static SINK_NONZERO: AtomicU64 = AtomicU64::new(0);
+static SINK_DROPPED: AtomicU64 = AtomicU64::new(0);
+static SINK_ERRORS: AtomicU64 = AtomicU64::new(0);
+static SINK_VOICES: AtomicU64 = AtomicU64::new(0);
+static PCM_DECODED_FRAMES: AtomicU64 = AtomicU64::new(0);
+static PCM_NONZERO: AtomicU64 = AtomicU64::new(0);
+static PCM_PACKETS: AtomicU64 = AtomicU64::new(0);
+static PCM_PACKET_ERRORS: AtomicU64 = AtomicU64::new(0);
+
+/// What the console decoder (xapu) did: `packets` Opus packets decoded to `frames` frames of which
+/// `nonzero` samples are not 0, `errors` packets that did not decode (silence went out).
+pub fn note_console_decode(packets: u64, errors: u64, frames: u64, nonzero: u64) {
+    PCM_PACKETS.fetch_add(packets, Ordering::Relaxed);
+    PCM_PACKET_ERRORS.fetch_add(errors, Ordering::Relaxed);
+    PCM_DECODED_FRAMES.fetch_add(frames, Ordering::Relaxed);
+    PCM_NONZERO.fetch_add(nonzero, Ordering::Relaxed);
+}
+
+/// Plays what a console decoder stream produced (interleaved float32, 48 kHz). Never blocks.
+pub fn console_pcm(stream: u32, channels: u16, samples: &[f32]) {
+    if samples.is_empty() || !(1..=2).contains(&channels) {
+        return;
+    }
+    let tx = SINK.get_or_init(|| {
+        let (tx, rx) = channel::<SinkItem>();
+        match std::thread::Builder::new().name("console-audio".into()).spawn(move || sink_thread(rx)) {
+            Ok(_) => Mutex::new(Some(tx)),
+            Err(_) => {
+                SINK_ERRORS.fetch_add(1, Ordering::Relaxed);
+                Mutex::new(None)
+            }
+        }
+    });
+    if let Some(t) = tx.lock().unwrap().as_ref() {
+        let _ = t.send((stream, channels, samples.to_vec()));
+    }
+}
+
+/// a voice's method: the system's, whatever this module patched in the shared vtable
+unsafe fn voice_fn(obj: *mut c_void, slot: usize) -> usize {
+    original(obj, slot).unwrap_or_else(|| vtable(obj).add(slot).read())
+}
+
+struct SinkVoice {
+    voice: *mut c_void,
+    channels: u16,
+    ring: Vec<Vec<f32>>,
+    next: usize,
+}
+
+unsafe fn sink_engine() -> Option<(*mut c_void, *mut c_void)> {
+    use windows_sys::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
+    CoInitializeEx(std::ptr::null(), COINIT_MULTITHREADED as u32);
+    let (with_version, plain) = system_create()?;
+    let mut engine: *mut c_void = std::ptr::null_mut();
+    let hr = match (with_version, plain) {
+        (Some(f), _) => f(&mut engine, 0, XAUDIO2_DEFAULT_PROCESSOR, NTDDI_WIN10_RS5),
+        (None, Some(f)) => f(&mut engine, 0, XAUDIO2_DEFAULT_PROCESSOR),
+        _ => E_FAIL,
+    };
+    if hr < 0 || engine.is_null() {
+        crate::xlog_warn!("console audio: no XAudio2 engine ({:#x}) – decoded sound is not played", hr as u32);
+        return None;
+    }
+    let create_mastering: CreateMasteringVoiceFn = std::mem::transmute(voice_fn(engine, ENGINE_CREATE_MASTERING_VOICE));
+    let mut mastering: *mut c_void = std::ptr::null_mut();
+    let hr = create_mastering(engine, &mut mastering, 0, 0, 0, std::ptr::null(), std::ptr::null(), AUDIO_CATEGORY_GAME_EFFECTS);
+    if hr < 0 || mastering.is_null() {
+        crate::xlog_warn!("console audio: no mastering voice ({:#x}) – no audio device? decoded sound is not played", hr as u32);
+        return None;
+    }
+    crate::xlog_info!("console audio: XAudio2 engine and mastering voice created – the console decoder's PCM is played");
+    Some((engine, mastering))
+}
+
+fn sink_thread(rx: std::sync::mpsc::Receiver<SinkItem>) {
+    unsafe {
+        let Some((engine, _mastering)) = sink_engine() else {
+            SINK_ERRORS.fetch_add(1, Ordering::Relaxed);
+            // keep draining so the title's side never queues without bound
+            for _ in rx {
+                SINK_DROPPED.fetch_add(1, Ordering::Relaxed);
+            }
+            return;
+        };
+        let mut voices: HashMap<u32, SinkVoice> = HashMap::new();
+        for (stream, channels, samples) in rx {
+            let need_new = voices.get(&stream).is_none_or(|v| v.channels != channels);
+            if need_new {
+                if let Some(old) = voices.remove(&stream) {
+                    let destroy: DestroyVoiceFn = std::mem::transmute(voice_fn(old.voice, VOICE_DESTROY));
+                    destroy(old.voice);
+                }
+                let fmt = WaveFormatEx {
+                    tag: WAVE_FORMAT_IEEE_FLOAT,
+                    channels,
+                    rate: 48_000,
+                    avg_bytes: 48_000 * 4 * channels as u32,
+                    block_align: 4 * channels,
+                    bits: 32,
+                    cb_size: 0,
+                };
+                let create: CreateSourceVoiceFn = std::mem::transmute(voice_fn(engine, ENGINE_CREATE_SOURCE_VOICE));
+                let mut voice: *mut c_void = std::ptr::null_mut();
+                let hr = create(engine, &mut voice, &fmt, 0, 1.0, std::ptr::null_mut(), std::ptr::null(), std::ptr::null());
+                if hr < 0 || voice.is_null() {
+                    crate::xlog_warn!("console audio: stream {stream}: no source voice ({:#x})", hr as u32);
+                    SINK_ERRORS.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+                let start: unsafe extern "system" fn(*mut c_void, u32, u32) -> HRESULT = std::mem::transmute(voice_fn(voice, VOICE_START));
+                start(voice, 0, 0);
+                SINK_VOICES.fetch_add(1, Ordering::Relaxed);
+                voices.insert(stream, SinkVoice { voice, channels, ring: vec![Vec::new(); SINK_RING], next: 0 });
+            }
+            let Some(v) = voices.get_mut(&stream) else { continue };
+            let mut st = XAudio2VoiceState { current_buffer_context: std::ptr::null_mut(), buffers_queued: 0, samples_played: 0 };
+            let get_state: GetStateFn = std::mem::transmute(voice_fn(v.voice, VOICE_GET_STATE));
+            get_state(v.voice, &mut st, 0x100 /* XAUDIO2_VOICE_NOSAMPLESPLAYED */);
+            let queued = st.buffers_queued;
+            if queued as usize >= SINK_RING - 1 {
+                SINK_DROPPED.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+            let slot = &mut v.ring[v.next];
+            v.next = (v.next + 1) % SINK_RING;
+            *slot = samples;
+            let b = XAudio2Buffer {
+                flags: 0,
+                audio_bytes: (slot.len() * 4) as u32,
+                audio_data: slot.as_ptr() as *const u8,
+                play_begin: 0,
+                play_length: 0,
+                loop_begin: 0,
+                loop_length: 0,
+                loop_count: 0,
+                context: std::ptr::null_mut(),
+            };
+            let submit: SubmitSourceBufferFn = std::mem::transmute(voice_fn(v.voice, VOICE_SUBMIT_SOURCE_BUFFER));
+            let hr = submit(v.voice, &b, std::ptr::null());
+            if hr < 0 {
+                SINK_ERRORS.fetch_add(1, Ordering::Relaxed);
+            } else {
+                SINK_SAMPLES.fetch_add(slot.len() as u64, Ordering::Relaxed);
+                SINK_NONZERO.fetch_add(slot.iter().filter(|&&x| x != 0.0).count() as u64, Ordering::Relaxed);
+            }
+        }
     }
 }
 

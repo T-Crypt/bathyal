@@ -156,6 +156,101 @@ pub fn in_graphics_reservation(p: usize) -> bool {
 
 const MEM_WRITE_WATCH: u32 = 0x20_0000;
 
+/// GPU views of the title's CPU memory. A retail game reserves 24 GB of 64 KiB pages twice
+/// in a row: once readable by the CPU (PAGE_READWRITE), once with PAGE_NOACCESS |
+/// PAGE_GRAPHICS_NOACCESS. It maps physical pages only into the first, yet places GPU
+/// resources at the same offset in the second (its Bink video planes: the decoder writes the
+/// first view, the video shader samples textures in the second). On the console the second
+/// reservation is a GPU-only view of the first; here it is separate, empty memory – the
+/// video was its colour of zero luma and chroma, a green screen. `source` names the CPU view
+/// behind an address of such a GPU view, which `d3d12x::title_textures` reads and watches.
+pub mod mirrors {
+    use std::collections::BTreeMap;
+    use std::sync::Mutex;
+
+    /// MEM_LARGE_PAGES | MEM_PHYSICAL: the console's 64 KiB pages
+    const PAGES_64K: u32 = 0x2040_0000;
+    /// PAGE_GRAPHICS_NOACCESS
+    const GRAPHICS_NOACCESS: u32 = 0x800;
+
+    struct State {
+        /// CPU-readable reservations of 64 KiB pages, oldest first: (sequence, base, size)
+        cpu: Vec<(u64, usize, usize)>,
+        /// GPU view base → (size, CPU view base)
+        gpu: BTreeMap<usize, (usize, usize)>,
+        /// the next reservation's sequence number
+        next: u64,
+        /// the most recent reservation while it lives: (sequence, base, size)
+        last: Option<(u64, usize, usize)>,
+    }
+    static STATE: Mutex<State> = Mutex::new(State { cpu: Vec::new(), gpu: BTreeMap::new(), next: 0, last: None });
+
+    /// A reservation of `size` bytes at `base` with allocation type `t` and protection `p`.
+    ///
+    /// A no-access graphics reservation of 64 KiB pages is paired with a CPU-readable one of
+    /// its size only when that one is the reservation immediately before it and is the only
+    /// CPU view of that size without a GPU view: with several candidates it is not known
+    /// which one the title means, and a texture read from the wrong one shows wrong texels.
+    /// A reservation that is not paired leaves its textures as they are.
+    pub fn reserved(base: usize, size: usize, t: u32, p: u32) {
+        if t & PAGES_64K != PAGES_64K || t & 0x1000 != 0 {
+            return;
+        }
+        let mut s = STATE.lock().unwrap();
+        let seq = s.next;
+        s.next += 1;
+        if p & GRAPHICS_NOACCESS != 0 && p & 0xFF == super::mem::PAGE_NOACCESS {
+            // CPU views of its size that are not the GPU view of anything yet
+            let taken: Vec<usize> = s.gpu.values().map(|&(_, c)| c).collect();
+            let candidates: Vec<(u64, usize)> = s
+                .cpu
+                .iter()
+                .filter(|&&(_, b, n)| n == size && !taken.contains(&b))
+                .map(|&(q, b, _)| (q, b))
+                .collect();
+            // the immediately preceding reservation, while it is still one of them
+            let preceded = s.last.filter(|&(q, _, n)| n == size && candidates.iter().any(|&(cq, _)| cq == q));
+            match (candidates.as_slice(), preceded) {
+                ([(_, cpu)], Some(_)) => {
+                    s.gpu.insert(base, (size, *cpu));
+                    crate::xlog_info!("kernelx: reservation {base:#x} ({size:#x} bytes, no CPU access) is the GPU view of {cpu:#x}");
+                }
+                (candidates, _) => {
+                    static SKIPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                    let n = SKIPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                    if n <= 2 || n.is_power_of_two() {
+                        crate::xlog_info!(
+                            "kernelx: reservation {base:#x} ({size:#x} bytes, no CPU access) is not paired: {} same-size CPU view(s), not exactly the reservation before it – a texture there stays as it is ({n} so far)",
+                            candidates.len()
+                        );
+                    }
+                }
+            }
+        } else if p & 0xFF != super::mem::PAGE_NOACCESS {
+            s.cpu.push((seq, base, size));
+        }
+        s.last = Some((seq, base, size));
+    }
+
+    /// The reservation at `base` was released.
+    pub fn released(base: usize) {
+        let mut s = STATE.lock().unwrap();
+        s.cpu.retain(|&(_, b, _)| b != base);
+        s.gpu.remove(&base);
+        s.gpu.retain(|_, &mut (_, c)| c != base);
+        if s.last.is_some_and(|(_, b, _)| b == base) {
+            s.last = None;
+        }
+    }
+
+    /// The CPU-view address behind `va` when `va` lies in a GPU view.
+    pub fn source(va: usize) -> Option<usize> {
+        let s = STATE.lock().unwrap();
+        let (&gpu, &(size, cpu)) = s.gpu.range(..=va).next_back()?;
+        (va < gpu + size).then(|| cpu + (va - gpu))
+    }
+}
+
 /// Graphics memory (MEM_GRAPHICS, committed, no fixed address) comes from the unified
 /// memory region the GPU uses directly (`gpu::uma`); a graphics reservation (no commit) is
 /// write-watched address space of Windows; everything else from Windows.
@@ -280,11 +375,10 @@ pub unsafe extern "system" fn VirtualAlloc(addr: *const c_void, size: usize, t: 
     // (`d3d12x::title_textures`), which needs its CPU writes to be seen: it is write-watched
     // like a graphics reservation. Without that such a texture was uploaded once, empty, and
     // never again (the game's glyph atlas: its menus lost their x-height letters).
-    if addr.is_null() && t & 0x2000 != 0 && (t & (MEM_GRAPHICS | 0x2000_0000) != 0 || p & PAGE_GRAPHICS_ANY != 0) {
-        let q = mem::VirtualAlloc(addr, size, sanitize_alloc_type(t) | MEM_WRITE_WATCH, sanitize_protect(p));
+    if gpu_visible_fallback(addr, t, p) {
+        let q = reserve_watched(size, t, p);
         if !q.is_null() {
-            GRAPHICS_RESERVATIONS.lock().unwrap().insert(q as usize, size);
-            GRAPHICS_RESERVATIONS_GEN.fetch_add(1, Ordering::Release);
+            mirrors::reserved(q as usize, size, t, p);
             trace_mem("VirtualAlloc (GPU-visible, write-watched)", addr as usize, size, t as u64, p, q as usize);
             return q;
         }
@@ -295,6 +389,25 @@ pub unsafe extern "system" fn VirtualAlloc(addr: *const c_void, size: usize, t: 
         crate::memstat::note(crate::memstat::WINDOWS, size);
     }
     trace_mem("VirtualAlloc", addr as usize, size, t as u64, p, q as usize);
+    q
+}
+
+/// Whether a VirtualAlloc that reached the plain-memory fallback is GPU-visible title memory
+/// (a reservation with MEM_GRAPHICS, MEM_LARGE_PAGES / MEM_64K_PAGES or a PAGE_GRAPHICS_*
+/// protection, at no fixed address), which is reserved write-watched (`reserve_watched`).
+fn gpu_visible_fallback(addr: *const c_void, t: u32, p: u32) -> bool {
+    addr.is_null() && t & 0x2000 != 0 && (t & (MEM_GRAPHICS | 0x2000_0000) != 0 || p & PAGE_GRAPHICS_ANY != 0)
+}
+
+/// Plain memory for GPU-visible title memory, write-watched and recorded with the graphics
+/// reservations (whose ranges `title_textures` watches; `VirtualFree` forgets it). Null if
+/// Windows refuses it.
+unsafe fn reserve_watched(size: usize, t: u32, p: u32) -> *mut c_void {
+    let q = mem::VirtualAlloc(std::ptr::null(), size, sanitize_alloc_type(t) | MEM_WRITE_WATCH, sanitize_protect(p));
+    if !q.is_null() {
+        GRAPHICS_RESERVATIONS.lock().unwrap().insert(q as usize, size);
+        GRAPHICS_RESERVATIONS_GEN.fetch_add(1, Ordering::Release);
+    }
     q
 }
 
@@ -386,6 +499,7 @@ pub unsafe extern "system" fn VirtualFree(addr: *mut c_void, size: usize, t: u32
     let ok = mem::VirtualFree(addr, size, t);
     if ok != 0 && t & 0x8000 != 0 && GRAPHICS_RESERVATIONS.lock().unwrap().remove(&(addr as usize)).is_some() {
         GRAPHICS_RESERVATIONS_GEN.fetch_add(1, Ordering::Release);
+        mirrors::released(addr as usize);
     }
     ok
 }
@@ -685,7 +799,9 @@ fn process_private_bytes() -> u64 {
         let mut c: PROCESS_MEMORY_COUNTERS_EX = std::mem::zeroed();
         c.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32;
         if K32GetProcessMemoryInfo(thr::GetCurrentProcess(), &mut c as *mut _ as *mut _, c.cb) != 0 {
-            c.PrivateUsage as u64
+            // Wine fills the fields before PrivateUsage only; PagefileUsage is the same number
+            // on Windows (the commit charge)
+            if c.PrivateUsage != 0 { c.PrivateUsage as u64 } else { c.PagefileUsage as u64 }
         } else {
             0
         }
@@ -1358,6 +1474,8 @@ struct OsVersionInfoW {
 #[link(name = "ntdll", kind = "raw-dylib")]
 extern "system" {
     fn RtlGetVersion(info: *mut OsVersionInfoW) -> i32;
+    fn NtQueryTimerResolution(coarsest: *mut u32, finest: *mut u32, current: *mut u32) -> i32;
+    fn NtSetTimerResolution(desired: u32, set: u8, current: *mut u32) -> i32;
 }
 
 pub fn host_os_version() -> (u32, u32, u32) {
@@ -1367,6 +1485,38 @@ pub fn host_os_version() -> (u32, u32, u32) {
         RtlGetVersion(&mut v);
         (v.major, v.minor, v.build)
     }
+}
+
+/// The finest timer Windows offers (0.5 ms) for the title: with the default 15.6 ms tick every
+/// sleep rounds up (a retail game's audio mixer ran at a third of real time). Windows 11 keeps
+/// it while the window is hidden only when told to.
+pub fn fine_timer() {
+    use windows_sys::Win32::System::Threading::{
+        GetCurrentProcess, ProcessPowerThrottling, SetProcessInformation, PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+        PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION, PROCESS_POWER_THROTTLING_STATE,
+    };
+    let state = PROCESS_POWER_THROTTLING_STATE {
+        Version: PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+        ControlMask: PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION,
+        StateMask: 0,
+    };
+    let size = std::mem::size_of::<PROCESS_POWER_THROTTLING_STATE>() as u32;
+    let kept = unsafe { SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &state as *const _ as *const c_void, size) } != 0;
+    // in 100 ns units; "finest" is the smallest period the system supports
+    let (mut coarsest, mut finest, mut was) = (0u32, 0u32, 0u32);
+    if unsafe { NtQueryTimerResolution(&mut coarsest, &mut finest, &mut was) } < 0 || finest == 0 {
+        crate::xlog_warn!("timer: NtQueryTimerResolution failed – Windows' default resolution");
+        return;
+    }
+    let mut now = 0u32;
+    let status = unsafe { NtSetTimerResolution(finest, 1, &mut now) };
+    crate::xlog_info!(
+        "timer: {} (was {:.2} ms, now {:.2} ms; kept while the window is hidden: {})",
+        if status >= 0 { "finest resolution for the title" } else { "raising the resolution failed" },
+        was as f64 / 10_000.0,
+        now as f64 / 10_000.0,
+        if kept { "yes" } else { "no" }
+    );
 }
 
 pub unsafe extern "system" fn GetSystemOSVersion(out: *mut SystemOsVersionInfo) {
@@ -1709,6 +1859,18 @@ pub unsafe extern "system" fn DisableThreadLibraryCalls(h: usize) -> BOOL {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fine_timer_makes_short_sleeps_short() {
+        // Windows' Sleep (std::thread::sleep has its own high-resolution timer)
+        fine_timer();
+        let t = std::time::Instant::now();
+        for _ in 0..20 {
+            unsafe { windows_sys::Win32::System::Threading::Sleep(1) };
+        }
+        let per = t.elapsed() / 20;
+        assert!(per < std::time::Duration::from_millis(5), "Sleep(1) took {per:?}: the 15.6 ms tick");
+    }
 
     #[test]
     fn affinity_masks_outside_the_process_are_fitted() {
@@ -2219,6 +2381,8 @@ mod tests {
         assert_eq!(unsafe { TitleMemoryStatus(&mut s) }, 1);
         assert_eq!(s.total, 13_824 * 1024 * 1024);
         assert!(s.avail <= s.total);
+        // the process's own memory counts as used (Wine leaves PrivateUsage 0)
+        assert!(process_private_bytes() > 0 && s.avail < s.total);
         s.dw_length = 8;
         assert_eq!(unsafe { TitleMemoryStatus(&mut s) }, 0);
     }
@@ -2350,23 +2514,84 @@ mod tests {
         }
     }
 
-    /// GPU-visible title memory that falls back to plain memory (64 KiB pages, large pages, a
-    /// graphics protection) is write-watched: a texture placed there sees the CPU's writes.
+    /// the `mirrors` tests share its state (the reservation before a GPU view is process-wide):
+    /// one at a time
+    static MIRRORS_TEST: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// A no-access graphics reservation of 64 KiB pages is the GPU view of the CPU-readable one
+    /// of its size immediately before it: textures there read the CPU view (`title_textures`).
+    #[test]
+    fn gpu_view_reservations_name_their_cpu_view() {
+        let _one = MIRRORS_TEST.lock().unwrap();
+        // (addresses far above anything Windows hands out: only the bookkeeping is tested)
+        let (a, b, size) = (0x7000_0000_0000usize, 0x7006_0000_0000usize, 0x6_0000_0000usize);
+        let other = 0x7010_0000_0000usize;
+        mirrors::reserved(other, 0x1000_0000, 0x2040_2000, mem::PAGE_READWRITE); // another size
+        mirrors::reserved(a, size, 0x2040_2000, mem::PAGE_READWRITE);
+        assert_eq!(mirrors::source(b + 0x1234_0000), None, "no GPU view yet");
+        mirrors::reserved(b, size, 0x2040_2000, 0x801);
+        assert_eq!(mirrors::source(b), Some(a));
+        assert_eq!(mirrors::source(b + 0x4524_0000), Some(a + 0x4524_0000));
+        assert_eq!(mirrors::source(b + size), None, "past its end");
+        assert_eq!(mirrors::source(a + 0x10), None, "the CPU view is no GPU view");
+        // committed memory or other protections are no GPU views
+        let c = 0x7020_0000_0000usize;
+        mirrors::reserved(c, size, 0x2040_3000, 0x801);
+        assert_eq!(mirrors::source(c), None);
+        mirrors::released(a);
+        assert_eq!(mirrors::source(b), None, "released with its CPU view");
+        mirrors::released(other);
+    }
+
+    /// A GPU view is paired only with the reservation immediately before it and only when that
+    /// is the single CPU view of its size: otherwise it stays unpaired (textures there are not
+    /// read from a view the title may not mean).
+    #[test]
+    fn ambiguous_gpu_views_stay_unpaired() {
+        let _one = MIRRORS_TEST.lock().unwrap();
+        let size = 0x2_0000_0000usize;
+        // two CPU views of the same size: which one the GPU view means is not known
+        let (x, y, g) = (0x7100_0000_0000usize, 0x7104_0000_0000usize, 0x7108_0000_0000usize);
+        mirrors::reserved(x, size, 0x2040_2000, mem::PAGE_READWRITE);
+        mirrors::reserved(y, size, 0x2040_2000, mem::PAGE_READWRITE);
+        mirrors::reserved(g, size, 0x2040_2000, 0x801);
+        assert_eq!(mirrors::source(g), None, "two same-size CPU views");
+        // a reservation of another size in between: the GPU view is not a view of the one
+        // before that gap
+        let size = 0x1_0000_0000usize;
+        let (p, q, h) = (0x7200_0000_0000usize, 0x7210_0000_0000usize, 0x7220_0000_0000usize);
+        mirrors::reserved(p, size, 0x2040_2000, mem::PAGE_READWRITE);
+        mirrors::reserved(q, 0x1000_0000, 0x2040_2000, mem::PAGE_READWRITE);
+        mirrors::reserved(h, size, 0x2040_2000, 0x801);
+        assert_eq!(mirrors::source(h), None, "not the reservation immediately before it");
+        for b in [x, y, g, p, q, h] {
+            mirrors::released(b);
+        }
+    }
+
+    /// GPU-visible title memory that reaches the plain-memory fallback (64 KiB pages, large
+    /// pages, a graphics protection) is write-watched: a texture placed there sees the CPU's
+    /// writes. The fallback is called directly: through `VirtualAlloc` these sizes land in a
+    /// unified-memory window whenever one has room (once any test has made the windows).
     #[test]
     fn gpu_visible_fallback_memory_is_write_watched() {
+        let null = std::ptr::null();
+        // (MEM_64K_PAGES | MEM_RESERVE; MEM_LARGE_PAGES | MEM_RESERVE | MEM_COMMIT with a
+        // PAGE_GRAPHICS_* protection; MEM_GRAPHICS | MEM_RESERVE | MEM_COMMIT)
+        let gpu = [(0x2040_2000u32, mem::PAGE_READWRITE), (0x2000_3000, 0x2404), (MEM_GRAPHICS | 0x3000, mem::PAGE_READWRITE)];
+        for &(t, p) in &gpu {
+            assert!(gpu_visible_fallback(null, t, p), "flags {t:#x} protect {p:#x}");
+        }
+        // plain memory stays plain: CPU-only reservations, commits at a fixed address
+        assert!(!gpu_visible_fallback(null, 0x3000, mem::PAGE_READWRITE));
+        assert!(!gpu_visible_fallback(null, 0x1000, 0x2404), "a commit without a reservation");
+        assert!(!gpu_visible_fallback(0x1_0000 as *const c_void, 0x2040_2000, mem::PAGE_READWRITE), "a fixed address");
         unsafe {
-            // (MEM_64K_PAGES | MEM_RESERVE; MEM_LARGE_PAGES | MEM_RESERVE | MEM_COMMIT with a
-            // PAGE_GRAPHICS_* protection; MEM_GRAPHICS | MEM_RESERVE | MEM_COMMIT)
-            for (t, p) in [(0x2040_2000u32, mem::PAGE_READWRITE), (0x2000_3000, 0x2404), (MEM_GRAPHICS | 0x3000, mem::PAGE_READWRITE)] {
+            for (t, p) in gpu {
                 let size = 0x40_0000;
-                let q = VirtualAlloc(std::ptr::null(), size, t, p);
+                let q = reserve_watched(size, t, p);
                 assert!(!q.is_null(), "flags {t:#x}");
                 let a = q as usize;
-                if crate::gpu::uma::get().is_some_and(|u| u.contains(a) || u.is_sparse(a)) {
-                    // a window had room: write-watched there (`uma::watch_regions`)
-                    VirtualFree(q, 0, mem::MEM_RELEASE);
-                    continue;
-                }
                 assert!(in_graphics_reservation(a), "flags {t:#x}: a fallback allocation is watched");
                 if t & 0x1000 == 0 {
                     assert!(!VirtualAlloc((a + 0x2_0000) as *const c_void, 0x1_0000, 0x1000, mem::PAGE_READWRITE).is_null());

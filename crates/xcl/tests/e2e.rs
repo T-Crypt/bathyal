@@ -97,7 +97,7 @@ fn test_title_runs_and_game_folder_is_untouched() {
         dll.display()
     );
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let root = manifest.join("..").join("..").join("target").join("e2e");
+    let root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("e2e");
     let _ = std::fs::remove_dir_all(&root);
     let game = root.join("game");
     let data = root.join("data");
@@ -248,7 +248,9 @@ fn test_title_draws_with_a_root_signature_under_the_debug_layer() {
     let sys = PathBuf::from(std::env::var_os("SystemRoot").unwrap_or_else(|| r"C:\Windows".into())).join("System32");
     for dll in ["d3d12SDKLayers.dll", "xgameruntime.dll"] {
         if !sys.join(dll).is_file() {
-            eprintln!("SKIPPED test_title_draws_with_a_root_signature_under_the_debug_layer: no {dll}");
+            // straight to stderr: libtest captures eprintln!, and scripts/test.ps1 counts this line
+            use std::io::Write;
+            let _ = writeln!(std::io::stderr(), "SKIPPED test_title_draws_with_a_root_signature_under_the_debug_layer: no {dll}");
             return;
         }
     }

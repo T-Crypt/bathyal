@@ -43,12 +43,17 @@ extern "system" {
     fn GetWriteWatch(flags: u32, base: *const c_void, size: usize, addresses: *mut *mut c_void, count: *mut usize, granularity: *mut u32) -> u32;
 }
 
-/// (device, address, layout, states) of an upload
+/// (device, address its bytes are read from, layout, states) of an upload
 type Upload = (usize, usize, Arc<xg::Texture>, Vec<D3D12_RESOURCE_STATES>);
 
 struct Entry {
     device: usize,
+    /// the title's address of the texture
     va: usize,
+    /// where its bytes are read and its CPU writes watched: `va`, or – for a texture in a GPU
+    /// view of the title's CPU memory with nothing mapped there – the same offset in the CPU
+    /// view (`kernelx::mirrors`)
+    src: usize,
     tex: Arc<xg::Texture>,
     /// the state the title's submitted work leaves the texture in (uploads leave it there):
     /// the creation state, then what its transitions give – one state for every subresource,
@@ -135,8 +140,16 @@ pub(super) unsafe fn register(device: *mut c_void, res: *mut c_void, va: usize, 
     if ID3D12Resource::from_raw_borrowed(&res).is_none() {
         return Err("no resource".into());
     }
+    let src = mirror_source(va);
+    if src != va {
+        static N: AtomicU64 = AtomicU64::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed) + 1;
+        if n <= 2 || n.is_power_of_two() {
+            crate::xlog_info!("D3D12.X: a texture at {va:#x} lies in a GPU view of the title's CPU memory: kept in step with {src:#x} ({n} so far)");
+        }
+    }
     let seq = SEQ.fetch_add(1, Ordering::Relaxed);
-    let e = Entry { device: device as usize, va, tex: Arc::new(tex), states: vec![state], pending: true, gpu_written: false, seq };
+    let e = Entry { device: device as usize, va, src, tex: Arc::new(tex), states: vec![state], pending: true, gpu_written: false, seq };
     {
         let mut t = TEXTURES.lock().unwrap();
         if let Some(old) = t.insert(res as usize, e) {
@@ -149,6 +162,16 @@ pub(super) unsafe fn register(device: *mut c_void, res: *mut c_void, va: usize, 
     }
     TEXTURES_GEN.fetch_add(1, Ordering::Release);
     Ok(())
+}
+
+/// Where a texture at `va` is read from: the CPU view behind a GPU view (`kernelx::mirrors`)
+/// when nothing is mapped at `va` itself, else `va`.
+fn mirror_source(va: usize) -> usize {
+    let Some(src) = crate::hle::kernelx::mirrors::source(va) else { return va };
+    use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT};
+    let mut m: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    let mapped = unsafe { VirtualQuery(va as *const c_void, &mut m, std::mem::size_of_val(&m)) } != 0 && m.State == MEM_COMMIT;
+    if mapped { va } else { src }
 }
 
 /// The title's GPU work writes texture `res` (a copy into it): on the console the memory then
@@ -305,7 +328,7 @@ fn cached_watch_ranges(u: &crate::gpu::uma::Uma) -> Arc<Vec<(usize, usize)>> {
     // write-watched regions) only when the set of textures, tiles, or reservations changed.
     let mut regions = u.watch_regions();
     regions.extend(crate::hle::kernelx::graphics_reservations());
-    let mut wanted: Vec<(usize, usize)> = TEXTURES.lock().unwrap().values().map(|e| (e.va & !0xFFF, (e.va + e.tex.size() as usize + 0xFFF) & !0xFFF)).collect();
+    let mut wanted: Vec<(usize, usize)> = TEXTURES.lock().unwrap().values().map(|e| (e.src & !0xFFF, (e.src + e.tex.size() as usize + 0xFFF) & !0xFFF)).collect();
     wanted.extend(super::sparse::mapped_ranges());
     let computed = Arc::new(watch_ranges(&regions, wanted));
     *WATCH_CACHE.lock().unwrap() = Some((key, Arc::clone(&computed)));
@@ -336,6 +359,120 @@ pub(super) unsafe fn refresh(queue: *mut c_void) {
     own_work(|| refresh_once(queue));
 }
 
+/// The write-watch ranges split into at most `WATCH_THREADS` parts of about equal size, or one
+/// part when the set is small enough that threads would cost more than they save.
+fn watch_parts(ranges: &[(usize, usize)]) -> Vec<Vec<(usize, usize)>> {
+    split_watch(ranges, watch_threads())
+}
+
+fn split_watch(ranges: &[(usize, usize)], threads: usize) -> Vec<Vec<(usize, usize)>> {
+    const MIN_PARALLEL: usize = 256 << 20;
+    let total: usize = ranges.iter().map(|r| r.1).sum();
+    if ranges.len() < 2 || total < MIN_PARALLEL || threads < 2 {
+        return vec![ranges.to_vec()];
+    }
+    let k = threads.min(ranges.len());
+    let share = total.div_ceil(k);
+    let mut parts: Vec<Vec<(usize, usize)>> = vec![Vec::new()];
+    let mut acc = 0usize;
+    for &r in ranges {
+        if acc >= share && parts.len() < k {
+            parts.push(Vec::new());
+            acc = 0;
+        }
+        parts.last_mut().unwrap().push(r);
+        acc += r.1;
+    }
+    parts
+}
+
+/// `XCL_WATCH_THREADS` (default 1 = the serial loop; the kernel serialises the walks, so more threads
+/// measured no faster): threads that read the write-watch.
+fn watch_threads() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| std::env::var("XCL_WATCH_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(1).clamp(1, 32))
+}
+
+/// GetWriteWatch with reset over `ranges`: every written page's address goes to `dirty`.
+///
+/// When the buffer fills, the call reports the pages that fitted and leaves the rest dirty, and
+/// the next call walks the whole range again from its base (measured: a 2 GiB range with 100k
+/// dirty pages and a 16384-entry buffer costs one walk per bufferful). A look that finds more
+/// pages than the buffer holds therefore costs several walks; the buffer grows to hold what the
+/// range has, up to `MAX_WATCH_BUF` entries.
+unsafe fn watch_into(ranges: &[(usize, usize)], buf: &mut Vec<*mut c_void>, dirty: &mut Vec<usize>, page: &mut u32) {
+    /// 4M pages (16 GiB of 4 KiB pages) held as 32 MiB of pointers
+    const MAX_WATCH_BUF: usize = 4 << 20;
+    if buf.len() < 16384 {
+        buf.resize(16384, std::ptr::null_mut());
+    }
+    for &(base, size) in ranges {
+        loop {
+            let mut n = buf.len();
+            if GetWriteWatch(WRITE_WATCH_FLAG_RESET, base as *const c_void, size, buf.as_mut_ptr(), &mut n, page) != 0 {
+                break;
+            }
+            dirty.extend(buf[..n].iter().map(|&p| p as usize));
+            if n < buf.len() {
+                break;
+            }
+            if buf.len() < MAX_WATCH_BUF {
+                buf.resize((buf.len() * 4).min(MAX_WATCH_BUF), std::ptr::null_mut());
+            }
+        }
+    }
+}
+
+type WatchJob = (Vec<(usize, usize)>, std::sync::mpsc::Sender<(Vec<usize>, u32)>);
+
+/// The write-watch threads: a shared queue of jobs, each answered with (dirty pages, granularity).
+struct WatchPool(Mutex<std::sync::mpsc::Sender<WatchJob>>);
+
+impl WatchPool {
+    fn send(&self, job: WatchJob) {
+        let _ = self.0.lock().unwrap().send(job);
+    }
+}
+
+fn watch_pool() -> &'static WatchPool {
+    static POOL: std::sync::OnceLock<WatchPool> = std::sync::OnceLock::new();
+    POOL.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel::<WatchJob>();
+        let rx = Arc::new(Mutex::new(rx));
+        for i in 0..watch_threads() {
+            let rx = Arc::clone(&rx);
+            let _ = std::thread::Builder::new().name(format!("xcl-watch-{i}")).spawn(move || {
+                let mut buf: Vec<*mut c_void> = Vec::new();
+                loop {
+                    let job = rx.lock().unwrap().recv();
+                    let Ok((ranges, reply)) = job else { return };
+                    let mut found = Vec::new();
+                    let mut page = 0u32;
+                    unsafe { watch_into(&ranges, &mut buf, &mut found, &mut page) };
+                    let _ = reply.send((found, page));
+                }
+            });
+        }
+        WatchPool(Mutex::new(tx))
+    })
+}
+
+/// Whether this submit reads the write-watch. By default every submit does: a page the CPU wrote
+/// between two submits (descriptors, buffers in sparse windows) must reach video memory before the
+/// second one. GetWriteWatch walks every watched page, though (gigabytes of mapped sparse tiles on a
+/// newer retail title: about 15 ms a call, several submits a frame), so `XCL_WATCH_PER_FRAME=1`
+/// reads it only at the first submit after a present: faster, but a write made between two submits
+/// of one frame reaches video memory one frame late.
+fn scan_this_submit() -> bool {
+    static PER_FRAME: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*PER_FRAME.get_or_init(|| std::env::var("XCL_WATCH_PER_FRAME").is_ok_and(|v| v != "0")) {
+        return true;
+    }
+    static LAST: AtomicU64 = AtomicU64::new(u64::MAX);
+    let now = super::present::presents();
+    LAST.swap(now, Ordering::Relaxed) != now
+}
+
 unsafe fn refresh_once(queue: *mut c_void) {
     let Some(u) = crate::gpu::uma::get() else { return };
     let sparse = u.has_sparse();
@@ -345,31 +482,46 @@ unsafe fn refresh_once(queue: *mut c_void) {
     let watch_t0 = std::time::Instant::now();
     let mut page = 0x1000u32;
     let ranges = cached_watch_ranges(u);
+    let scan = scan_this_submit();
     let dirty_len = DIRTY_BUF.with(|dcell| {
         let mut dirty = dcell.borrow_mut();
         dirty.clear();
-        WATCH_BUF.with(|wcell| {
-            let mut buf = wcell.borrow_mut();
-            if buf.len() < 16384 {
-                buf.resize(16384, std::ptr::null_mut());
+        if !scan {
+            return 0;
+        }
+        let parts = watch_parts(&ranges);
+        if parts.len() <= 1 {
+            WATCH_BUF.with(|wcell| watch_into(&ranges, &mut wcell.borrow_mut(), &mut dirty, &mut page));
+        } else {
+            // Large watched sets: GetWriteWatch walks every page of a range in the kernel, one
+            // range after another, and that walk held the title's submitting thread for most of
+            // its frame. The ranges are split over a pool of long-lived threads (created once,
+            // so the title's per-thread setup runs only for them); each range is still read and
+            // reset by exactly one call, so the dirty set is the same as the serial loop's.
+            let (tx, rx) = std::sync::mpsc::channel();
+            let n = parts.len();
+            for part in parts {
+                watch_pool().send((part, tx.clone()));
             }
-            for &(base, size) in ranges.iter() {
-                loop {
-                    let mut n = buf.len();
-                    if GetWriteWatch(WRITE_WATCH_FLAG_RESET, base as *const c_void, size, buf.as_mut_ptr(), &mut n, &mut page) != 0 {
-                        break;
-                    }
-                    dirty.extend(buf[..n].iter().map(|&p| p as usize));
-                    if n < buf.len() {
-                        break;
+            drop(tx);
+            for _ in 0..n {
+                if let Ok((found, g)) = rx.recv() {
+                    dirty.extend(found);
+                    if g != 0 {
+                        page = g;
                     }
                 }
             }
-        });
+        }
         dirty.sort_unstable();
         dirty.len()
     });
-    super::sparse::note_watch(watch_t0.elapsed(), dirty_len);
+    super::sparse::note_watch(
+        watch_t0.elapsed(),
+        dirty_len,
+        if scan { ranges.len() } else { 0 },
+        if scan { ranges.iter().map(|r| r.1).sum() } else { 0 },
+    );
     if super::present::trace_frame() {
         // every 600th look: what the CPU's view of a few textures holds now (does the title's
         // data reach the address at all, and is the texture still kept in step?)
@@ -381,7 +533,7 @@ unsafe fn refresh_once(queue: *mut c_void) {
             let content = |e: &Entry| -> usize {
                 let size = e.tex.size() as usize;
                 (0..16usize)
-                    .map(|k| e.va + (size.saturating_sub(4096)) * k / 15)
+                    .map(|k| e.src + (size.saturating_sub(4096)) * k / 15)
                     .filter(|&a| crate::gpu::shader::readable(a, 4096))
                     .map(|a| std::slice::from_raw_parts(a as *const u8, 4096).iter().filter(|&&b| b != 0).count())
                     .sum()
@@ -423,8 +575,8 @@ unsafe fn refresh_once(queue: *mut c_void) {
                 if e.gpu_written {
                     return false;
                 }
-                let i = dirty.partition_point(|&p| p + page as usize <= e.va);
-                dirty.get(i).is_some_and(|&p| p < e.va + e.tex.size() as usize)
+                let i = dirty.partition_point(|&p| p + page as usize <= e.src);
+                dirty.get(i).is_some_and(|&p| p < e.src + e.tex.size() as usize)
             })
             .filter_map(|(&res, e)| {
                 if e.pending {
@@ -432,7 +584,7 @@ unsafe fn refresh_once(queue: *mut c_void) {
                     PENDING.fetch_sub(1, Ordering::Relaxed);
                 }
                 let p = res as *mut c_void;
-                ID3D12Resource::from_raw_borrowed(&p).map(|r| (e.seq, r.clone(), (e.device, e.va, Arc::clone(&e.tex), e.states.clone())))
+                ID3D12Resource::from_raw_borrowed(&p).map(|r| (e.seq, r.clone(), (e.device, e.src, Arc::clone(&e.tex), e.states.clone())))
             })
             .collect()
     });
@@ -466,12 +618,12 @@ unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>) {
             if !batch.is_empty() && (bytes + tex.size() as usize > BATCH_BYTES || *dev != device) {
                 break;
             }
-            let (r, (dev, va, tex, states)) = todo.next().unwrap();
+            let (r, (dev, src, tex, states)) = todo.next().unwrap();
             device = dev;
             bytes += tex.size() as usize;
-            let subs = subresources(va, &tex);
+            let subs = subresources(src, &tex);
             if super::present::trace_frame() {
-                note_content(va, &r, &subs);
+                note_content(src, &r, &subs);
             }
             batch.push((r, subs, states));
         }
@@ -529,7 +681,7 @@ pub unsafe fn probe_gpu_content(res: usize) {
         }
         g.push(res);
     }
-    let Some((device, va, tex, gpu_written)) = TEXTURES.lock().unwrap().get(&res).map(|e| (e.device, e.va, Arc::clone(&e.tex), e.gpu_written)) else { return };
+    let Some((device, va, src, tex, gpu_written)) = TEXTURES.lock().unwrap().get(&res).map(|e| (e.device, e.va, e.src, Arc::clone(&e.tex), e.gpu_written)) else { return };
     let d = device as *mut c_void;
     let r = res as *mut c_void;
     let (Some(dev), Some(r)) = (ID3D12Device::from_raw_borrowed(&d), ID3D12Resource::from_raw_borrowed(&r)) else { return };
@@ -586,7 +738,7 @@ pub unsafe fn probe_gpu_content(res: usize) {
         rb.Unmap(0, None);
         Ok(out)
     });
-    let cpu = subresources(va, &tex).into_iter().next().map(|s| s.data).unwrap_or_default();
+    let cpu = subresources(src, &tex).into_iter().next().map(|s| s.data).unwrap_or_default();
     match result {
         Ok(gpu) => {
             let nonzero = gpu.iter().filter(|&&b| b != 0).count();
@@ -617,9 +769,12 @@ unsafe fn upload_queue(dev: &ID3D12Device, device: usize) -> Result<ID3D12Comman
     Ok(made)
 }
 
-/// Ranges closer than this are scanned as one (a gap costs little to scan; a call per texture –
-/// thousands of them – a lot)
-const WATCH_GAP: usize = 1 << 20;
+/// Ranges closer than this are scanned as one. A gap costs the walk over it, a call costs its
+/// fixed cost, and both were measured on a 2 GiB synthetic reservation: about 6.9 µs a call and
+/// 0.35 µs a MiB walked (squarely kernel-side: the same bytes in one call are 13× cheaper than
+/// in 512 calls). So a gap under about 19 MiB is cheaper to walk as part of a bigger range than
+/// to leave as a call of its own; 16 MiB keeps margin under that break-even.
+const WATCH_GAP: usize = 16 << 20;
 
 /// The parts of `wanted` (start, end) inside `regions` (base, size), merged (gaps under
 /// `WATCH_GAP` too) and sorted, as (base, size) – each within one region (a write-watch call
@@ -739,7 +894,7 @@ mod tests {
         assert_eq!(subresource_count(&tex), 6);
         // fake resource / list keys, never dereferenced: GPU-written, so no refresh uploads it
         let (res, other, l1, l2) = (0x7E57_0000_1000usize, 0x7E57_0000_2000usize, 0x7E57_0000_3000usize, 0x7E57_0000_4000usize);
-        TEXTURES.lock().unwrap().insert(res, Entry { device: 0, va: 0x7E57_0000_0000, tex, states: vec![D3D12_RESOURCE_STATE_COMMON], pending: false, gpu_written: true, seq: 0 });
+        TEXTURES.lock().unwrap().insert(res, Entry { device: 0, va: 0x7E57_0000_0000, src: 0x7E57_0000_0000, tex, states: vec![D3D12_RESOURCE_STATE_COMMON], pending: false, gpu_written: true, seq: 0 });
         TEXTURES_LEN.fetch_add(1, Ordering::Relaxed);
         let states = || TEXTURES.lock().unwrap().get(&res).unwrap().states.clone();
         let (p1, p2) = (l1 as *mut c_void, l2 as *mut c_void);
@@ -777,8 +932,173 @@ mod tests {
         let regions = [(0x10000, 0x10000), (0x40000, 0x10000), (0x1000_0000, 0x1000_0000)];
         let wanted = vec![(0x12000, 0x13000), (0x11000, 0x12800), (0x1F000, 0x41000), (0x60000, 0x61000)];
         assert_eq!(watch_ranges(&regions, wanted), vec![(0x11000, 0xF000), (0x40000, 0x10000)]);
-        // ranges a gap of under 1 MiB apart: one scan; further apart: two
-        let wanted = vec![(0x1000_0000, 0x1000_1000), (0x1008_0000, 0x1008_1000), (0x1100_0000, 0x1100_1000)];
-        assert_eq!(watch_ranges(&regions, wanted), vec![(0x1000_0000, 0x8_1000), (0x1100_0000, 0x1000)]);
+        // ranges a gap of 512 KiB apart: one scan; 47 MiB apart: two
+        let wanted = vec![(0x1000_0000, 0x1000_1000), (0x1008_0000, 0x1008_1000), (0x1300_0000, 0x1300_1000)];
+        assert_eq!(watch_ranges(&regions, wanted), vec![(0x1000_0000, 0x8_1000), (0x1300_0000, 0x1000)]);
+        // a call costs more than the walk over a gap of up to `WATCH_GAP`: 8 MiB merges, 40 MiB not
+        let wanted = vec![(0x1000_0000, 0x1000_1000), (0x1080_1000, 0x1080_2000)];
+        assert_eq!(watch_ranges(&regions, wanted), vec![(0x1000_0000, 0x80_2000)]);
+        let wanted = vec![(0x1000_0000, 0x1000_1000), (0x1280_0000, 0x1280_1000)];
+        assert_eq!(watch_ranges(&regions, wanted), vec![(0x1000_0000, 0x1000), (0x1280_0000, 0x1000)]);
+    }
+}
+
+#[cfg(test)]
+mod watch_parts_tests {
+    use super::split_watch;
+
+    #[test]
+    fn small_sets_stay_serial_and_large_ones_split_without_losing_a_range() {
+        let small = vec![(0x1000usize, 0x10000usize), (0x20000, 0x10000)];
+        assert_eq!(split_watch(&small, 8), vec![small.clone()]);
+        let big: Vec<(usize, usize)> = (0..40).map(|i| (0x1_0000_0000 + i * (64 << 20), 64 << 20)).collect();
+        assert_eq!(split_watch(&big, 1), vec![big.clone()], "one thread: the serial loop");
+        let parts = split_watch(&big, 8);
+        assert!(parts.len() > 1 && parts.len() <= 8, "{} parts", parts.len());
+        let flat: Vec<(usize, usize)> = parts.concat();
+        assert_eq!(flat, big, "every range exactly once, in order");
+    }
+}
+
+/// What the write-watch costs, measured on this machine (Windows only): the kernel walk over a
+/// synthetic write-watched reservation, and how that cost splits into a fixed part per call, a
+/// part per page and a part per dirty page. `XCL_BENCH_WATCH_MB` (default 512) is the size of the
+/// reservation the benches use.
+///
+/// `cargo test -q --lib watch_bench -- --ignored --nocapture` runs the benches; the first test
+/// runs in the normal suite (64 MiB).
+#[cfg(all(test, windows))]
+mod watch_bench {
+    use super::{watch_into, GetWriteWatch, WRITE_WATCH_FLAG_RESET};
+    use std::ffi::c_void;
+    use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE};
+
+    const MEM_WRITE_WATCH: u32 = 0x20_0000;
+
+    /// `len` bytes of write-watched memory, freed on drop.
+    struct Watched(*mut c_void, usize);
+
+    impl Watched {
+        fn new(len: usize) -> Self {
+            let p = unsafe { VirtualAlloc(std::ptr::null(), len, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE) };
+            assert!(!p.is_null(), "VirtualAlloc({len}, MEM_WRITE_WATCH) failed");
+            Watched(p, len)
+        }
+
+        /// write one byte of `pages` 4 KiB pages, spread over the range
+        fn touch(&self, pages: usize) {
+            let step = (self.1 / pages.max(1) & !0xFFF).max(0x1000);
+            for k in 0..pages {
+                unsafe { std::ptr::write_volatile((self.0 as *mut u8).add(k * step), 1) };
+            }
+        }
+    }
+
+    impl Drop for Watched {
+        fn drop(&mut self) {
+            unsafe { VirtualFree(self.0, 0, MEM_RELEASE) };
+        }
+    }
+
+    fn mb() -> usize {
+        std::env::var("XCL_BENCH_WATCH_MB").ok().and_then(|v| v.parse().ok()).unwrap_or(512).clamp(16, 2048)
+    }
+
+    /// More dirty pages than the buffer starts with: `watch_into` grows the buffer and returns
+    /// every page without a second walk over the range.
+    #[test]
+    fn more_dirty_pages_than_the_buffer_holds_are_all_returned() {
+        let w = Watched::new(128 << 20);
+        let pages = 20_000usize;
+        w.touch(pages);
+        let mut buf: Vec<*mut c_void> = Vec::new();
+        let mut dirty: Vec<usize> = Vec::new();
+        let mut gran = 0u32;
+        unsafe { watch_into(&[(w.0 as usize, w.1)], &mut buf, &mut dirty, &mut gran) };
+        dirty.sort_unstable();
+        dirty.dedup();
+        assert_eq!(dirty.len(), pages, "every written page reported once");
+        assert!(buf.len() >= pages, "the buffer grew to hold the range's pages ({} entries)", buf.len());
+    }
+
+    #[test]
+    #[ignore = "bench: up to 2 GiB, cost by bytes and by dirty pages"]
+    fn get_write_watch_cost_by_bytes_and_dirty_pages() {
+        let mb = mb();
+        let w = Watched::new(mb << 20);
+        let mut buf = vec![std::ptr::null_mut::<c_void>(); 1 << 16];
+        for &dirty in &[0usize, 16, 1024, 16384] {
+            w.touch(dirty);
+            let t = std::time::Instant::now();
+            let (mut n, mut gran) = (buf.len(), 0u32);
+            let r = unsafe { GetWriteWatch(WRITE_WATCH_FLAG_RESET, w.0, w.1, buf.as_mut_ptr(), &mut n, &mut gran) };
+            let d = t.elapsed().as_secs_f64();
+            assert_eq!(r, 0, "GetWriteWatch failed");
+            assert_eq!(n, dirty, "{dirty} pages written, {n} reported");
+            println!(
+                "watched {mb} MiB ({:.0} pages), {n} dirty: {:.2} ms ({:.2} ns/page, {:.3} µs/dirty page)",
+                w.1 as f64 / 4096.0,
+                d * 1e3,
+                d * 1e9 / (w.1 as f64 / 4096.0),
+                d * 1e6 / n.max(1) as f64
+            );
+        }
+    }
+
+    /// The same bytes in one call and in many: the fixed cost of a call.
+    #[test]
+    #[ignore = "bench: 512 MiB in 1 call vs calls of 1, 4 and 16 MiB"]
+    fn cost_of_many_small_ranges() {
+        let len = mb() << 20;
+        let w = Watched::new(len);
+        let mut buf = vec![std::ptr::null_mut::<c_void>(); 1 << 16];
+        for chunk in [len, 16 << 20, 4 << 20, 1 << 20] {
+            w.touch(64);
+            let mut got = 0usize;
+            let t = std::time::Instant::now();
+            for base in (0..len).step_by(chunk) {
+                let (mut n, mut gran) = (buf.len(), 0u32);
+                let r = unsafe { GetWriteWatch(WRITE_WATCH_FLAG_RESET, (w.0 as *const u8).add(base) as *const c_void, chunk, buf.as_mut_ptr(), &mut n, &mut gran) };
+                assert_eq!(r, 0);
+                got += n;
+            }
+            let d = t.elapsed().as_secs_f64();
+            println!(
+                "{} MiB in {} calls of {} MiB: {:.2} ms, {got} pages ({:.1} µs a call)",
+                len >> 20,
+                len / chunk,
+                chunk >> 20,
+                d * 1e3,
+                d * 1e6 / (len / chunk) as f64
+            );
+            assert_eq!(got, 64);
+        }
+    }
+
+    /// A buffer that fills: the call reports what fitted and the rest stay dirty, so the next
+    /// call walks the whole range again (why `watch_into` grows the buffer).
+    #[test]
+    #[ignore = "bench: 2 GiB, 100k dirty pages, small vs grown buffer"]
+    fn a_full_buffer_costs_one_walk_per_bufferful() {
+        let w = Watched::new(2048 << 20);
+        let dirty = 100_000usize;
+        for entries in [16384usize, 0] {
+            w.touch(dirty);
+            let mut buf = vec![std::ptr::null_mut::<c_void>(); if entries == 0 { dirty + 1024 } else { entries }];
+            let t = std::time::Instant::now();
+            let (mut got, mut calls, mut gran) = (0usize, 0usize, 0u32);
+            loop {
+                let mut n = buf.len();
+                let r = unsafe { GetWriteWatch(WRITE_WATCH_FLAG_RESET, w.0, w.1, buf.as_mut_ptr(), &mut n, &mut gran) };
+                assert_eq!(r, 0);
+                got += n;
+                calls += 1;
+                if n < buf.len() {
+                    break;
+                }
+            }
+            println!("buffer {} entries: {calls} calls, {got} of {dirty} pages, {:.2} ms", buf.len(), t.elapsed().as_secs_f64() * 1e3);
+            assert_eq!(got, dirty);
+        }
     }
 }
