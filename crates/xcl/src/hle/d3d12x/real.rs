@@ -5166,6 +5166,52 @@ mod rect_list_pso_tests {
 }
 
 #[cfg(test)]
+mod this_first_tests {
+    use super::*;
+
+    /// `this_first`: either argument order, and a return buffer whose first word is a stale copy
+    /// of the object's vtable pointer (7a033c8: the retail game's C-way call wrote its result
+    /// over the device). Synthetic objects; no GPU and no title.
+    #[test]
+    fn a_return_buffer_with_a_stale_vtable_copy_is_not_the_object() {
+        let pc = [0usize; 32];
+        let ext = [pc.as_ptr() as usize, 0];
+        let vtbl = ext.as_ptr() as usize + 8;
+        EXTS.lock().unwrap().get_or_insert_with(HashSet::new).insert(vtbl);
+        let plain = 0x1234_5678usize;
+        let p = &plain as *const usize as *mut c_void;
+        // an object off the stack (as a real device is), and a stack buffer holding a stale copy
+        // of its vtable pointer - the retail game's case
+        let obj = Box::into_raw(Box::new([vtbl])) as *mut c_void;
+        let buf = [vtbl];
+        let b = buf.as_ptr() as *mut c_void;
+        unsafe {
+            assert!(is_adopted(obj) && is_adopted(b), "both look adopted");
+            // one adopted: that one is the object, either position
+            assert!(this_first(obj, p));
+            assert!(!this_first(p, obj));
+            // neither adopted: unchanged (the C way is assumed)
+            assert!(!this_first(p, p) && !this_first(std::ptr::null_mut(), std::ptr::null_mut()));
+            // one null argument: the other is taken as `this`, either position
+            assert!(this_first(obj, std::ptr::null_mut()));
+            assert!(!this_first(std::ptr::null_mut(), obj));
+            // both adopted, one on this thread's stack: the stack one is the buffer, so the heap
+            // one is `this` in either order - what 7a033c8 fixed
+            assert!(this_first(obj, b));
+            assert!(!this_first(b, obj));
+            // both on the stack, neither the device: `a` (the C++ way)
+            let stale = [vtbl];
+            let s = stale.as_ptr() as *mut c_void;
+            assert!(this_first(b, s) && this_first(s, b));
+            drop(Box::from_raw(obj as *mut [usize; 1]));
+        }
+        if let Some(g) = EXTS.lock().unwrap().as_mut() {
+            g.remove(&vtbl);
+        }
+    }
+}
+
+#[cfg(test)]
 mod cache_report_tests {
     use super::*;
 
