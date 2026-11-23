@@ -1207,7 +1207,8 @@ mod tests {
             let (frames, bytes) = (r.frames, r.output_bytes);
             assert!(frames <= 960, "never more than the packet can hold");
             assert_eq!(bytes, frames * 4, "mono float32");
-            assert!(buf[bytes as usize..].iter().all(|&b| b == 0xAA), "the rest of the output is untouched");
+            let stray = buf.iter().enumerate().skip(bytes as usize).find(|(_, &b)| b != 0xAA).map(|(i, _)| i);
+            assert!(stray.is_none(), "the rest of the output is untouched: frames {frames} bytes {bytes} stray {stray:?} first {:02x?}", &buf[..16]);
             // Deactivate drops the stream's decoder
             let d = XApuCommand { kind: XAPU_DEACTIVATE, stream: 0, sequence: 0, options: 0, context: std::ptr::null_mut() };
             assert_eq!(XApuEnqueueCommand(h, &d as *const _ as *const XApuCommand, &mut n), S_OK);
