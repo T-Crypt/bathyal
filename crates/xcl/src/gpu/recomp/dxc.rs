@@ -949,6 +949,15 @@ pub fn in_cached_only() -> bool {
     CACHED_ONLY.with(|c| c.get())
 }
 
+/// The cached-only attempt found work that must not run on the title's thread: a shader
+/// that is not compiled yet, or the driver's compile of a pipeline. `cached_only`'s
+/// second return becomes true.
+pub fn defer_to_worker() {
+    if CACHED_ONLY.with(|c| c.get()) {
+        MISSED.with(|m| m.set(true));
+    }
+}
+
 pub fn compile_cached(src: &str, entry: &str, profile: &str) -> Result<(Vec<u8>, bool), String> {
     compile_cached_in(&cache_dir(), src, entry, profile)
 }
@@ -1067,6 +1076,13 @@ mod cache_tests {
 
         let (r, missed) = cached_only(|| request(|| panic!("a cached-only miss must not compile")));
         assert!(r.is_err() && missed);
+        let (n, missed) = cached_only(|| {
+            defer_to_worker();
+            7
+        });
+        assert_eq!(n, 7);
+        assert!(missed);
+        assert!(!cached_only(|| 1).1);
         assert_eq!(
             counters.snapshot(),
             CacheStats {
