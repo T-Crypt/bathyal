@@ -349,7 +349,13 @@ fn cached_watch_ranges(u: &crate::gpu::uma::Uma) -> Arc<Vec<(usize, usize)>> {
     let mut wanted: Vec<(usize, usize)> = TEXTURES.lock().unwrap().values().map(|e| (e.src & !0xFFF, (e.src + e.tex.size() as usize + 0xFFF) & !0xFFF)).collect();
     let mapped = super::sparse::mapped_ranges();
     let all = watch_all_tiles();
-    let tiles = if all { mapped.clone() } else { super::sparse::visible_ranges() };
+    let mut tiles = if all { mapped.clone() } else { super::sparse::visible_ranges() };
+    // a title that has made no GPU-visible object yet: nothing would be watched, so watch all of
+    // its tiles until one exists
+    let fell_back = tiles.is_empty() && !mapped.is_empty();
+    if fell_back {
+        tiles = mapped.clone();
+    }
     let n = WATCH_COMPUTES.fetch_add(1, Ordering::Relaxed) + 1;
     if n.is_power_of_two() {
         let sum = |rs: &[(usize, usize)]| rs.iter().map(|r| r.1).sum::<usize>() >> 20;
@@ -359,7 +365,7 @@ fn cached_watch_ranges(u: &crate::gpu::uma::Uma) -> Arc<Vec<(usize, usize)>> {
             sum(&mapped),
             tiles.len(),
             mapped.len(),
-            if all { "every mapped tile" } else { "the tiles resources, heaps and copies cover" }
+            if all { "every mapped tile" } else if fell_back { "no GPU-visible object yet, so every mapped tile" } else { "the tiles resources, heaps and copies cover" }
         );
     }
     wanted.extend(tiles);
