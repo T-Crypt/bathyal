@@ -300,7 +300,11 @@ thread_local! {
     static DIRTY_BUF: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
-fn cached_watch_ranges(u: &crate::gpu::uma::Uma) -> Arc<Vec<(usize, usize)>> {
+/// Identity of a computed watched-range set: (mapped sparse tiles, textures kept in step,
+/// graphics reservations) counters.
+type WatchKey = (u64, u64, u64);
+
+fn cached_watch_ranges(u: &crate::gpu::uma::Uma) -> (WatchKey, Arc<Vec<(usize, usize)>>) {
     let key = (
         super::sparse::mapped_gen(),
         TEXTURES_GEN.load(Ordering::Acquire),
@@ -310,7 +314,7 @@ fn cached_watch_ranges(u: &crate::gpu::uma::Uma) -> Arc<Vec<(usize, usize)>> {
         let g = WATCH_CACHE.lock().unwrap();
         if let Some((k, ref ranges)) = *g {
             if k == key {
-                return Arc::clone(ranges);
+                return (key, Arc::clone(ranges));
             }
         }
     }
@@ -322,7 +326,57 @@ fn cached_watch_ranges(u: &crate::gpu::uma::Uma) -> Arc<Vec<(usize, usize)>> {
     wanted.extend(super::sparse::mapped_ranges());
     let computed = Arc::new(watch_ranges(&regions, wanted));
     *WATCH_CACHE.lock().unwrap() = Some((key, Arc::clone(&computed)));
-    computed
+    (key, computed)
+}
+
+/// `XCL_WATCH_COLD_PERIOD`: the number of looks a watched range that was clean on its last look
+/// may wait before it is read again (default 1 = every range every look, the schedule off).
+///
+/// `GetWriteWatch` costs time in proportion to the pages of the range, not to the pages written
+/// (about 20 ns a 4 KiB page: about 15 ms for 3 GiB of mapped tiles), so the only way to make a
+/// look cheaper is to walk fewer pages. A range that had a write on the look that read it is hot
+/// and is read every look; the rest are swept in order, so a write to a range whose last look
+/// was clean reaches the GPU at most `period` looks late.
+fn watch_cold_period() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| std::env::var("XCL_WATCH_COLD_PERIOD").ok().and_then(|v| v.parse().ok()).unwrap_or(1).clamp(1, 600))
+}
+
+/// What the last look saw, for the hot/cold schedule.
+struct WatchSchedule {
+    key: WatchKey,
+    /// per watched range: had a CPU write on the look that last read it
+    hot: Vec<bool>,
+    /// where the sweep of the clean ranges resumes (an index into `hot`)
+    cursor: usize,
+}
+
+static SCHEDULE: Mutex<Option<WatchSchedule>> = Mutex::new(None);
+
+/// The indices of the watched ranges to read this look: every hot one, plus `ceil(cold/period)`
+/// clean ones from `cursor` on (wrapping), so no range waits more than `period` looks.
+fn select_ranges(hot: &[bool], cursor: &mut usize, period: usize) -> Vec<usize> {
+    let n = hot.len();
+    if period <= 1 || n == 0 {
+        *cursor = 0;
+        return (0..n).collect();
+    }
+    let cold = hot.iter().filter(|&&h| !h).count();
+    let take = cold.div_ceil(period);
+    let mut out: Vec<usize> = (0..n).filter(|&i| hot[i]).collect();
+    let mut taken = 0;
+    let mut examined = 0;
+    while examined < n && taken < take {
+        let j = (*cursor + examined) % n;
+        if !hot[j] {
+            out.push(j);
+            taken += 1;
+        }
+        examined += 1;
+    }
+    *cursor = (*cursor + examined) % n;
+    out.sort_unstable();
+    out
 }
 
 /// Run `f` as XCL's own GPU work: ExecuteCommandLists inside it does not refresh.
@@ -455,7 +509,7 @@ unsafe fn refresh_once(queue: *mut c_void) {
     }
     let watch_t0 = std::time::Instant::now();
     let mut page = 0x1000u32;
-    let ranges = cached_watch_ranges(u);
+    let (key, ranges) = cached_watch_ranges(u);
     let scan = scan_this_submit();
     let dirty_len = DIRTY_BUF.with(|dcell| {
         let mut dirty = dcell.borrow_mut();
@@ -463,9 +517,23 @@ unsafe fn refresh_once(queue: *mut c_void) {
         if !scan {
             return 0;
         }
-        let parts = watch_parts(&ranges);
+        let period = watch_cold_period();
+        let picked = if period <= 1 {
+            (0..ranges.len()).collect::<Vec<usize>>()
+        } else {
+            let mut g = SCHEDULE.lock().unwrap();
+            let s = g.get_or_insert_with(|| WatchSchedule { key, hot: vec![true; ranges.len()], cursor: 0 });
+            if s.key != key || s.hot.len() != ranges.len() {
+                // a new set of ranges: read all of it once, so every range starts with its
+                // writes of the last look carried over
+                *s = WatchSchedule { key, hot: vec![true; ranges.len()], cursor: 0 };
+            }
+            select_ranges(&s.hot, &mut s.cursor, period)
+        };
+        let selected: Vec<(usize, usize)> = picked.iter().map(|&i| ranges[i]).collect();
+        let parts = watch_parts(&selected);
         if parts.len() <= 1 {
-            WATCH_BUF.with(|wcell| watch_into(&ranges, &mut wcell.borrow_mut(), &mut dirty, &mut page));
+            WATCH_BUF.with(|wcell| watch_into(&selected, &mut wcell.borrow_mut(), &mut dirty, &mut page));
         } else {
             // Large watched sets: GetWriteWatch walks every page of a range in the kernel, one
             // range after another, and that walk held the title's submitting thread for most of
@@ -488,6 +556,17 @@ unsafe fn refresh_once(queue: *mut c_void) {
             }
         }
         dirty.sort_unstable();
+        if period > 1 {
+            // a range read this look is hot for the next one when it had a write
+            let mut g = SCHEDULE.lock().unwrap();
+            if let Some(s) = g.as_mut() {
+                for &i in &picked {
+                    let (base, size) = ranges[i];
+                    let k = dirty.partition_point(|&p| p < base);
+                    s.hot[i] = dirty.get(k).is_some_and(|&p| p < base + size);
+                }
+            }
+        }
         dirty.len()
     });
     super::sparse::note_watch(watch_t0.elapsed(), dirty_len);
@@ -917,5 +996,110 @@ mod watch_parts_tests {
         assert!(parts.len() > 1 && parts.len() <= 8, "{} parts", parts.len());
         let flat: Vec<(usize, usize)> = parts.concat();
         assert_eq!(flat, big, "every range exactly once, in order");
+    }
+}
+
+#[cfg(test)]
+mod watch_schedule_tests {
+    use super::select_ranges;
+
+    /// The cold sweep: no range waits more than `period` looks.
+    #[test]
+    fn every_cold_range_is_read_within_the_period() {
+        for (n, period) in [(100usize, 7usize), (1000, 3), (42, 40), (9, 1_000)] {
+            let hot = vec![false; n];
+            let mut cursor = 0;
+            let mut seen = vec![0usize; n];
+            for _ in 0..period {
+                for i in select_ranges(&hot, &mut cursor, period) {
+                    seen[i] += 1;
+                }
+            }
+            assert!(seen.iter().all(|&c| c >= 1), "{n} ranges, period {period}: {seen:?}");
+        }
+    }
+
+    /// A range that had a write is read on every look after it, so a writer never waits.
+    #[test]
+    fn a_hot_range_is_read_every_look() {
+        let mut hot = vec![false; 64];
+        let mut cursor = 0;
+        select_ranges(&hot, &mut cursor, 8);
+        hot[42] = true;
+        for _ in 0..40 {
+            let picked = select_ranges(&hot, &mut cursor, 8);
+            assert!(picked.contains(&42), "hot range skipped: {picked:?}");
+            assert!(picked.len() <= 1 + 64usize.div_ceil(8), "{} ranges read", picked.len());
+        }
+    }
+
+    /// Every range hot (the look after a new range set): everything is read, and the sweep is
+    /// where it was.
+    #[test]
+    fn all_hot_reads_every_range() {
+        let hot = vec![true; 5];
+        let mut cursor = 0;
+        assert_eq!(select_ranges(&hot, &mut cursor, 4), vec![0, 1, 2, 3, 4]);
+        // period 1 is off: everything, and the sweep restarts
+        let mut cursor = 3;
+        assert_eq!(select_ranges(&hot, &mut cursor, 1), vec![0, 1, 2, 3, 4]);
+        assert_eq!(cursor, 0);
+    }
+
+    /// Nothing hot at all: exactly `ceil(n/period)` ranges a look, in order, wrapping.
+    #[test]
+    fn the_sweep_takes_one_share_a_look() {
+        let hot = vec![false; 10];
+        let mut cursor = 0;
+        assert_eq!(select_ranges(&hot, &mut cursor, 4), vec![0, 1, 2]);
+        assert_eq!(select_ranges(&hot, &mut cursor, 4), vec![3, 4, 5]);
+        assert_eq!(select_ranges(&hot, &mut cursor, 4), vec![6, 7, 8]);
+        assert_eq!(select_ranges(&hot, &mut cursor, 4), vec![9]);
+        assert_eq!(select_ranges(&hot, &mut cursor, 4), vec![0, 1, 2]);
+    }
+}
+
+/// `cargo test -q --lib watch_bench -- --ignored --nocapture`, on Windows: what `GetWriteWatch`
+/// costs over a synthetic write-watched reservation, and whether the number of dirty pages in it
+/// matters (it does not: the walk is over the pages of the range). `XCL_BENCH_WATCH_MB` (default
+/// 512) is the reservation size.
+#[cfg(all(test, windows))]
+mod watch_bench {
+    use super::{GetWriteWatch, WRITE_WATCH_FLAG_RESET};
+    use std::ffi::c_void;
+    use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE};
+
+    const MEM_WRITE_WATCH: u32 = 0x20_0000;
+
+    #[test]
+    #[ignore = "bench: reserves and commits up to 2 GiB, then times GetWriteWatch"]
+    fn get_write_watch_cost_by_bytes_and_dirty_pages() {
+        let mb: usize = std::env::var("XCL_BENCH_WATCH_MB").ok().and_then(|v| v.parse().ok()).unwrap_or(512).clamp(16, 2048);
+        let len = mb << 20;
+        let p = unsafe { VirtualAlloc(std::ptr::null(), len, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE) };
+        assert!(!p.is_null(), "VirtualAlloc({len}, MEM_WRITE_WATCH) failed");
+        let mut buf = vec![std::ptr::null_mut::<c_void>(); 1 << 16];
+        // the same call for an untouched range, then with a few to many pages written first
+        for &dirty in &[0usize, 16, 1024, 16384] {
+            let step = (len / dirty.max(1)) & !0xFFF;
+            for k in 0..dirty {
+                unsafe { std::ptr::write_volatile((p as *mut u8).add(k * step), 1) };
+            }
+            let t = std::time::Instant::now();
+            let (mut n, mut gran) = (buf.len(), 0u32);
+            let r = unsafe { GetWriteWatch(WRITE_WATCH_FLAG_RESET, p, len, buf.as_mut_ptr(), &mut n, &mut gran) };
+            let d = t.elapsed().as_secs_f64();
+            assert_eq!(r, 0, "GetWriteWatch failed");
+            assert_eq!(n, dirty, "{dirty} pages written, {n} reported");
+            println!(
+                "watched {mb} MiB ({:.0} pages), {n} dirty: {:.2} ms ({:.0} GB/s, {:.1} ns/page, {:.2} µs/dirty page)",
+                len as f64 / 4096.0,
+                d * 1e3,
+                len as f64 / d / 1e9,
+                d * 1e9 / (len as f64 / 4096.0),
+                d * 1e6 / n as f64
+            );
+        }
+        unsafe { VirtualFree(p, 0, MEM_RELEASE) };
     }
 }
