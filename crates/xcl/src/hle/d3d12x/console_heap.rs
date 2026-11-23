@@ -302,6 +302,9 @@ pub fn register(obj: usize, n: u32, pc_cpu: u64, pc_gpu: u64, inc: u32, sampler:
         }
     }
     let pages = if shared && !sampler && GLOBAL.lock().unwrap().is_some() { vec![UNMAPPED; n.div_ceil(PAGE_SLOTS).max(1) as usize] } else { Vec::new() };
+    // the heap's memory is GPU-visible (its descriptors are read by the GPU): watch it, even
+    // when it lies in a raw commit of the title's reservation
+    super::sparse::note_visible(p as usize, bytes as usize);
     HEAPS.lock().unwrap().push(Heap { obj, shadow: p as usize, n, pc_cpu, pc_gpu, inc, sampler, pages, visible, memory });
     true
 }
@@ -313,6 +316,8 @@ pub fn unregister(obj: usize) {
         heaps.iter().position(|h| h.obj == obj).map(|i| heaps.swap_remove(i))
     };
     if let Some(h) = gone {
+        let bytes = h.n.max(1) as usize * if h.sampler { SAMPLER_SLOT as usize } else { SLOT as usize };
+        super::sparse::note_hidden(h.shadow, bytes);
         for (p, &f) in h.pages.iter().enumerate().filter(|&(_, &f)| f != UNMAPPED) {
             release_global(f, page_descriptors(h.n, p as u32));
         }
