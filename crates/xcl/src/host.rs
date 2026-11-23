@@ -169,8 +169,11 @@ pub fn host_main(boot_path: &Path) -> i32 {
     };
     unsafe { crate::hle::kernelx::adopt_title_hooks(&main) };
     crate::report::write_final(None);
+    // `XCL_PROFILE=1`: where the title's threads spend their time (started once its threads exist)
+    crate::profiler::start_from_env();
     let code = crate::loader::run_main(&main);
     crate::xlog_info!("game entry point returned code {code}");
+    crate::profiler::log_summary();
     crate::report::write_final(None);
     crate::log::flush();
     code as i32
