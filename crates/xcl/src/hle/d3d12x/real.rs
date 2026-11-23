@@ -4368,16 +4368,11 @@ unsafe fn untranslated_stream_desc(desc: *const c_void, stream: bool) -> Option<
 }
 
 /// The GS that completes a rect list's rects behind the console VS `vs` and the PS `ps`; refused
-/// for a PS that reads flat or is not a console one (its inputs' modes are not known).
+/// for a PS that is not a console one (its inputs' modes are not known).
 fn rect_list_gs(vs: &[u8], ps: Option<&[u8]>) -> Result<Vec<u8>, String> {
     use crate::gpu::recomp::pso;
-    if let Some(p) = ps {
-        if !pso::is_console(p) {
-            return Err("a PC pixel shader".into());
-        }
-        if pso::ps_reads_flat(p)? {
-            return Err("the PS reads a flat attribute".into());
-        }
+    if ps.is_some_and(|p| !pso::is_console(p)) {
+        return Err("a PC pixel shader".into());
     }
     pso::rect_list_gs(vs)
 }
