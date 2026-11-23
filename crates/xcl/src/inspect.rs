@@ -5,7 +5,7 @@ use std::path::Path;
 
 use serde::Serialize;
 
-use crate::pe::{Layout, Pe};
+use crate::pe::{ImportDll, Layout, Pe};
 use crate::resolver::{self, Source};
 
 #[derive(Serialize)]
@@ -29,6 +29,10 @@ struct Out {
     tls_template_bytes: Option<u64>,
     exception_entries: u32,
     stack_reserve: String,
+    /// True when the file imports console libraries (kernelx / xgameruntime / d3d12_xs).
+    is_console: bool,
+    /// The console libraries it imports, in first-seen order.
+    console_imports: Vec<String>,
     imports: Vec<Entry>,
 }
 
@@ -39,9 +43,15 @@ pub fn console_imports(path: &Path) -> Option<Vec<String>> {
     let pe = Pe::parse(&data, Layout::File).ok()?;
     let mut all = pe.imports().unwrap_or_default();
     all.extend(pe.delay_imports().unwrap_or_default());
+    Some(console_imports_from(&all))
+}
+
+/// The console libraries in already-parsed imports. Shared with `run` so the text and JSON
+/// reports agree without parsing the file twice.
+fn console_imports_from(all: &[ImportDll]) -> Vec<String> {
     let reg = crate::hle::registry();
     let mut out: Vec<String> = Vec::new();
-    for d in &all {
+    for d in all {
         let key = crate::util::dll_key(&d.dll);
         let console = key == crate::hle::KERNELX
             || reg
@@ -52,7 +62,29 @@ pub fn console_imports(path: &Path) -> Option<Vec<String>> {
             out.push(key);
         }
     }
-    Some(out)
+    out
+}
+
+/// Assemble the report from the parsed PE, so the JSON path can be tested without capturing stdout.
+fn report(path: &Path, pe: &Pe, imports: Vec<Entry>, console: Vec<String>) -> Out {
+    let tls = pe.tls().ok().flatten().map(|t| t.total_len());
+    let ex = pe.dir(crate::pe::DIR_EXCEPTION);
+    Out {
+        file: path.to_string_lossy().into_owned(),
+        machine: format!("{:#06x}", pe.machine),
+        image_base: format!("{:#x}", pe.image_base),
+        entry_rva: format!("{:#x}", pe.entry_rva),
+        size_of_image: format!("{:#x}", pe.size_of_image),
+        subsystem: pe.subsystem,
+        is_dll: pe.is_dll(),
+        has_relocations: pe.has_relocs(),
+        tls_template_bytes: tls,
+        exception_entries: ex.size / 12,
+        stack_reserve: format!("{:#x}", pe.stack_reserve),
+        is_console: !console.is_empty(),
+        console_imports: console,
+        imports,
+    }
 }
 
 fn status(s: &Source) -> String {
@@ -95,22 +127,8 @@ pub fn run(path: &Path, json: bool) -> i32 {
             imports.push(Entry { dll: d.dll.clone(), function: e.what.to_string(), delay: d.delay, status: status(&s) });
         }
     }
-    let tls = pe.tls().ok().flatten().map(|t| t.total_len());
-    let ex = pe.dir(crate::pe::DIR_EXCEPTION);
-    let out = Out {
-        file: path.to_string_lossy().into_owned(),
-        machine: format!("{:#06x}", pe.machine),
-        image_base: format!("{:#x}", pe.image_base),
-        entry_rva: format!("{:#x}", pe.entry_rva),
-        size_of_image: format!("{:#x}", pe.size_of_image),
-        subsystem: pe.subsystem,
-        is_dll: pe.is_dll(),
-        has_relocations: pe.has_relocs(),
-        tls_template_bytes: tls,
-        exception_entries: ex.size / 12,
-        stack_reserve: format!("{:#x}", pe.stack_reserve),
-        imports,
-    };
+    let console = console_imports_from(&all);
+    let out = report(path, &pe, imports, console);
     if json {
         println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
         return 0;
@@ -119,12 +137,13 @@ pub fn run(path: &Path, json: bool) -> i32 {
     println!("Type:          {} x64, subsystem {}", if out.is_dll { "DLL" } else { "EXE" }, out.subsystem);
     println!("ImageBase:     {}  (size {}, entry +{})", out.image_base, out.size_of_image, out.entry_rva);
     println!("Relocations:   {}", if out.has_relocations { "yes" } else { "NO (the image must be mapped at ImageBase)" });
-    println!("Static TLS:    {}", tls.map(|n| format!("{n} B (handled by the TLS carrier)")).unwrap_or_else(|| "none".into()));
+    println!("Static TLS:    {}", out.tls_template_bytes.map(|n| format!("{n} B (handled by the TLS carrier)")).unwrap_or_else(|| "none".into()));
     println!("Exceptions:    {} .pdata entries", out.exception_entries);
     println!("Stack:         {}", out.stack_reserve);
-    match console_imports(path) {
-        Some(c) if !c.is_empty() => println!("Console game:  yes (imports {})", c.join(", ")),
-        _ => println!("Console game:  NO – no kernelx / xgameruntime / d3d12_xs imports (a regular Windows program?)"),
+    if out.is_console {
+        println!("Console game:  yes (imports {})", out.console_imports.join(", "));
+    } else {
+        println!("Console game:  NO – no kernelx / xgameruntime / d3d12_xs imports (a regular Windows program?)");
     }
     let mut per_dll: BTreeMap<String, Vec<&Entry>> = BTreeMap::new();
     for e in &out.imports {
@@ -153,4 +172,33 @@ pub fn run(path: &Path, json: bool) -> i32 {
         }
     }
     0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dll(name: &str) -> ImportDll {
+        ImportDll { dll: name.into(), delay: false, entries: Vec::new(), module_handle_rva: 0 }
+    }
+
+    #[test]
+    fn console_verdict_counts_regular_and_delay_imports_once() {
+        let all = [dll("kernel32.dll"), dll("KERNELX.DLL"), dll("D3D12_XS.dll"), dll("xgameruntime.dll"), dll("kernelx.dll")];
+        assert_eq!(console_imports_from(&all), ["kernelx.dll", "d3d12_xs.dll", "xgameruntime.dll"]);
+        assert!(console_imports_from(&[dll("kernel32.dll"), dll("user32.dll")]).is_empty());
+    }
+
+    #[test]
+    fn json_report_carries_the_console_verdict() {
+        let path = std::env::current_exe().unwrap();
+        let data = std::fs::read(&path).unwrap();
+        let pe = Pe::parse(&data, Layout::File).unwrap();
+        let json = serde_json::to_value(report(&path, &pe, Vec::new(), vec!["kernelx.dll".into()])).unwrap();
+        assert_eq!(json["is_console"], true);
+        assert_eq!(json["console_imports"][0], "kernelx.dll");
+        let json = serde_json::to_value(report(&path, &pe, Vec::new(), Vec::new())).unwrap();
+        assert_eq!(json["is_console"], false);
+        assert_eq!(json["console_imports"].as_array().unwrap().len(), 0);
+    }
 }
