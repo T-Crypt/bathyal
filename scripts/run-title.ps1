@@ -1,19 +1,19 @@
 # Runs a title with the release build in a visible window and keeps a log of each run.
 # Before the first run it fills XCL's shader caches, as HANDOFF.md advises for large titles: compute programs
 # first (`--precompile --only cs`), then the compute pipelines (`--precompile --pipelines`). A marker file in the
-# log folder records that this was done for this xcl.exe; -Precompile forces it again.
+# log folder records that this was done for this bathyal.exe; -Precompile forces it again.
 #
 #   powershell -ExecutionPolicy Bypass -File scripts\run-title.ps1 -Game D:\games\title
 #   powershell -ExecutionPolicy Bypass -File scripts\run-title.ps1 -Game D:\games\title -Seconds 120
 param(
     [Parameter(Mandatory = $true)][string]$Game,
-    [string]$Xcl = (Join-Path (Split-Path -Parent $PSScriptRoot) 'target\release\xcl.exe'),
+    [string]$Xcl = (Join-Path (Split-Path -Parent $PSScriptRoot) 'target\release\bathyal.exe'),
     [string]$Logs = (Join-Path $env:LOCALAPPDATA 'bathyal\runs'),
     [int]$Seconds = 0,
     [switch]$Precompile
 )
 $ErrorActionPreference = 'Stop'
-if (-not (Test-Path -LiteralPath $Xcl)) { throw "xcl.exe not found: $Xcl (cargo build --release --workspace)" }
+if (-not (Test-Path -LiteralPath $Xcl)) { throw "bathyal.exe not found: $Xcl (cargo build --release --workspace)" }
 $shaders = Get-ChildItem -LiteralPath $Game -Filter 'shaders.rpf' -Recurse -Depth 2 -ErrorAction SilentlyContinue |
     Select-Object -First 1
 New-Item -ItemType Directory -Force -Path $Logs | Out-Null
@@ -34,5 +34,5 @@ if ($Seconds -gt 0) { $env:XCL_RUN_SECONDS = "$Seconds" }
 "running $Game; log $log"
 & $Xcl run $Game 2>&1 | Tee-Object -FilePath $log
 $code = $LASTEXITCODE
-"xcl exited with code $code; the run's report.json is written as XCL describes in README.md"
+"bathyal exited with code $code; the run's report.json is written as XCL describes in README.md"
 exit $code

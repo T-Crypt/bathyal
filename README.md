@@ -2,15 +2,16 @@
 
 Bathyal is a fork of [XCL](https://github.com/ivall/xcl) by ivall and its contributors, under the same
 GPL-2.0 license (see [`NOTICE.md`](NOTICE.md)). It follows XCL's `main` and adds work focused on NVIDIA
-GPUs (32-lane waves) and on running newer retail titles further. The binary, crate and `XCL_*` settings
-keep XCL's names so upstream changes merge cleanly.
+GPUs (32-lane waves) and on running newer retail titles further. The program is `bathyal.exe`; the crate,
+the `XCL_*` settings and the `%LOCALAPPDATA%\XCL` data folder keep XCL's names so upstream changes merge
+cleanly and existing caches stay valid.
 
 This repository holds code only: no game files, shaders, assets, keys or logs from any game, and no
 decryption or DRM workarounds. Bring your own legally obtained, unpacked game files.
 
 
-XCL runs Xbox Series X|S (GDK) game files on a Windows PC **without CPU emulation**: the game's
-x64 code runs natively and XCL stands in for the console libraries the PC does not have
+Bathyal runs Xbox Series X|S (GDK) game files on a Windows PC **without CPU emulation**: the game's
+x64 code runs natively and Bathyal stands in for the console libraries the PC does not have
 (`kernelx.dll`, XGameRuntime, `d3d12_xs.dll`, …) – in the spirit of Wine/Proton. The console's
 GPU code (RDNA2 machine code) is recompiled into PC shaders (HLSL → DXIL).
 
@@ -70,8 +71,8 @@ next steps:
 |---|---|---|---|
 | **Shader recompiler** | ✅ | RDNA2 → HLSL → DXIL: VS, PS, CS, mesh (NGG), GS; atomics, LDS, scratch, images, samplers incl. static ones, wave ops, ray-tracing instructions; structured control flow; parallel DXC, disk cache | 26 698 / 26 698 programs of the retail pack; 0 DXC errors on random samples; per-instruction GPU tests |
 | **Pipelines** | ✅ | PSOs from console shaders: VS+PS, CS, MS+PS, VS+GS+PS; root signature with the shaders' static samplers; non-blocking creation – a pipeline whose shaders are not compiled yet gets a stand-in at once and is built in the background | GPU tests drawing the game's own VS / PS pairs, also built in the background |
-| **D3D12.X compute** | ✅ | console device slots, console descriptor heaps (T# / V# / S#), buffers at their console addresses, compute command lists recorded in the console format and replayed (tables, barriers, clears, copies) | the game's BVH builder and FSR 4 record and run through XCL |
-| **D3D12.X graphics** | ✅ | device, resources and heaps (also placed in title memory), pipelines; the title's graphics command lists – draws, indirect draws, graphics root arguments, barriers, copies, clears – and command lists recorded by console code, replayed; `PresentX` and frame pacing into an XCL window | Minecraft Preview plays its worlds (millions of draws, none skipped); Fortnite and XDefiant draw their screens |
+| **D3D12.X compute** | ✅ | console device slots, console descriptor heaps (T# / V# / S#), buffers at their console addresses, compute command lists recorded in the console format and replayed (tables, barriers, clears, copies) | the game's BVH builder and FSR 4 record and run through Bathyal |
+| **D3D12.X graphics** | ✅ | device, resources and heaps (also placed in title memory), pipelines; the title's graphics command lists – draws, indirect draws, graphics root arguments, barriers, copies, clears – and command lists recorded by console code, replayed; `PresentX` and frame pacing into an Bathyal window | Minecraft Preview plays its worlds (millions of draws, none skipped); Fortnite and XDefiant draw their screens |
 | **Textures** | ✅ | GFX10 tiling (all 14 2D swizzle modes, the 6 3D thick modes, linear), mip chains with mip tail, arrays, cubes and 3D textures → PC textures | 909 / 912 retail textures exact (the 3 volume LUTs decode smooth); GPU upload bit exact |
 | **Ray tracing** | ✅ | BLAS / TLAS built on the GPU by the game's own XboxBvhBuilder; RDNA2 BVH node format; BVH intersection instructions emulated in shaders | GPU traversal = brute force reference; the game's builder output checked on the GPU |
 | **Upscaling** | ✅ | the game's AMD FSR 4 console DLL (`amd_fidelityfx_upscaler_xbox.dll`): context, the 29 pipelines in the console driver's own container (FSPX) translated, a frame's 20 passes recorded and run on the GPU | end-to-end with the real DLL: a 1280×720 → 1920×1080 frame on an RX 9070, the input's gradient in the output |
@@ -81,7 +82,7 @@ next steps:
 | Feature | State | What it does | Verified by |
 |---|---|---|---|
 | **Video** | ✅ | the game's Bink 2 console DLL decodes its movies (720p / 1080p) on the CPU; the game's own YUV → RGB display shaders (`PS_Bink…` in its pack) translate like any other. Bink's GPU-assisted mode needs no Bink-specific support: its compute shaders ship with the game and go through the recompiler too (no game seen using it yet) | a game movie decodes frame by frame, picture checked |
-| **Tools** | ✅ | `xcl inspect`, `xcl run`, `xcl disasm` (RDNA2, console shader containers), `xcl shaders` (pack statistics, recompile / compile runs), `xcl rpf` | – |
+| **Tools** | ✅ | `bathyal inspect`, `bathyal run`, `bathyal disasm` (RDNA2, console shader containers), `bathyal shaders` (pack statistics, recompile / compile runs), `bathyal rpf` | – |
 
 ## Controls
 
@@ -98,12 +99,12 @@ A **gamepad is recommended**: console games are made for one, and their menus an
 ## Building and usage
 
 Windows 10/11 x64, Rust (`stable-x86_64-pc-windows-msvc`), the Windows SDK (DXC: `dxcompiler.dll`
-+ `dxil.dll`, looked up in `Windows Kits\10\bin\<version>\x64`, next to `xcl.exe` or in
++ `dxil.dll`, looked up in `Windows Kits\10\bin\<version>\x64`, next to `bathyal.exe` or in
 `%XCL_DXC_DIR%`), a D3D12 GPU with Shader Model 6.6 and mesh shaders, and the system XGameRuntime
 (`System32\xgameruntime.dll`, part of Windows / Gaming Services). On **Windows 10** (22H2
 KB5029331+), inbox `D3D12Core.dll` stops at SM 6.5; place the Microsoft D3D12 Agility SDK
 (`D3D12Core.dll`, plus `d3d12SDKLayers.dll` if using `XCL_D3D12_DEBUG=1`) in a `D3D12\` folder
-next to `xcl.exe`, directly next to `xcl.exe`, in `%LOCALAPPDATA%\XCL\D3D12\`, or point `%XCL_D3D12_DIR%` at it
+next to `bathyal.exe`, directly next to `bathyal.exe`, in `%LOCALAPPDATA%\XCL\D3D12\`, or point `%XCL_D3D12_DIR%` at it
 (for `cargo test`, use `%LOCALAPPDATA%\XCL\D3D12\` or `%XCL_D3D12_DIR%`).
 
 - **DXC:** 1.8 or newer is recommended, from the
@@ -111,7 +112,7 @@ next to `xcl.exe`, directly next to `xcl.exe`, in `%LOCALAPPDATA%\XCL\D3D12\`, o
   and point `XCL_DXC_DIR` at its `bin\x64`. A Windows SDK may hold an older one (the same `10.0.26100.0`
   folder has DXC 1.7.2308 or 1.8.2502, depending on the SDK's revision). DXC 1.7's DXIL was 2–2.7 times the
   size of 1.9's for translated compute programs and took an NVIDIA driver 1.4–2.2 times as long to build
-  pipelines from ([#156](https://github.com/ivall/xcl/issues/156)). `xcl run` prints the DXC it loaded, and
+  pipelines from ([#156](https://github.com/ivall/xcl/issues/156)). `bathyal run` prints the DXC it loaded, and
   `report.json` has it under `dxc`.
 - **GPU:** developed on AMD RDNA4. The console's geometry and NGG programs run as a compute pass plus a
   mesh pass, so a GPU without mesh shaders draws none of them. On GPUs with 32-lane waves only
@@ -121,19 +122,19 @@ next to `xcl.exe`, directly next to `xcl.exe`, in `%LOCALAPPDATA%\XCL\D3D12\`, o
   can still differ there. Test results on other GPUs: [#42](https://github.com/ivall/xcl/issues/42).
 
 ```powershell
-cargo build --release --workspace          # target\release\xcl.exe
+cargo build --release --workspace          # target\release\bathyal.exe
 
-xcl inspect D:\Game\game.exe               # the game's imports and what XCL has for them
-xcl run D:\Game [-- game arguments]        # run
-xcl disasm <shader.bin> [--hex]            # RDNA2 disassembler (console containers too)
-xcl shaders D:\data\shaders.rpf --top 50   # pack statistics; --recomp / --compile N
-xcl rpf D:\data\shaders.rpf --extract NAME --out folder
+bathyal inspect D:\Game\game.exe               # the game's imports and what Bathyal has for them
+bathyal run D:\Game [-- game arguments]        # run
+bathyal disasm <shader.bin> [--hex]            # RDNA2 disassembler (console containers too)
+bathyal shaders D:\data\shaders.rpf --top 50   # pack statistics; --recomp / --compile N
+bathyal rpf D:\data\shaders.rpf --extract NAME --out folder
 ```
 
-- **Without a command line** (xcl.exe opened from Explorer) XCL shows a small menu: *Choose a
+- **Without a command line** (bathyal.exe opened from Explorer) Bathyal shows a small menu: *Choose a
   game…* (pick its exe or `MicrosoftGame.config`) or *Run again* (the last one). On an error the
   window stays open until Enter.
-- XCL works on **unpacked** game files you own; it contains nothing for decrypting or
+- Bathyal works on **unpacked** game files you own; it contains nothing for decrypting or
   circumventing DRM.
 - **The game folder is never modified** – writes go to the overlay.
 - Every run writes `report.json` (called stubs, unknown D3D12.X slots and interfaces, XGameRuntime

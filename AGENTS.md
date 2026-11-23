@@ -24,13 +24,13 @@ A title's executable is untrusted code until it has proven itself. Before its fi
 
 1. Check its SHA-256 against a source you trust.
 2. Keep it out of the read-only package folder; build a game folder with `scripts\setup-game-folder.ps1`.
-3. Block its egress: `scripts\block-egress.ps1` (outbound block on `xcl.exe`; the title runs inside it).
+3. Block its egress: `scripts\block-egress.ps1` (outbound block on `bathyal.exe`; the title runs inside it).
 4. Run on a machine with no personal accounts or sensitive data when you can.
 
 ## Build, test, run (Windows)
 
 ```powershell
-cargo build --release --workspace                      # target\release\xcl.exe
+cargo build --release --workspace                      # target\release\bathyal.exe
 .\scripts\test.ps1                                     # cargo build + cargo test --workspace
 .\scripts\run-title.ps1 -Game D:\games\title           # precompiles caches once, then runs; logs in %LOCALAPPDATA%\bathyal\runs
 ```
@@ -43,7 +43,8 @@ git fetch xcl
 git merge xcl/main                                     # on a branch; keep our README header and NOTICE.md
 ```
 
-Binary, crate and `XCL_*` names stay XCL's so these merges stay clean.
+The program is `bathyal.exe`. The crate, module paths, `XCL_*` settings and the `%LOCALAPPDATA%\XCL` data
+folder keep XCL's names so these merges stay clean; rename them only together with upstream.
 
 ## Notes carried over from Leonida
 
