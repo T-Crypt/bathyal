@@ -362,12 +362,16 @@ pub(super) unsafe fn refresh(queue: *mut c_void) {
 /// The write-watch ranges split into at most `WATCH_THREADS` parts of about equal size, or one
 /// part when the set is small enough that threads would cost more than they save.
 fn watch_parts(ranges: &[(usize, usize)]) -> Vec<Vec<(usize, usize)>> {
+    split_watch(ranges, watch_threads())
+}
+
+fn split_watch(ranges: &[(usize, usize)], threads: usize) -> Vec<Vec<(usize, usize)>> {
     const MIN_PARALLEL: usize = 256 << 20;
     let total: usize = ranges.iter().map(|r| r.1).sum();
-    if ranges.len() < 2 || total < MIN_PARALLEL || watch_threads() < 2 {
+    if ranges.len() < 2 || total < MIN_PARALLEL || threads < 2 {
         return vec![ranges.to_vec()];
     }
-    let k = watch_threads().min(ranges.len());
+    let k = threads.min(ranges.len());
     let share = total.div_ceil(k);
     let mut parts: Vec<Vec<(usize, usize)>> = vec![Vec::new()];
     let mut acc = 0usize;
@@ -442,14 +446,15 @@ fn watch_pool() -> &'static WatchPool {
     })
 }
 
-/// Whether this submit reads the write-watch. GetWriteWatch walks every watched page (gigabytes
-/// of mapped sparse tiles on a newer retail title: about 15 ms a call) and a title submits several
-/// times a frame, so by default it is read once a frame: at the first submit after a present.
-/// A page written between two submits of one frame then reaches video memory at the next frame's
-/// first submit. `XCL_WATCH_EVERY_SUBMIT=1` reads it before every submit, as before.
+/// Whether this submit reads the write-watch. By default every submit does: a page the CPU wrote
+/// between two submits (descriptors, buffers in sparse windows) must reach video memory before the
+/// second one. GetWriteWatch walks every watched page, though (gigabytes of mapped sparse tiles on a
+/// newer retail title: about 15 ms a call, several submits a frame), so `XCL_WATCH_PER_FRAME=1`
+/// reads it only at the first submit after a present: faster, but a write made between two submits
+/// of one frame reaches video memory one frame late.
 fn scan_this_submit() -> bool {
-    static EVERY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if *EVERY.get_or_init(|| std::env::var("XCL_WATCH_EVERY_SUBMIT").is_ok_and(|v| v != "0")) {
+    static PER_FRAME: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*PER_FRAME.get_or_init(|| std::env::var("XCL_WATCH_PER_FRAME").is_ok_and(|v| v != "0")) {
         return true;
     }
     static LAST: AtomicU64 = AtomicU64::new(u64::MAX);
@@ -916,14 +921,15 @@ mod tests {
 
 #[cfg(test)]
 mod watch_parts_tests {
-    use super::watch_parts;
+    use super::split_watch;
 
     #[test]
     fn small_sets_stay_serial_and_large_ones_split_without_losing_a_range() {
         let small = vec![(0x1000usize, 0x10000usize), (0x20000, 0x10000)];
-        assert_eq!(watch_parts(&small), vec![small.clone()]);
+        assert_eq!(split_watch(&small, 8), vec![small.clone()]);
         let big: Vec<(usize, usize)> = (0..40).map(|i| (0x1_0000_0000 + i * (64 << 20), 64 << 20)).collect();
-        let parts = watch_parts(&big);
+        assert_eq!(split_watch(&big, 1), vec![big.clone()], "one thread: the serial loop");
+        let parts = split_watch(&big, 8);
         assert!(parts.len() > 1 && parts.len() <= 8, "{} parts", parts.len());
         let flat: Vec<(usize, usize)> = parts.concat();
         assert_eq!(flat, big, "every range exactly once, in order");
