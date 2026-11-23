@@ -1945,8 +1945,9 @@ fn pc_srv(rd: &D3D12_RESOURCE_DESC, v: Option<&D3D12_SHADER_RESOURCE_VIEW_DESC>)
     let mut out = match v {
         Some(v) => *v,
         None => {
-            // only a typeless depth buffer needs a description of its own
-            if !matches!(rf, 19 | 39 | 44 | 53) {
+            // only a typeless resource needs a description of its own (a depth buffer, and one
+            // `pc_resource_desc` made typeless for its views)
+            if !matches!(rf, 19 | 39 | 44 | 53) && !super::device_x::typeless_format(rf) {
                 return None;
             }
             let mut v = D3D12_SHADER_RESOURCE_VIEW_DESC { Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING, ..Default::default() };
@@ -1964,6 +1965,10 @@ fn pc_srv(rd: &D3D12_RESOURCE_DESC, v: Option<&D3D12_SHADER_RESOURCE_VIEW_DESC>)
         return None;
     }
     let f = super::device_x::pc_shader_view_format(rf, out.Format.0 as u32);
+    // a typeless resource whose family has no obvious view (none of the console's): as it was
+    if f == 0 {
+        return None;
+    }
     let stencil = super::device_x::stencil_view(rf, f);
     if v.is_some() && f == out.Format.0 as u32 && !stencil {
         return None;
@@ -2165,14 +2170,57 @@ fn buffer_words_at(va: u64, format: windows::Win32::Graphics::Dxgi::Common::DXGI
     crate::gpu::desc::buffer_words(va + first * elem as u64, stride, records, fmt)
 }
 
-unsafe extern "system" fn dev_create_uav_x(this: *mut c_void, res: *mut c_void, counter: *mut c_void, desc: *const D3D12_UNORDERED_ACCESS_VIEW_DESC, cpu: u64) {
-    // the view's format as the PC's for the resource (B5G5R5A1 of a target made R8G8B8A8,
-    // `device_x::pc_resource_desc`: an invalid call, the device removed)
-    let mut copy = desc.as_ref().copied();
-    if let (Some(c), Some(r)) = (copy.as_mut(), ID3D12Resource::from_raw_borrowed(&res)) {
-        let rf = r.GetDesc().Format.0 as u32;
-        c.Format = windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(super::device_x::pc_shader_view_format(rf, c.Format.0 as u32) as i32);
+/// A UAV view desc `d` (None: the resource's own) of `rd` with the PC's format names
+/// (`device_x::pc_shader_view_format`, `device_x::pc_unorm_format`) – None: as it is. A resource
+/// the PC holds typeless (`pc_resource_desc`: an R9G9B9E5 target, an sRGB one with UAVs) needs a
+/// typed desc of its own.
+fn pc_uav_desc(rd: &D3D12_RESOURCE_DESC, d: Option<&D3D12_UNORDERED_ACCESS_VIEW_DESC>) -> Option<D3D12_UNORDERED_ACCESS_VIEW_DESC> {
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
+    if rd.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER {
+        return None;
     }
+    let rf = rd.Format.0 as u32;
+    let named = d.map_or(0, |c| c.Format.0 as u32);
+    let f = super::device_x::pc_unorm_format(super::device_x::pc_shader_view_format(rf, named));
+    if named != 0 {
+        if f == named {
+            return None;
+        }
+        let mut c = *d?;
+        c.Format = DXGI_FORMAT(f as i32);
+        return Some(c);
+    }
+    // the console's default view is the resource's own format; a typeless one has no such view
+    if f == rf || f == 0 {
+        return None;
+    }
+    let mut c = D3D12_UNORDERED_ACCESS_VIEW_DESC { Format: DXGI_FORMAT(f as i32), ..Default::default() };
+    let dim = rd.Dimension.0 as u32;
+    if dim == D3D12_RESOURCE_DIMENSION_TEXTURE1D.0 as u32 {
+        if rd.DepthOrArraySize > 1 {
+            c.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE1DARRAY;
+            c.Anonymous.Texture1DArray = D3D12_TEX1D_ARRAY_UAV { ArraySize: rd.DepthOrArraySize as u32, ..Default::default() };
+        } else {
+            c.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE1D;
+            c.Anonymous.Texture1D = D3D12_TEX1D_UAV::default();
+        }
+    } else if dim == D3D12_RESOURCE_DIMENSION_TEXTURE3D.0 as u32 {
+        c.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE3D;
+        c.Anonymous.Texture3D = D3D12_TEX3D_UAV { WSize: rd.DepthOrArraySize as u32, ..Default::default() };
+    } else if rd.DepthOrArraySize > 1 {
+        c.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2DARRAY;
+        c.Anonymous.Texture2DArray = D3D12_TEX2D_ARRAY_UAV { ArraySize: rd.DepthOrArraySize as u32, ..Default::default() };
+    } else {
+        c.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+        c.Anonymous.Texture2D = D3D12_TEX2D_UAV::default();
+    }
+    Some(c)
+}
+
+unsafe extern "system" fn dev_create_uav_x(this: *mut c_void, res: *mut c_void, counter: *mut c_void, desc: *const D3D12_UNORDERED_ACCESS_VIEW_DESC, cpu: u64) {
+    // the view's format as the PC's for the resource (B5G5R5A1 of a target made R8G8B8A8, an sRGB
+    // one of a texture made typeless: an invalid call, the device removed)
+    let copy = ID3D12Resource::from_raw_borrowed(&res).and_then(|r| pc_uav_desc(&r.GetDesc(), desc.as_ref()));
     let desc = copy.as_ref().map_or(desc, |c| c as *const _);
     super::present::note_use(res as usize, super::present::USE_UAV);
     let f: unsafe extern "system" fn(*mut c_void, *mut c_void, *mut c_void, *const D3D12_UNORDERED_ACCESS_VIEW_DESC, u64) = std::mem::transmute(orig_fn(this, 19));
@@ -4614,6 +4662,43 @@ unsafe extern "system" fn dev_create_root_signature(this: *mut c_void, mask: u32
 // presentation tracking
 // ---------------------------------------------------------------------------------------
 
+/// The view a render target view without a description has, for a texture `pc_resource_desc`
+/// made typeless (an sRGB one with UAVs, an R9G9B9E5 target) – None: the resource's format is
+/// a typed one.
+fn default_rtv(d: &D3D12_RESOURCE_DESC) -> Option<D3D12_RENDER_TARGET_VIEW_DESC> {
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
+    let rf = d.Format.0 as u32;
+    if matches!(rf, 19 | 44 | 53) {
+        return None;
+    }
+    let f = super::device_x::pc_shader_view_format(rf, 0);
+    if f == rf {
+        return None;
+    }
+    let mut v = D3D12_RENDER_TARGET_VIEW_DESC { Format: DXGI_FORMAT(f as i32), ..Default::default() };
+    let dim = d.Dimension.0 as u32;
+    let array = d.DepthOrArraySize;
+    if dim == D3D12_RESOURCE_DIMENSION_TEXTURE1D.0 as u32 {
+        if array > 1 {
+            v.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE1DARRAY;
+            v.Anonymous.Texture1DArray = D3D12_TEX1D_ARRAY_RTV { ArraySize: array as u32, ..Default::default() };
+        } else {
+            v.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE1D;
+            v.Anonymous.Texture1D = D3D12_TEX1D_RTV::default();
+        }
+    } else if dim == D3D12_RESOURCE_DIMENSION_TEXTURE3D.0 as u32 {
+        v.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE3D;
+        v.Anonymous.Texture3D = D3D12_TEX3D_RTV { WSize: array as u32, ..Default::default() };
+    } else if array > 1 {
+        v.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2DARRAY;
+        v.Anonymous.Texture2DArray = D3D12_TEX2D_ARRAY_RTV { ArraySize: array as u32, ..Default::default() };
+    } else {
+        v.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+        v.Anonymous.Texture2D = D3D12_TEX2D_RTV::default();
+    }
+    Some(v)
+}
+
 unsafe extern "system" fn dev_create_rtv(this: *mut c_void, res: *mut c_void, desc: *const c_void, handle: usize) {
     type F = unsafe extern "system" fn(*mut c_void, *mut c_void, *const c_void, usize);
     let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "CreateRenderTargetView")));
@@ -4622,6 +4707,11 @@ unsafe extern "system" fn dev_create_rtv(this: *mut c_void, res: *mut c_void, de
     if let Some(c) = copy.as_mut() {
         let rf = ID3D12Resource::from_raw_borrowed(&res).map_or(0, |r| r.GetDesc().Format.0 as u32);
         c.Format = windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(super::device_x::pc_shader_view_format(rf, c.Format.0 as u32) as i32);
+    }
+    // no description: the resource's format – which a texture made typeless is not one a view
+    // can have
+    if copy.is_none() {
+        copy = ID3D12Resource::from_raw_borrowed(&res).and_then(|r| default_rtv(&r.GetDesc()));
     }
     let desc = copy.as_ref().map_or(desc, |c| c as *const _ as *const c_void);
     f(this, res, desc, handle);
@@ -5474,6 +5564,76 @@ mod srv_tests {
         let mut d2 = cube;
         d2.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
         assert!(cube_as_cube_array(&d2).is_none());
+    }
+}
+
+#[cfg(test)]
+mod typeless_uav_view_tests {
+    use super::*;
+    use windows::Win32::Graphics::Dxgi::Common::*;
+
+    fn rd(format: u32, array: u16) -> D3D12_RESOURCE_DESC {
+        D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 2048,
+            Height: 2048,
+            DepthOrArraySize: array,
+            MipLevels: 1,
+            Format: DXGI_FORMAT(format as i32),
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            ..Default::default()
+        }
+    }
+
+    fn uav(format: u32, mip: u32) -> D3D12_UNORDERED_ACCESS_VIEW_DESC {
+        D3D12_UNORDERED_ACCESS_VIEW_DESC {
+            Format: DXGI_FORMAT(format as i32),
+            ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2D,
+            Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 { Texture2D: D3D12_TEX2D_UAV { MipSlice: mip, PlaneSlice: 0 } },
+        }
+    }
+
+    /// A resource the PC holds typeless (an sRGB texture with UAVs, an R9G9B9E5 target) gets a
+    /// typed UAV desc: the sRGB one's UNORM for shaders that write values, the shared-exponent
+    /// one's R32_FLOAT or, as the console names it, R32_UINT for the packed 32 bits.
+    #[test]
+    fn typeless_resources_get_typed_uav_descs() {
+        // sRGB typeless: a named sRGB view becomes UNORM, keeping its mip
+        let v = pc_uav_desc(&rd(27, 1), Some(&uav(29, 2))).expect("a UAV of an sRGB texture");
+        assert_eq!((v.Format.0, v.ViewDimension.0), (28, D3D12_UAV_DIMENSION_TEXTURE2D.0));
+        assert_eq!(unsafe { v.Anonymous.Texture2D }.MipSlice, 2);
+        // ... and the default view too
+        let v = pc_uav_desc(&rd(27, 1), None).expect("the sRGB texture's own UAV");
+        assert_eq!((v.Format.0, v.ViewDimension.0), (28, D3D12_UAV_DIMENSION_TEXTURE2D.0));
+        let v = pc_uav_desc(&rd(27, 3), None).expect("the sRGB array's own UAV");
+        assert_eq!((v.Format.0, v.ViewDimension.0), (28, D3D12_UAV_DIMENSION_TEXTURE2DARRAY.0));
+        assert_eq!(unsafe { v.Anonymous.Texture2DArray }.ArraySize, 3);
+
+        // R9G9B9E5 typeless: floats for the console format, the packed bits' format as named
+        assert_eq!(pc_uav_desc(&rd(39, 1), Some(&uav(67, 0))).map(|v| v.Format.0), Some(41));
+        assert_eq!(pc_uav_desc(&rd(39, 1), None).map(|v| v.Format.0), Some(41));
+        assert!(pc_uav_desc(&rd(39, 1), Some(&uav(42, 0))).is_none(), "R32_UINT stays R32_UINT");
+
+        // a resource that is its own typed format is left as the title made it
+        assert!(pc_uav_desc(&rd(28, 1), Some(&uav(28, 0))).is_none());
+        assert!(pc_uav_desc(&rd(28, 1), None).is_none());
+        assert!(pc_uav_desc(&rd(67, 1), Some(&uav(67, 0))).is_none(), "a sampled R9G9B9E5 texture");
+
+        // an SRV of a typeless sRGB resource: its own view is the sRGB one
+        let s = pc_srv(&rd(27, 1), None).expect("the sRGB texture's own SRV");
+        assert_eq!((s.Format.0, s.ViewDimension.0), (29, D3D12_SRV_DIMENSION_TEXTURE2D.0));
+        let s = pc_srv(&rd(39, 1), None).expect("an R32_TYPELESS texture's own SRV");
+        assert_eq!(s.Format.0, 41);
+        assert!(pc_srv(&rd(28, 1), None).is_none());
+
+        // the same for an RTV and, with no description, a view of the console's own format
+        let r = default_rtv(&rd(27, 1)).expect("the sRGB texture's own RTV");
+        assert_eq!((r.Format.0, r.ViewDimension.0), (29, D3D12_RTV_DIMENSION_TEXTURE2D.0));
+        let r = default_rtv(&rd(39, 3)).expect("the R9G9B9E5 target's own RTV");
+        assert_eq!((r.Format.0, r.ViewDimension.0), (41, D3D12_RTV_DIMENSION_TEXTURE2DARRAY.0));
+        assert_eq!(unsafe { r.Anonymous.Texture2DArray }.ArraySize, 3);
+        assert!(default_rtv(&rd(28, 1)).is_none());
+        assert!(default_rtv(&rd(44, 1)).is_none(), "a depth buffer's views name it");
     }
 }
 
