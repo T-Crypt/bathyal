@@ -867,6 +867,7 @@ unsafe fn set_abi(list: &ID3D12GraphicsCommandList, rs: &ID3D12RootSignature, vi
 /// u0 io (the user SGPRs, `io_patch` written over them), u1 res (`res`, or 256 bytes of its
 /// own), u2… the memory windows.
 unsafe fn abi_views(this: *mut c_void, real: usize, gfx: bool, res: Option<u64>, io_patch: &[(usize, u32)]) -> Result<Vec<u64>, String> {
+    super::list_x::ensure_view_heap(this);
     let u = crate::gpu::uma::get().ok_or("no unified memory")?;
     let windows = super::real::uma_window_vas();
     let first = *windows.first().ok_or("unified memory is not open on the GPU")?;
