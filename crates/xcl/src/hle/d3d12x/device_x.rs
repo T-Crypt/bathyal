@@ -899,11 +899,32 @@ pub(super) unsafe extern "system" fn create_placed_resource_x(this: *mut c_void,
             return hr;
         }
     }
+    // a texture the CPU fills: on the title's pages of such textures (`vram`), shared with the
+    // ones placed there before as on the console, else a committed texture of its own
+    let mut kept = if buffer { Err(String::new()) } else { super::title_textures::layout(&x) };
+    let on_pages = kept.as_ref().ok().map(|t| t.size()).filter(|_| !super::vram::gpu_owned(flags));
+    if let Some(console_bytes) = on_pages {
+        let pc = std::ptr::read_unaligned(d.as_ptr() as *const D3D12_RESOURCE_DESC);
+        if let Some(hr) = super::vram::place_title_texture(this, va as usize, &pc, state, console_bytes, riid, ppv) {
+            let res = *ppv;
+            let tex = std::mem::replace(&mut kept, Err(String::new()));
+            if tex.and_then(|t| super::title_textures::register(this, res, va as usize, t, D3D12_RESOURCE_STATES(state as i32))).is_ok() {
+                real::note_title_address(res as usize, va as usize);
+                return hr;
+            }
+            // (not kept in step: the pages are not its own – a resource of its own instead)
+            if !res.is_null() {
+                drop(windows::core::IUnknown::from_raw(res));
+            }
+            *ppv = std::ptr::null_mut();
+            kept = super::title_textures::layout(&x);
+        }
+    }
     let heap = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() };
     let hr = real::dev_create_committed_resource(this, &heap as *const _ as usize, 0, d.as_ptr() as usize, state as usize, clear as usize, riid, ppv);
     if hr >= 0 && !buffer && !(*ppv).is_null() {
         static M: AtomicU64 = AtomicU64::new(0);
-        match super::title_textures::register(this, *ppv, va as usize, &x, D3D12_RESOURCE_STATES(state as i32)) {
+        match kept.and_then(|tex| super::title_textures::register(this, *ppv, va as usize, tex, D3D12_RESOURCE_STATES(state as i32))) {
             Ok(()) => {
                 real::note_title_address(*ppv as usize, va as usize);
                 return hr;

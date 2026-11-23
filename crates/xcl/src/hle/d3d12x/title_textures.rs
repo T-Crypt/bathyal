@@ -19,6 +19,11 @@
 //! transitions of these textures are noted per PC command list as they are recorded
 //! (`note_transitions`) and applied, in submission order, when the list is submitted
 //! (`submitted`) – per subresource once a transition names one.
+//!
+//! The PC texture is a reserved resource on 64 KiB pages of video memory, one per page of the
+//! title's address, shared by every such texture placed there (`vram::place_title_texture`) –
+//! a title streaming its world places new textures over the old ones' memory; where it cannot
+//! be (an address not 64 KiB aligned, a texture the driver does not reserve) it is committed.
 
 use std::collections::BTreeMap;
 use std::ffi::c_void;
@@ -54,7 +59,14 @@ struct Entry {
     /// the title's GPU work wrote it (CopyTextureRegion into it): its CPU view is stale from
     /// then on and no longer uploaded
     gpu_written: bool,
+    /// the order it was placed in: textures placed over the same memory share its video memory
+    /// (`vram::place_title_texture`), and as on the console the newest one's texels are what it
+    /// holds – uploads go oldest first
+    seq: u64,
 }
+
+/// the next texture's `Entry::seq`
+static SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// textures waiting for their first upload
 static PENDING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -80,8 +92,9 @@ pub fn counts() -> (usize, u64) {
     (TEXTURES.lock().unwrap().len(), UPLOADS.load(Ordering::Relaxed))
 }
 
-/// A texture the title placed at `va` (its console desc `desc`): kept in step with the memory.
-pub(super) unsafe fn register(device: *mut c_void, res: *mut c_void, va: usize, desc: &[u8; 0x38], state: D3D12_RESOURCE_STATES) -> Result<(), String> {
+/// The console layout of a texture the title places (its console desc `desc`) when it can be
+/// kept in step with the memory (`register`); Err: why not.
+pub(super) fn layout(desc: &[u8; 0x38]) -> Result<xg::Texture, String> {
     let tex = xg::Texture::new(desc).map_err(|hr| format!("layout {hr:#x}"))?;
     // the console's 32-bit 116 / 117 floats are half floats on the PC (`pc_resource_desc`): the
     // title's bytes are not the resource's texels
@@ -110,13 +123,20 @@ pub(super) unsafe fn register(device: *mut c_void, res: *mut c_void, va: usize, 
         static N: AtomicU64 = AtomicU64::new(0);
         let n = N.fetch_add(1, Ordering::Relaxed) + 1;
         if n <= 2 || n.is_power_of_two() {
-            crate::xlog_info!("D3D12.X: a small render target at {va:#x} ({} planes) is kept in step with the title's memory – a glyph cache the CPU fills ({n} so far)", tex.planes.len());
+            crate::xlog_info!("D3D12.X: a small render target ({} planes) is kept in step with the title's memory – a glyph cache the CPU fills ({n} so far)", tex.planes.len());
         }
     }
+    Ok(tex)
+}
+
+/// A texture the title placed at `va` (its console layout `tex`, from `layout`): kept in step
+/// with the memory.
+pub(super) unsafe fn register(device: *mut c_void, res: *mut c_void, va: usize, tex: xg::Texture, state: D3D12_RESOURCE_STATES) -> Result<(), String> {
     if ID3D12Resource::from_raw_borrowed(&res).is_none() {
         return Err("no resource".into());
     }
-    let e = Entry { device: device as usize, va, tex: Arc::new(tex), states: vec![state], pending: true, gpu_written: false };
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let e = Entry { device: device as usize, va, tex: Arc::new(tex), states: vec![state], pending: true, gpu_written: false, seq };
     {
         let mut t = TEXTURES.lock().unwrap();
         if let Some(old) = t.insert(res as usize, e) {
@@ -392,7 +412,7 @@ unsafe fn refresh_once(queue: *mut c_void) {
     }
     // textures made since the last submit and those with a written page; a reference each
     // while they are uploaded
-    let todo: Vec<(ID3D12Resource, Upload)> = DIRTY_BUF.with(|dcell| {
+    let mut todo: Vec<(u64, ID3D12Resource, Upload)> = DIRTY_BUF.with(|dcell| {
         let dirty = dcell.borrow();
         let mut t = TEXTURES.lock().unwrap();
         t.iter_mut()
@@ -412,11 +432,18 @@ unsafe fn refresh_once(queue: *mut c_void) {
                     PENDING.fetch_sub(1, Ordering::Relaxed);
                 }
                 let p = res as *mut c_void;
-                ID3D12Resource::from_raw_borrowed(&p).map(|r| (r.clone(), (e.device, e.va, Arc::clone(&e.tex), e.states.clone())))
+                ID3D12Resource::from_raw_borrowed(&p).map(|r| (e.seq, r.clone(), (e.device, e.va, Arc::clone(&e.tex), e.states.clone())))
             })
             .collect()
     });
-    upload_all(todo);
+    upload_all(in_placement_order(&mut todo));
+}
+
+/// The uploads `todo` (placement order, PC texture, upload) oldest placement first: where
+/// textures share video memory the newest one's upload is the last word.
+fn in_placement_order<R, U>(todo: &mut Vec<(u64, R, U)>) -> Vec<(R, U)> {
+    todo.sort_unstable_by_key(|t| t.0);
+    todo.drain(..).map(|(_, r, u)| (r, u)).collect()
 }
 
 /// staging bytes of one batch at most
@@ -457,6 +484,8 @@ unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>) {
                 continue;
             }
         };
+        // textures on pages: their tiles' mappings come first
+        super::vram::before_execute(&queue);
         match own_work(|| texture::upload_batch(dev, &queue, &batch)) {
             Ok(failed) => {
                 for (_, e) in failed {
@@ -710,7 +739,7 @@ mod tests {
         assert_eq!(subresource_count(&tex), 6);
         // fake resource / list keys, never dereferenced: GPU-written, so no refresh uploads it
         let (res, other, l1, l2) = (0x7E57_0000_1000usize, 0x7E57_0000_2000usize, 0x7E57_0000_3000usize, 0x7E57_0000_4000usize);
-        TEXTURES.lock().unwrap().insert(res, Entry { device: 0, va: 0x7E57_0000_0000, tex, states: vec![D3D12_RESOURCE_STATE_COMMON], pending: false, gpu_written: true });
+        TEXTURES.lock().unwrap().insert(res, Entry { device: 0, va: 0x7E57_0000_0000, tex, states: vec![D3D12_RESOURCE_STATE_COMMON], pending: false, gpu_written: true, seq: 0 });
         TEXTURES_LEN.fetch_add(1, Ordering::Relaxed);
         let states = || TEXTURES.lock().unwrap().get(&res).unwrap().states.clone();
         let (p1, p2) = (l1 as *mut c_void, l2 as *mut c_void);
