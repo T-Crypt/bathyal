@@ -2109,7 +2109,7 @@ mod tests {
 
             let data: Vec<u8> = (0..0x800u32).map(|i| (i * 29 + 11) as u8).collect();
             let table = Box::new([0usize]);
-            let cell = table.as_ptr() as *mut usize;
+            let cell = table.as_ptr() as usize;
             enqueue(q, request_ex(SOURCE_MEMORY_BIT | DEST_PHYS_PAGES_BIT, cell as u64, 0, data.len() as u32, data.as_ptr() as u64, 0, data.len() as u32, 0, 0).as_ptr());
             status(q, s, 0);
             submit(q);
@@ -2117,7 +2117,7 @@ mod tests {
             let page = pages[0];
             let filler = std::thread::spawn(move || {
                 std::thread::sleep(std::time::Duration::from_millis(1));
-                unsafe { std::ptr::write_volatile(cell, page) };
+                unsafe { std::ptr::write_volatile(cell as *mut usize, page) };
             });
 
             let t = std::time::Instant::now();
