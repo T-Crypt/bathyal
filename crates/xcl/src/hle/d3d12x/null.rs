@@ -803,17 +803,45 @@ mod tests {
             assert_eq!(D3D12CreateDevice(std::ptr::null_mut(), 0xC100, std::ptr::null(), &mut dev), S_OK);
             let desc = [0u32, 16, 1, 0]; // CBV_SRV_UAV, 16 slots, shader visible
             let create_heap: Fn4 = std::mem::transmute(slot(dev, 14));
-            let mut h = std::ptr::null_mut();
-            assert_eq!(create_heap(dev, desc.as_ptr() as *const c_void, std::ptr::null(), &mut h), S_OK);
-            for i in [9, 10] {
-                // a caller that passes only `this`, with a stray pointer left in rdx
-                let start: unsafe extern "system" fn(*mut c_void, *mut u64) -> u64 = std::mem::transmute(slot(h, i));
-                let mut stray = 0x5A5A_5A5Au64;
-                let p = start(h, &mut stray);
-                assert_eq!(stray, 0x5A5A_5A5A, "slot {i} wrote through rdx");
-                assert_ne!(p, 0, "slot {i}");
-                assert_ne!(p, &mut stray as *mut u64 as u64, "slot {i} returned rdx");
+            let mut heaps = [std::ptr::null_mut(); 2];
+            for h in &mut heaps {
+                assert_eq!(create_heap(dev, desc.as_ptr() as *const c_void, std::ptr::null(), h), S_OK);
+            }
+            // the start is the heap's own handle range (CreateDescriptorHeap): not 0, one per heap
+            let base = heaps.map(|h| (*(h as *mut NullObj)).value.load(Ordering::Relaxed));
+            assert_ne!(base[0], 0);
+            assert_ne!(base[0], base[1]);
+            for (h, base) in heaps.into_iter().zip(base) {
+                for i in [9, 10] {
+                    #[cfg(all(target_arch = "x86_64", windows))]
+                    {
+                        let mut sentinel = 0x5A5A_5A5A_5A5A_5A5Au64;
+                        let p = call_with_rdx(slot(h, i), h, &mut sentinel);
+                        assert_eq!(sentinel, 0x5A5A_5A5A_5A5A_5A5A, "slot {i} wrote through rdx");
+                        assert_eq!(p, base, "slot {i} with rdx set");
+                    }
+                    let start: unsafe extern "system" fn(*mut c_void) -> u64 = std::mem::transmute(slot(h, i));
+                    assert_eq!(start(h), base, "slot {i}");
+                }
             }
         }
+    }
+
+    /// Calls `f(this)` (Win64) the way console code does, with a writable pointer left in rdx.
+    #[cfg(all(target_arch = "x86_64", windows))]
+    unsafe fn call_with_rdx(f: usize, this: *mut c_void, rdx: *mut u64) -> u64 {
+        let ret: u64;
+        // rsp is 16-aligned on entry to the asm block: 32 B of shadow space keep it so at the call
+        core::arch::asm!(
+            "sub rsp, 32",
+            "call {f}",
+            "add rsp, 32",
+            f = in(reg) f,
+            in("rcx") this,
+            in("rdx") rdx,
+            lateout("rax") ret,
+            clobber_abi("system"),
+        );
+        ret
     }
 }
