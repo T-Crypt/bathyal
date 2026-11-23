@@ -2817,6 +2817,164 @@ fn gpu_wave64_vs_spill_slots_and_identity() {
     }
 }
 
+/// Masks in whole-quad mode hold the helper lanes (#105): after `s_wqm` the helper pixels of a
+/// quad a primitive's edge splits are in EXEC, and the console's `v_cmp` sets their bits like
+/// any other lane's. Wave ops leave helper lanes out before SM 6.7, so a mask taken with
+/// `WaveActiveBallot` alone had them 0: `v_cndmask` gave them the false value, `s_and_saveexec`
+/// dropped them, and a derivative taken across the quad by hand (DPP) was wrong along the
+/// diagonal of two triangles. A waterfall loop over `v_readfirstlane` never removed a helper
+/// lane from EXEC and ran into the loop budget. The target is two triangles sharing the
+/// diagonal; per pixel: |ddx| of a value picked by `v_cndmask`, |ddy| of a value written
+/// under `s_and_saveexec` (both 1 everywhere), and the waterfall loop's iteration count.
+#[test]
+fn gpu_ps_masks_hold_helper_lanes_on_triangle_edges() {
+    if !gpu_ready() {
+        return;
+    }
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32G32_FLOAT;
+    let vs = super::dxc::compile("float4 main(float2 p : POSITION) : SV_Position { return float4(p, 0.5, 1.0); }\n", "main", "vs_6_6", &[]).unwrap();
+    for wave64 in [true, false] {
+        let pt = helper_lane_masks_ps(wave64);
+        assert!(pt.complete(), "{:?}\n{}", pt.unsupported_why, pt.hlsl);
+        let ps = super::dxc::compile(&pt.hlsl, "main", "ps_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", pt.hlsl));
+        // the whole target as two triangles sharing the diagonal x = y
+        let quad = [-1.0f32, -1.0, 1.0, -1.0, -1.0, 1.0, 1.0, -1.0, 1.0, 1.0, -1.0, 1.0];
+        let layout = [runner::VertexElement { semantic: "POSITION", index: 0, format: DXGI_FORMAT_R32G32_FLOAT, offset: 0 }];
+        let size = 32usize;
+        let px = runner::draw(&vs, &ps, &layout, &quad, 8, &[], &[], size as u32, [9.0; 4]).unwrap();
+        let lanes = if wave64 { 64.0 } else { 32.0 };
+        let bad: Vec<(usize, usize, [f32; 4])> = (0..size * size)
+            .filter(|&i| {
+                let p = px[i];
+                p[0].abs() != 1.0 || p[1].abs() != 1.0 || !(1.0..=lanes).contains(&p[2]) || p[3] != 1.0
+            })
+            .map(|i| (i % size, i / size, px[i]))
+            .collect();
+        let count = |k: usize, ok: &dyn Fn(f32) -> bool| px.iter().filter(|p| !ok(p[k])).count();
+        let (dx, dy, it) = (count(0, &|v| v.abs() == 1.0), count(1, &|v| v.abs() == 1.0), count(2, &|v| (1.0..=lanes).contains(&v)));
+        println!("wave64 {wave64}: {} of {} pixels wrong (ddx {dx}, ddy {dy}, loop {it}), first: {:?}", bad.len(), size * size, bad.iter().take(6).collect::<Vec<_>>());
+        assert!(bad.is_empty(), "wave64 {wave64}: {} pixels wrong (ddx {dx}, ddy {dy}, loop {it}; |ddx|, |ddy|, loop iterations, 1), first {:?}", bad.len(), &bad[..bad.len().min(6)]);
+    }
+}
+
+/// The masks of a waterfall loop in a pixel shader take the helper lanes' bits from quad reads
+/// of the compare's vector operand, not of the compare (#134): AMD's RDNA2 compiler crashed in
+/// `CreateGraphicsPipelineState` on quad reads of a value computed from a `WaveReadLaneAt` in a
+/// loop (WarmMilkCodes, RX 6600 XT), which `ballot_px` gave the loop's `v_cmp`. Outside loops the
+/// masks keep `ballot_px`. CPU only: what the GPU sees is `gpu_ps_masks_hold_helper_lanes_on_triangle_edges`.
+#[test]
+fn ps_masks_in_loops_quad_read_the_operands_not_the_compare() {
+    for wave64 in [true, false] {
+        let pt = helper_lane_masks_ps(wave64);
+        assert!(pt.complete(), "{:?}\n{}", pt.unsupported_why, pt.hlsl);
+        let (before, rest) = pt.hlsl.split_once("[loop] for (;;) {").unwrap_or_else(|| panic!("no loop\n{}", pt.hlsl));
+        let body = &rest[..rest.find("\n    }\n").unwrap_or_else(|| panic!("no loop end\n{}", pt.hlsl))];
+        assert!(!body.contains("ballot_px(") && !body.contains("QuadReadAcross"), "wave64 {wave64}: a quad read of a compare in the loop\n{body}");
+        assert!(body.contains("ballot_px_quad(") && body.contains("QuadReadLaneAt(v2, 3u)"), "wave64 {wave64}: the loop's v_cmp without its operand's quad reads\n{body}");
+        // one read per register and member, though the float compare names v2 twice (NaN test, ==)
+        assert_eq!(body.matches("QuadReadLaneAt(v2, ").count(), 4, "wave64 {wave64}\n{body}");
+        assert!(before.contains("= ballot_px(and("), "wave64 {wave64}: the masks before the loop lost ballot_px\n{before}");
+    }
+}
+
+/// The pixel shader of the two tests above, translated: after `s_wqm`, a mask read by
+/// `v_cndmask` (A), one for `s_and_saveexec` (B) and a waterfall loop over `v_readfirstlane` of
+/// pos.x (C); exports |ddx| of A, |ddy| of B, C's iteration count and 1.
+fn helper_lane_masks_ps(wave64: bool) -> super::Translation {
+    use super::PsInterface;
+    {
+        // the wave-size forms of the scalar mask instructions; EXEC / VCC = their low words in wave32
+        let (mov, wqm, and_save, xor) = if wave64 {
+            ("S_MOV_B64", "S_WQM_B64", "S_AND_SAVEEXEC_B64", "S_XOR_B64")
+        } else {
+            ("S_MOV_B32", "S_WQM_B32", "S_AND_SAVEEXEC_B32", "S_XOR_B32")
+        };
+        let sop1 = |n: &'static str, d: u64, s: u64| (n, "ENC_SOP1", vec![("SDST", d), ("SSRC0", s)], None);
+        type I = (&'static str, &'static str, Vec<(&'static str, u64)>, Option<u32>);
+        let head: Vec<I> = vec![
+            sop1(mov, 20, 126), // s[20:21] = the live lanes
+            sop1(wqm, 126, 126),
+            // A: v4 = v_cndmask(0, pos.x, 0 < pos.x) – pos.x in every lane; v6 = v4 of the quad's
+            // other column (quad_perm [1,0,3,2]) - v4
+            ("V_CMP_LT_F32", "ENC_VOPC", vec![("SRC0", 128), ("VSRC1", 2)], None),
+            ("V_CNDMASK_B32", "ENC_VOP2", vec![("VDST", 4), ("SRC0", 128), ("VSRC1", 2)], None),
+            ("V_MOV_B32", "VOP1_VOP_DPP16", vec![("VDST", 5), ("SRC0", 0xFA), ("VSRC0", 4), ("DPP_CTRL", 0xB1), ("ROW_MASK", 0xF), ("BANK_MASK", 0xF)], None),
+            ("V_SUB_F32", "ENC_VOP2", vec![("VDST", 6), ("SRC0", V + 5), ("VSRC1", 4)], None),
+            // B: v7 = pos.y under s_and_saveexec(0 < pos.y); v9 = v7 of the quad's other row
+            // (quad_perm [2,3,0,1]) - v7
+            ("V_CMP_LT_F32", "ENC_VOPC", vec![("SRC0", 128), ("VSRC1", 3)], None),
+            sop1(and_save, 22, 106),
+            ("V_MOV_B32", "ENC_VOP1", vec![("VDST", 7), ("SRC0", V + 3)], None),
+            sop1(mov, 126, 22),
+            ("V_MOV_B32", "VOP1_VOP_DPP16", vec![("VDST", 8), ("SRC0", 0xFA), ("VSRC0", 7), ("DPP_CTRL", 0x4E), ("ROW_MASK", 0xF), ("BANK_MASK", 0xF)], None),
+            ("V_SUB_F32", "ENC_VOP2", vec![("VDST", 9), ("SRC0", V + 8), ("VSRC1", 7)], None),
+            // C: a waterfall loop over pos.x, s8 = its iterations
+            ("S_MOV_B32", "ENC_SOP1", vec![("SDST", 8), ("SSRC0", 128)], None),
+            sop1(mov, 24, 126),
+        ];
+        let body: Vec<I> = vec![
+            ("V_READFIRSTLANE_B32", "ENC_VOP1", vec![("VDST", 4), ("SRC0", V + 2)], None),
+            ("V_CMP_EQ_F32", "ENC_VOPC", vec![("SRC0", 4), ("VSRC1", 2)], None),
+            sop1(and_save, 26, 106),
+            ("S_ADD_U32", "ENC_SOP2", vec![("SDST", 8), ("SSRC0", 8), ("SSRC1", 129)], None),
+            (xor, "ENC_SOP2", vec![("SDST", 126), ("SSRC0", 26), ("SSRC1", 126)], None),
+        ];
+        let tail: Vec<I> = vec![
+            sop1(mov, 126, 24),
+            ("V_CVT_F32_U32", "ENC_VOP1", vec![("VDST", 10), ("SRC0", 8)], None),
+            ("V_MOV_B32", "ENC_VOP1", vec![("VDST", 11), ("SRC0", 242)], None),
+            sop1(mov, 126, 20), // back to the live lanes for the export
+            ("EXP", "ENC_EXP", vec![("TGT", 0), ("EN", 0xF), ("VSRC0", 6), ("VSRC1", 9), ("VSRC2", 10), ("VSRC3", 11), ("DONE", 1), ("VM", 1)], None),
+        ];
+        let enc = |l: &[I]| -> Vec<u8> { l.iter().flat_map(|(n, e, f, x)| encode(n, e, f, *x).unwrap_or_else(|err| panic!("{n}: {err}"))).collect() };
+        let body_code = enc(&body);
+        let back = (-((body_code.len() as i64 + 4) / 4)) as u16 as u64;
+        let mut ps_code = enc(&head);
+        ps_code.extend(&body_code);
+        ps_code.extend(encode("S_CBRANCH_EXECNZ", "ENC_SOPP", &[("SIMM16", back)], None).unwrap());
+        ps_code.extend(enc(&tail));
+        ps_code.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+        let psi = PsInterface { inputs: vec![el("SV_Position", 0, 1, 3, 0, 0xF)], outputs: vec![el("SV_Target", 0, 64, 3, 0, 0xF)], input_ena: 0x302, attrs: None };
+        translate(&ps_code, &Options { mode: Mode::Pixel(psi), wave64, ..Default::default() }).unwrap()
+    }
+}
+
+/// What the pixel shaders' masks (`ballot_px`) and lane reads (`rla`) rely on, checked on the
+/// adapter with native HLSL on the same two triangles: a quad is hardware lanes 4k..4k+3 (X = ^1,
+/// Y = ^2, diagonal = ^3), and a helper lane gets the wave's result of a `WaveActiveBallot` –
+/// each lane holds its own copy of EXEC, a helper lane's included. Not every wave op does that:
+/// `WaveActiveBitOr` gave helper lanes another value on an RTX 5070 Ti (printed, not checked).
+#[test]
+fn gpu_ps_helper_lanes_see_ballots_and_quads_are_lanes_4k() {
+    if !gpu_ready() {
+        return;
+    }
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32G32_FLOAT;
+    let vs = super::dxc::compile("float4 main(float2 p : POSITION) : SV_Position { return float4(p, 0.5, 1.0); }\n", "main", "vs_6_6", &[]).unwrap();
+    // per pixel: is the quad's other column a helper lane; does it see this lane's ballot and
+    // bit-or; are this lane and that one at lanes 4k..4k+3
+    let src = "float4 main(float4 p : SV_Position) : SV_Target {\n\
+        uint l = WaveGetLaneIndex();\n\
+        uint hl = IsHelperLane() ? 1u : 0u;\n\
+        uint b = WaveActiveBallot(((uint)p.x & 3u) == 1u).x;\n\
+        uint o = WaveActiveBitOr(1u << (l & 31u));\n\
+        bool lay = QuadReadAcrossX(l) == (l ^ 1u) && QuadReadAcrossY(l) == (l ^ 2u) && QuadReadAcrossDiagonal(l) == (l ^ 3u) && QuadReadLaneAt(l, 0u) == (l & ~3u);\n\
+        bool both = lay && QuadReadAcrossX((uint)lay) != 0u;\n\
+        return float4(QuadReadAcrossX(hl), QuadReadAcrossX(b) == b ? 1.0 : 0.0, QuadReadAcrossX(o) == o ? 1.0 : 0.0, both ? 1.0 : 0.0);\n}\n";
+    let ps = super::dxc::compile(src, "main", "ps_6_6", &[]).unwrap_or_else(|e| panic!("{e}"));
+    let quad = [-1.0f32, -1.0, 1.0, -1.0, -1.0, 1.0, 1.0, -1.0, 1.0, 1.0, -1.0, 1.0];
+    let layout = [runner::VertexElement { semantic: "POSITION", index: 0, format: DXGI_FORMAT_R32G32_FLOAT, offset: 0 }];
+    let px = runner::draw(&vs, &ps, &layout, &quad, 8, &[], &[], 32, [9.0; 4]).unwrap();
+    let helpers: Vec<[f32; 4]> = px.iter().copied().filter(|p| p[0] == 1.0).collect();
+    let ballot = helpers.iter().filter(|p| p[1] == 1.0).count();
+    let bit_or = helpers.iter().filter(|p| p[2] == 1.0).count();
+    let quads = px.iter().filter(|p| p[3] == 1.0).count();
+    println!("{:?}: {} pixels next to a helper lane; its ballot right in {ballot}, its bit-or in {bit_or}; quads at lanes 4k in {quads} of {}", runner::adapter(), helpers.len(), px.len());
+    assert!(!helpers.is_empty(), "no helper lanes along the diagonal");
+    assert_eq!(ballot, helpers.len(), "helper lanes without the wave's ballot");
+    assert_eq!(quads, px.len(), "quads not at hardware lanes 4k..4k+3");
+}
+
 /// XCL image descriptor (T#, GFX10 layout): BASE_ADDRESS = SRV heap index, FORMAT, TYPE.
 fn tsharp(index: u32, format: u32, ty: u32) -> [u32; 8] {
     [index, format << 20, 0, ty << 28, 0, 0, 0, 0]
@@ -8144,5 +8302,154 @@ fn gpu_padded_compute_groups_look_the_same_to_the_program() {
             tg_size.push(tg);
         }
         assert!(tg_size[0] == tg_size[1] && tg_size[0] == tg_size[2], "{dims:?}, wave{lanes}: TG_SIZE with and without padding");
+    }
+}
+
+/// DXC cost of a folder of console shader containers (`XCL_BENCH_DIR`): every program
+/// translated (`XCL_BENCH_SPLIT=1`: the split wave64 form, `XCL_BENCH_WINDOWS=n`: n memory windows), then
+/// compiled on `XCL_BENCH_THREADS` threads (default: the DXC pool's) with `XCL_DXC_ARGS`.
+/// Prints translate time, HLSL bytes and digest, DXC wall time, sum of per-shader times and
+/// DXIL bytes. `XCL_BENCH_NO_DXC=1`: translation and digest only.
+#[test]
+#[ignore]
+fn dxc_bench_folder() {
+    let Ok(dir) = std::env::var("XCL_BENCH_DIR") else { return };
+    let split = std::env::var("XCL_BENCH_SPLIT").is_ok_and(|v| v == "1");
+    // `XCL_BENCH_WINDOWS=4`: the memory windows of a running title (`Uma::for_runtime`)
+    let windows = std::env::var("XCL_BENCH_WINDOWS").ok().and_then(|v| v.parse().ok()).unwrap_or(1u32);
+    let args = std::env::var("XCL_DXC_ARGS").unwrap_or_default();
+    let extra: Vec<&str> = args.split_whitespace().collect();
+    let mut files: Vec<_> = std::fs::read_dir(&dir).unwrap().flatten().map(|e| e.path()).collect();
+    files.sort();
+    // `XCL_BENCH_SLICE=k/n`: every n-th file from the k-th (processes side by side)
+    if let Some((k, n)) = std::env::var("XCL_BENCH_SLICE").ok().and_then(|v| v.split_once('/').and_then(|(k, n)| Some((k.parse::<usize>().ok()?, n.parse::<usize>().ok()?)))) {
+        files = files.into_iter().skip(k).step_by(n.max(1)).collect();
+    }
+    if let Ok(out) = std::env::var("XCL_BENCH_HLSL_OUT") {
+        let _ = std::fs::create_dir_all(&out);
+    }
+    let t0 = std::time::Instant::now();
+    let mut jobs: Vec<(String, String, &'static str)> = Vec::new();
+    // `XCL_BENCH_HLSL=1`: the folder holds saved HLSL (`<name>.<profile>.hlsl`) instead
+    let hlsl_dir = std::env::var("XCL_BENCH_HLSL").is_ok_and(|v| v == "1");
+    for path in files.iter().filter(|_| hlsl_dir) {
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        let profile = ["vs_6_6", "ps_6_6", "cs_6_6"].into_iter().find(|p| name.contains(p)).unwrap_or("cs_6_6");
+        let stem = name.strip_suffix(".hlsl").and_then(|n| n.strip_suffix(profile)).and_then(|n| n.strip_suffix('.')).unwrap_or(&name).to_string();
+        jobs.push((stem, std::fs::read_to_string(path).unwrap(), profile));
+    }
+    for path in files.iter().filter(|_| !hlsl_dir) {
+        let Ok(blob) = std::fs::read(path) else { continue };
+        let Some(sh) = crate::gpu::xbox::parse(&blob) else { continue };
+        for f in &sh.fssm {
+            let Some(mode) = super::interface(&blob, &sh, f) else { continue };
+            let profile = match &mode {
+                Mode::Vertex(_) => "vs_6_6",
+                Mode::Pixel(_) => "ps_6_6",
+                Mode::Compute(_) => "cs_6_6",
+                _ => continue,
+            };
+            for p in &f.programs {
+                let code = &f.data[p.offset..p.offset + p.len];
+                let opt = Options { mode: mode.clone(), wave64: super::detect_wave64(code), split_wave64: split, mem_windows: windows, ..Default::default() };
+                let Ok(t) = translate(code, &opt) else { continue };
+                if t.complete() {
+                    let name = path.file_name().unwrap().to_string_lossy().into_owned();
+                    if let Ok(out) = std::env::var("XCL_BENCH_HLSL_OUT") {
+                        let _ = std::fs::write(std::path::Path::new(&out).join(format!("{name}.{profile}.hlsl")), &t.hlsl);
+                    }
+                    jobs.push((name, t.hlsl, profile));
+                }
+            }
+        }
+    }
+    let translate_s = t0.elapsed().as_secs_f64();
+    let mut digest = 0xcbf2_9ce4_8422_2325u64;
+    for (_, h, p) in &jobs {
+        for b in h.bytes().chain(p.bytes()).chain([0]) {
+            digest ^= b as u64;
+            digest = digest.wrapping_mul(0x100_0000_01b3);
+        }
+    }
+    let bytes: usize = jobs.iter().map(|j| j.1.len()).sum();
+    let distinct: std::collections::HashSet<(&str, &str)> = jobs.iter().map(|j| (j.1.as_str(), j.2)).collect();
+    println!(
+        "programs {}, distinct HLSL {}, HLSL {:.1} MB, digest {digest:016x}, translate {translate_s:.2} s (one thread)",
+        jobs.len(),
+        distinct.len(),
+        bytes as f64 / 1048576.0
+    );
+    if std::env::var("XCL_BENCH_NO_DXC").is_ok() {
+        return;
+    }
+    let threads = std::env::var("XCL_BENCH_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or_else(super::dxc::compile_threads);
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let results: std::sync::Mutex<Vec<(f64, usize, usize, String)>> = Default::default();
+    let dxil_digest = std::sync::atomic::AtomicU64::new(0);
+    let t1 = std::time::Instant::now();
+    std::thread::scope(|s| {
+        for _ in 0..threads {
+            s.spawn(|| loop {
+                let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let Some((name, h, p)) = jobs.get(i) else { break };
+                let t = std::time::Instant::now();
+                let r = super::dxc::compile(h, "main", p, &extra);
+                let secs = t.elapsed().as_secs_f64();
+                let n = r.as_ref().map_or(0, |b| b.len());
+                // DXIL digest per program, combined by name below (order-free)
+                let mut d = 0xcbf2_9ce4_8422_2325u64;
+                for &b in r.as_deref().unwrap_or(&[]).iter().chain(name.as_bytes()).chain(p.as_bytes()) {
+                    d ^= b as u64;
+                    d = d.wrapping_mul(0x100_0000_01b3);
+                }
+                dxil_digest.fetch_xor(d, std::sync::atomic::Ordering::Relaxed);
+                if let Err(e) = &r {
+                    println!("  {name}: {}", e.lines().find(|l| l.contains("error")).unwrap_or(""));
+                }
+                results.lock().unwrap().push((secs, h.len(), n, name.clone()));
+            });
+        }
+    });
+    let wall = t1.elapsed().as_secs_f64();
+    if let Ok(out) = std::env::var("XCL_BENCH_TIMES") {
+        let t: String = results.lock().unwrap().iter().map(|(s, l, _, n)| format!("{n}	{s:.4}	{l}
+")).collect();
+        let _ = std::fs::write(out, t);
+    }
+    let mut r = results.into_inner().unwrap();
+    r.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let sum: f64 = r.iter().map(|x| x.0).sum();
+    let dxil: usize = r.iter().map(|x| x.2).sum();
+    let failed = r.iter().filter(|x| x.2 == 0).count();
+    let q = |f: f64| r[((r.len() - 1) as f64 * f) as usize].0;
+    println!(
+        "DXC {extra:?} threads {threads}: wall {wall:.2} s, {:.0} programs/s, per-program sum {sum:.1} s (median {:.3}, p90 {:.3}, max {:.2}), DXIL {:.1} MB (digest {:016x}), failed {failed}",
+        r.len() as f64 / wall,
+        q(0.5),
+        q(0.9),
+        q(1.0),
+        dxil as f64 / 1048576.0,
+        dxil_digest.into_inner()
+    );
+    for (secs, len, _, name) in r.iter().rev().take(3) {
+        println!("  {secs:.2} s, HLSL {} KB: {name}", len / 1024);
+    }
+    // cost by size: ms per HLSL KB in size buckets (is DXC linear in the source?)
+    let mut buckets = std::collections::BTreeMap::<usize, (usize, f64, usize)>::new();
+    for (secs, len, _, _) in &r {
+        let b = buckets.entry((*len / 1024).next_power_of_two()).or_default();
+        b.0 += 1;
+        b.1 += secs;
+        b.2 += len;
+    }
+    for (kb, (n, secs, len)) in buckets {
+        println!("  size <= {kb} KB: {n} programs, {:.1} ms each, {:.2} ms/KB", secs * 1e3 / n as f64, secs * 1e3 / (len as f64 / 1024.0));
+    }
+    unsafe {
+        use windows_sys::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
+        let mut c: PROCESS_MEMORY_COUNTERS = std::mem::zeroed();
+        c.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
+        GetProcessMemoryInfo(windows_sys::Win32::System::Threading::GetCurrentProcess(), &mut c, c.cb);
+        println!("  peak commit {} MB", c.PeakPagefileUsage >> 20);
     }
 }
