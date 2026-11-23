@@ -370,6 +370,22 @@ unsafe fn emulate_console_only(ctx: &mut windows_sys::Win32::System::Diagnostics
             d.Low = crate::insn::insertq(d.Low, s.Low, len, idx);
             d.High = 0;
         }
+        ConsoleOnly::Movnts { bytes, src, mem } => {
+            let regs = [
+                ctx.Rax, ctx.Rcx, ctx.Rdx, ctx.Rbx, ctx.Rsp, ctx.Rbp, ctx.Rsi, ctx.Rdi,
+                ctx.R8, ctx.R9, ctx.R10, ctx.R11, ctx.R12, ctx.R13, ctx.R14, ctx.R15,
+            ];
+            let at = crate::insn::address(&mem, &regs, ctx.Rip + len as u64) as usize;
+            if !crate::gpu::shader::readable(at, bytes as usize) {
+                return 0; // the real store faults there too
+            }
+            let v = ctx.Anonymous.FltSave.XmmRegisters[src as usize & 15].Low;
+            if bytes == 8 {
+                (at as *mut u64).write_unaligned(v);
+            } else {
+                (at as *mut u32).write_unaligned(v as u32);
+            }
+        }
     }
     ctx.Rip += len as u64;
     -1 // EXCEPTION_CONTINUE_EXECUTION
@@ -1054,5 +1070,59 @@ mod tests {
             }
         }
         modules::unregister_mapped(code);
+    }
+
+    /// MOVNTSS / MOVNTSD in a title image: on a CPU without SSE4a (any Intel) they raise
+    /// STATUS_ILLEGAL_INSTRUCTION and the handler does the store; on an AMD CPU they run
+    /// natively. Either way the memory holds the same values.
+    #[test]
+    fn sse4a_streaming_stores_run_in_a_title_image() {
+        use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_EXECUTE_READWRITE};
+        // s(p, v): movq xmm0, rdx; movntsd [rcx], xmm0; ret
+        // t(p, v): movq xmm1, rdx; movntss [rcx+4], xmm1 (a SIB without an index); ret
+        // u(p, v): movq xmm2, rdx; movntsd [rip+disp32], xmm2 (into the page's last 8 bytes); ret
+        let s_code: &[u8] = &[0x66, 0x48, 0x0F, 0x6E, 0xC2, 0xF2, 0x0F, 0x2B, 0x01, 0xC3];
+        let t_code: &[u8] = &[0x66, 0x48, 0x0F, 0x6E, 0xCA, 0xF3, 0x0F, 0x2B, 0x4C, 0x21, 0x04, 0xC3];
+        unsafe {
+            let page = VirtualAlloc(std::ptr::null(), 4096, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE) as *mut u8;
+            assert!(!page.is_null());
+            std::ptr::write_bytes(page, 0xCC, 4096);
+            std::ptr::copy_nonoverlapping(s_code.as_ptr(), page, s_code.len());
+            std::ptr::copy_nonoverlapping(t_code.as_ptr(), page.add(32), t_code.len());
+            // u at 64: the store's disp32 is relative to the end of the movntsd (64 + 5 + 8)
+            let disp = (4096 - 8 - (64 + 5 + 8)) as u32;
+            let mut u_code = vec![0x66, 0x48, 0x0F, 0x6E, 0xD2, 0xF2, 0x0F, 0x2B, 0x15];
+            u_code.extend_from_slice(&disp.to_le_bytes());
+            u_code.push(0xC3);
+            std::ptr::copy_nonoverlapping(u_code.as_ptr(), page.add(64), u_code.len());
+            modules::register_mapped(std::sync::Arc::new(modules::MappedModule {
+                name: "sse4a_test.exe".into(),
+                path: "sse4a_test.exe".into(),
+                base: page as usize,
+                size: 4096,
+                entry_rva: 0,
+                is_dll: false,
+                exports: Default::default(),
+                tls_callbacks: Default::default(),
+                no_thread_calls: Default::default(),
+                initialized: Default::default(),
+                stack_reserve: 0,
+            }));
+            let veh = windows_sys::Win32::System::Diagnostics::Debug::AddVectoredExceptionHandler(1, Some(cpp_exception_logger));
+            let s: extern "system" fn(*mut u64, u64) = std::mem::transmute(page);
+            let t: extern "system" fn(*mut u32, u64) = std::mem::transmute(page.add(32));
+            let u: extern "system" fn(*mut u64, u64) = std::mem::transmute(page.add(64));
+            let mut out = [0u64; 2];
+            s(out.as_mut_ptr(), 0x0123_4567_89AB_CDEF);
+            assert_eq!(out[0], 0x0123_4567_89AB_CDEF, "movntsd stores the low quadword");
+            let mut words = [0u32; 3];
+            t(words.as_mut_ptr(), 0xFFFF_FFFF_DEAD_BEEF);
+            assert_eq!(words, [0, 0xDEAD_BEEF, 0], "movntss stores the low dword at [rcx+4] and nothing else");
+            u(std::ptr::null_mut(), 0x1122_3344_5566_7788);
+            assert_eq!((page.add(4096 - 8) as *const u64).read_unaligned(), 0x1122_3344_5566_7788, "rip-relative movntsd");
+            windows_sys::Win32::System::Diagnostics::Debug::RemoveVectoredExceptionHandler(veh);
+            modules::unregister_mapped(page as usize);
+            VirtualFree(page as _, 0, MEM_RELEASE);
+        }
     }
 }

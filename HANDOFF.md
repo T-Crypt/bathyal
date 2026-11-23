@@ -1820,7 +1820,9 @@ right after its first `CreateShaderResourceView` (the first descriptor written i
 the Zen 2 instructions such a CPU lacks – `clwb` (Intel: Ice Lake+), `clzero`, `rdpru`, `monitorx` / `mwaitx`
 (AMD only), `rdpid` – and the vectored handler (`eh::emulate_console_only`) emulates them and steps over
 (`clwb` / `monitorx` / `mwaitx`: nothing, the PC's memory is coherent; `clzero`: 64 zero bytes at rAX; `rdpru`:
-QueryPerformanceCounter; `rdpid`: the processor number). Logged once per instruction. Any other illegal instruction
+QueryPerformanceCounter; `rdpid`: the processor number). SSE4a (AMD only): `extrq` / `insertq` on the exception's
+XMM registers, `movntss` / `movntsd` as a plain store of the low dword / quadword (fs / gs-relative ones are not
+emulated). Logged once per instruction. Any other illegal instruction
 (and `ud2`, a title's own trap) is logged with its 16 code bytes, in the first-chance handler and in the crash line.
 SHA-NI is not emulated (also missing on those CPUs): add it if a title's code bytes show `0F 38 C8..CD`.
 
