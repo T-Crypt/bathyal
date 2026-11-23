@@ -826,9 +826,187 @@ fn mf_runtime() -> Result<&'static MfRuntime, String> {
     .map_err(|e| e.clone())
 }
 
-/// Whether Windows' built-in `MSOpusDecoder.dll` + Media Foundation runtime is available.
+/// Whether an Opus decoder is available: Windows' built-in `MSOpusDecoder.dll` + Media Foundation
+/// runtime, or libopus loaded from `opus.dll` (see [`libopus`]).
 pub fn is_available() -> bool {
-    mf_runtime().is_ok()
+    mf_runtime().is_ok() || libopus().is_ok()
+}
+
+/// The decoder in use ("Windows MSOpusDecoder", "libopus (path)"), or why there is none. Logged once.
+pub fn backend() -> String {
+    match (mf_runtime(), libopus()) {
+        (Ok(_), _) => "Windows' MSOpusDecoder (Media Foundation)".to_string(),
+        (_, Ok(l)) => format!("libopus ({})", l.path),
+        (Err(a), Err(b)) => format!("none ({a}; {b})"),
+    }
+}
+
+// ---------------------------------------------------------------------------------------
+// libopus from `opus.dll`, loaded at run time (where Windows' decoder does not exist: Wine)
+// ---------------------------------------------------------------------------------------
+//
+// Not distributed with XCL (like DXC): `opus.dll` – libopus (BSD-3-Clause), built for Windows – is
+// looked for in `%XCL_OPUS_DIR%`, then next to xcl.exe (`opus.dll`, `libopus.dll`, `libopus-0.dll`).
+// Windows' own decoder is used first when the system has it. Only the decoder is used.
+
+type OpusDecoderCreateFn = unsafe extern "C" fn(i32, i32, *mut i32) -> *mut c_void;
+type OpusDecodeFn = unsafe extern "C" fn(*mut c_void, *const u8, i32, *mut i16, i32, i32) -> i32;
+type OpusDecoderDestroyFn = unsafe extern "C" fn(*mut c_void);
+type OpusDecoderCtlFn = unsafe extern "C" fn(*mut c_void, i32, ...) -> i32;
+
+/// `OPUS_RESET_STATE`: the decoder starts again
+const OPUS_RESET_STATE: i32 = 4028;
+
+struct LibOpus {
+    path: String,
+    create: OpusDecoderCreateFn,
+    decode: OpusDecodeFn,
+    destroy: OpusDecoderDestroyFn,
+    ctl: OpusDecoderCtlFn,
+}
+
+static LIBOPUS: OnceLock<Result<LibOpus, String>> = OnceLock::new();
+
+fn libopus() -> Result<&'static LibOpus, String> {
+    LIBOPUS
+        .get_or_init(|| unsafe {
+            use std::os::windows::ffi::OsStrExt;
+            use windows_sys::Win32::System::LibraryLoader::LoadLibraryW;
+            let mut dirs: Vec<std::path::PathBuf> = Vec::new();
+            if let Some(d) = std::env::var_os("XCL_OPUS_DIR") {
+                dirs.push(d.into());
+            }
+            if let Some(d) = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.to_path_buf())) {
+                dirs.push(d);
+            }
+            for dir in &dirs {
+                for name in ["opus.dll", "libopus.dll", "libopus-0.dll"] {
+                    let path = dir.join(name);
+                    if !path.is_file() {
+                        continue;
+                    }
+                    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+                    let h = LoadLibraryW(wide.as_ptr()) as usize;
+                    if h == 0 {
+                        continue;
+                    }
+                    let f = |n: &str| crate::resolver::system_proc_in(h, &crate::pe::ImportName::Name { hint: 0, name: n.into() });
+                    let (Some(create), Some(decode), Some(destroy), Some(ctl)) =
+                        (f("opus_decoder_create"), f("opus_decode"), f("opus_decoder_destroy"), f("opus_decoder_ctl"))
+                    else {
+                        continue;
+                    };
+                    return Ok(LibOpus {
+                        path: path.display().to_string(),
+                        create: std::mem::transmute::<usize, OpusDecoderCreateFn>(create),
+                        decode: std::mem::transmute::<usize, OpusDecodeFn>(decode),
+                        destroy: std::mem::transmute::<usize, OpusDecoderDestroyFn>(destroy),
+                        ctl: std::mem::transmute::<usize, OpusDecoderCtlFn>(ctl),
+                    });
+                }
+            }
+            Err("no opus.dll (libopus) in %XCL_OPUS_DIR% or next to xcl.exe".to_string())
+        })
+        .as_ref()
+        .map_err(|e| e.clone())
+}
+
+/// One libopus decoder (1 or 2 channels), the same job as [`MftDecoder`].
+struct LibDecoder {
+    lib: &'static LibOpus,
+    state: *mut c_void,
+    channels: u16,
+    output_rate: u32,
+}
+
+impl LibDecoder {
+    fn new(channels: u16, sample_rate: u32) -> Result<Self, String> {
+        let lib = libopus()?;
+        let ch = channels.clamp(1, 2);
+        // libopus decodes to 8, 12, 16, 24 or 48 kHz
+        let rate = if matches!(sample_rate, 8_000 | 12_000 | 16_000 | 24_000 | 48_000) { sample_rate } else { 48_000 };
+        let mut err = 0i32;
+        let state = unsafe { (lib.create)(rate as i32, ch as i32, &mut err) };
+        if state.is_null() || err != 0 {
+            return Err(format!("opus_decoder_create: {err}"));
+        }
+        Ok(Self { lib, state, channels: ch, output_rate: rate })
+    }
+
+    fn flush(&mut self) {
+        unsafe {
+            (self.lib.ctl)(self.state, OPUS_RESET_STATE);
+        }
+    }
+
+    fn decode_packet(&mut self, packet: &[u8], out: &mut Vec<i16>) -> Result<usize, String> {
+        let max_frames = (MAX_PACKET_SAMPLES_48K as usize * self.output_rate as usize) / 48_000;
+        let ch = self.channels as usize;
+        let start = out.len();
+        out.resize(start + max_frames * ch, 0);
+        let n = unsafe { (self.lib.decode)(self.state, packet.as_ptr(), packet.len() as i32, out[start..].as_mut_ptr(), max_frames as i32, 0) };
+        if n < 0 {
+            out.truncate(start);
+            return Err(format!("opus_decode: {n}"));
+        }
+        out.truncate(start + n as usize * ch);
+        Ok(n as usize)
+    }
+}
+
+impl Drop for LibDecoder {
+    fn drop(&mut self) {
+        unsafe { (self.lib.destroy)(self.state) }
+    }
+}
+
+// SAFETY: a libopus decoder state is used by one thread at a time (`&mut self`).
+unsafe impl Send for LibDecoder {}
+
+/// One single-stream decoder: Windows' MFT where there is one, else libopus.
+enum SingleStreamDecoder {
+    Mft(MftDecoder),
+    Lib(LibDecoder),
+}
+
+impl SingleStreamDecoder {
+    fn new(channels: u16, sample_rate: u32, head_bytes: Option<&[u8]>) -> Result<Self, String> {
+        static CHOICE: std::sync::Once = std::sync::Once::new();
+        CHOICE.call_once(|| crate::xlog_info!("Opus: decoder = {}", backend()));
+        match MftDecoder::new(channels, sample_rate, head_bytes) {
+            Ok(d) => Ok(Self::Mft(d)),
+            Err(mft) => LibDecoder::new(channels, sample_rate).map(Self::Lib).map_err(|lib| format!("{mft}; {lib}")),
+        }
+    }
+
+    fn output_rate(&self) -> u32 {
+        match self {
+            Self::Mft(d) => d.output_rate,
+            Self::Lib(d) => d.output_rate,
+        }
+    }
+
+    /// stream time of the next packet (0: nothing decoded since the start / the last flush)
+    fn timestamp_100ns(&self) -> i64 {
+        match self {
+            Self::Mft(d) => d.timestamp_100ns,
+            Self::Lib(_) => 0,
+        }
+    }
+
+    fn flush(&mut self) {
+        match self {
+            Self::Mft(d) => d.flush(),
+            Self::Lib(d) => d.flush(),
+        }
+    }
+
+    fn decode_packet(&mut self, packet: &[u8], out: &mut Vec<i16>) -> Result<usize, String> {
+        match self {
+            Self::Mft(d) => d.decode_packet(packet, out),
+            Self::Lib(d) => d.decode_packet(packet, out),
+        }
+    }
 }
 
 fn mf_create_media_type(rt: &MfRuntime) -> Result<IMFMediaType, String> {
@@ -882,7 +1060,7 @@ enum OutputSampleFormat {
     Float32,
 }
 
-struct SingleStreamDecoder {
+struct MftDecoder {
     mft: IMFTransform,
     channels: u16,
     output_rate: u32,
@@ -892,7 +1070,7 @@ struct SingleStreamDecoder {
     timestamp_100ns: i64,
 }
 
-impl SingleStreamDecoder {
+impl MftDecoder {
     fn new(channels: u16, sample_rate: u32, head_bytes: Option<&[u8]>) -> Result<Self, String> {
         let rt = mf_runtime()?;
         let mft = create_opus_mft(rt)?;
@@ -1163,7 +1341,7 @@ impl Decoder {
                 streams.push(SingleStreamDecoder::new(sch, rate, Some(&ud))?);
             }
         }
-        let output_rate = streams[0].output_rate;
+        let output_rate = streams[0].output_rate();
         let pre_skip_scaled = ((head.pre_skip as u64 * output_rate as u64) / 48_000) as usize;
         let output_gain_scale = gain_scale(head.output_gain);
 
@@ -1291,7 +1469,7 @@ impl Decoder {
                 && t.head.coupled_count == self.coupled_count
                 && t.head.mapping == self.mapping
                 && gain_scale(t.head.output_gain) == self.output_gain_scale
-                && self.streams.iter().all(|s| s.timestamp_100ns == 0)
+                && self.streams.iter().all(|s| s.timestamp_100ns() == 0)
         });
         if let Some(timing) = timing {
             for pkt in &packets {
