@@ -56,9 +56,6 @@ pub fn exports() -> Vec<(&'static str, usize)> {
         XMemFreePhysicalPages,
         XMemTransferMemory,
         XMemGetWorkingSetStatistics,
-        XMemGetWriteWatch,
-        XMemResetWriteWatch,
-        XMemIsToolsMemAvailable,
         TitleMemoryStatus,
         JobTitleMemoryStatus,
         ToolingMemoryStatus,
@@ -758,35 +755,6 @@ pub unsafe extern "system" fn XMemTransferMemory(_direction: u32, _size: usize) 
     1
 }
 
-/// `UINT XMemGetWriteWatch(flags, base, size, addresses, count, granularity)`: the console's
-/// `GetWriteWatch`. A title that keeps its own dirty-page bookkeeping for GPU uploads calls it
-/// (console title memory is unified). XCL already allocates its GPU-visible title memory
-/// write-watched (`reserve_watched`, the graphics reservations `title_textures` watches), so
-/// the host call answers for it; a region Windows did not watch fails as it does for
-/// `GetWriteWatch` (a non-zero return).
-pub unsafe extern "system" fn XMemGetWriteWatch(
-    flags: u32,
-    base: *const c_void,
-    size: usize,
-    addresses: *mut *mut c_void,
-    count: *mut usize,
-    granularity: *mut u32,
-) -> u32 {
-    mem::GetWriteWatch(flags, base, size, addresses, count, granularity)
-}
-
-/// `UINT XMemResetWriteWatch(base, size)`: the console's `ResetWriteWatch` – the region's dirty
-/// set starts again from empty.
-pub unsafe extern "system" fn XMemResetWriteWatch(base: *const c_void, size: usize) -> u32 {
-    mem::ResetWriteWatch(base, size)
-}
-
-/// `BOOL XMemIsToolsMemAvailable()`: a PC has no development-kit tools memory. The measured
-/// title asks only on an out-of-memory path, after an allocation has already failed.
-pub unsafe extern "system" fn XMemIsToolsMemAvailable() -> BOOL {
-    0
-}
-
 /// The title's debug output (console builds print a lot there) goes to XCL's log as well.
 pub unsafe extern "system" fn OutputDebugStringA(s: *const u8) {
     if let Some(m) = from_ansi_ptr(s) {
@@ -838,14 +806,6 @@ fn process_private_bytes() -> u64 {
             0
         }
     }
-}
-
-/// The title's memory in use: the process's commit charge, capped at the title's budget (the
-/// number `XMemGetWorkingSetStatistics`, `TitleMemoryStatus` and `XSystemGetAppMemoryUsage`
-/// report).
-pub fn title_memory_in_use() -> u64 {
-    let total = crate::state::config().title_memory_budget_mb() * 1024 * 1024;
-    process_private_bytes().min(total)
 }
 
 pub unsafe extern "system" fn TitleMemoryStatus(buf: *mut TitleMemoryStatusT) -> BOOL {
@@ -2437,53 +2397,9 @@ mod tests {
         }
     }
 
-    /// `XMemGetWriteWatch` / `XMemResetWriteWatch` are the host calls: a write to a
-    /// write-watched region is reported once, a reset starts the dirty set again, and a region
-    /// Windows did not watch fails as `GetWriteWatch` does.
     #[test]
-    fn xmem_write_watch_reports_and_resets_dirty_pages() {
-        const MEM_WRITE_WATCH: u32 = 0x20_0000;
-        unsafe {
-            let size = 0x10_0000;
-            let q = mem::VirtualAlloc(std::ptr::null(), size, mem::MEM_COMMIT | mem::MEM_RESERVE | MEM_WRITE_WATCH, mem::PAGE_READWRITE);
-            assert!(!q.is_null(), "a write-watched region");
-            let a = q as usize;
-            let mut buf = [std::ptr::null_mut::<c_void>(); 16];
-            let (mut n, mut gran) = (buf.len(), 0u32);
-            assert_eq!(XMemGetWriteWatch(1, q, size, buf.as_mut_ptr(), &mut n, &mut gran), 0, "no writes yet");
-            assert_eq!(n, 0);
-            assert_eq!(gran, 0x1000, "the host's page size");
-            ((a + 0x12_345) as *mut u8).write_volatile(1);
-            n = buf.len();
-            assert_eq!(XMemGetWriteWatch(1, q, size, buf.as_mut_ptr(), &mut n, &mut gran), 0);
-            assert_eq!(&buf[..n], &[(a + 0x12_000) as *mut c_void], "the written page; the flag resets it");
-            n = buf.len();
-            assert_eq!(XMemGetWriteWatch(1, q, size, buf.as_mut_ptr(), &mut n, &mut gran), 0);
-            assert_eq!(n, 0, "reported once");
-            ((a + 0x20_000) as *mut u8).write_volatile(1);
-            assert_eq!(XMemResetWriteWatch(q, size), 0);
-            n = buf.len();
-            assert_eq!(XMemGetWriteWatch(0, q, size, buf.as_mut_ptr(), &mut n, &mut gran), 0);
-            assert_eq!(n, 0, "a reset clears the dirty set");
-            assert_eq!(VirtualFree(q, 0, mem::MEM_RELEASE), 1);
-            // memory Windows did not watch fails, as GetWriteWatch does
-            let plain = mem::VirtualAlloc(std::ptr::null(), 0x1000, mem::MEM_COMMIT | mem::MEM_RESERVE, mem::PAGE_READWRITE);
-            assert!(!plain.is_null());
-            n = buf.len();
-            assert_ne!(XMemGetWriteWatch(1, plain, 0x1000, buf.as_mut_ptr(), &mut n, &mut gran), 0);
-            assert_ne!(XMemResetWriteWatch(plain, 0x1000), 0);
-            assert_eq!(VirtualFree(plain, 0, mem::MEM_RELEASE), 1);
-        }
-    }
-
-    /// No development-kit tools memory on a PC.
-    #[test]
-    fn no_tools_memory() {
-        assert_eq!(unsafe { XMemIsToolsMemAvailable() }, 0);
-    }
-
-    #[test]
-    fn title_memory_status_reports_budget() {        let mut s: TitleMemoryStatusT = unsafe { std::mem::zeroed() };
+    fn title_memory_status_reports_budget() {
+        let mut s: TitleMemoryStatusT = unsafe { std::mem::zeroed() };
         s.dw_length = std::mem::size_of::<TitleMemoryStatusT>() as u32;
         assert_eq!(std::mem::size_of::<TitleMemoryStatusT>(), 80);
         assert_eq!(unsafe { TitleMemoryStatus(&mut s) }, 1);

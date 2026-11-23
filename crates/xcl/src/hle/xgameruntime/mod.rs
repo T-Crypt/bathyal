@@ -88,8 +88,6 @@ pub fn exports() -> Vec<(&'static str, usize)> {
         // system
         XSystemGetDeviceType,
         XSystemGetConsoleId,
-        XSystemGetAppMemoryUsageLimit,
-        XSystemGetAppMemoryUsage,
         XSystemGetAnalyticsInfo,
         XSystemGetXboxLiveSandboxId,
         // package
@@ -247,19 +245,6 @@ pub unsafe extern "system" fn XSystemGetConsoleId(size: usize, buf: *mut u8, use
 
 pub unsafe extern "system" fn XSystemGetXboxLiveSandboxId(size: usize, buf: *mut u8, used: *mut usize) -> HRESULT {
     write_cstr_out(&crate::state::config().sandbox_id, buf, size, used)
-}
-
-/// `UINT64 XSystemGetAppMemoryUsageLimit()`: the memory the title may use, in bytes (GDK
-/// reference: the app's memory limit). Titles size their pools and texture streaming from it;
-/// here it is the title's budget, the same number `XMemGetWorkingSetStatistics` reports.
-pub unsafe extern "system" fn XSystemGetAppMemoryUsageLimit() -> u64 {
-    crate::state::config().title_memory_budget_mb() as u64 * 1024 * 1024
-}
-
-/// `UINT64 XSystemGetAppMemoryUsage()`: the title's memory in use in bytes – the process's
-/// commit charge, capped at the budget.
-pub unsafe extern "system" fn XSystemGetAppMemoryUsage() -> u64 {
-    crate::hle::kernelx::title_memory_in_use()
 }
 
 #[repr(C)]
@@ -1069,9 +1054,6 @@ mod tests {
             assert_eq!(XSystemGetConsoleId(39, id.as_mut_ptr(), &mut used), S_OK);
             assert_eq!(&id[..used - 1], b"00000000.00000000.00000000.00000000.00");
             assert_eq!(XSystemGetDeviceType(), DEVICE_XBOX_SCARLETT_ANACONDA);
-            // the memory budget: the limit is the title's budget, the usage the process's commit
-            assert_eq!(XSystemGetAppMemoryUsageLimit(), 13_824 * 1024 * 1024);
-            assert!(XSystemGetAppMemoryUsage() > 0 && XSystemGetAppMemoryUsage() <= XSystemGetAppMemoryUsageLimit());
             let info = XSystemGetAnalyticsInfo();
             assert!(info.os_version.major >= 10);
             assert_eq!(&info.form[..13], b"Xbox Series X");

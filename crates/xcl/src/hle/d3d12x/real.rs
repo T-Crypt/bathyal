@@ -968,7 +968,7 @@ fn console_slots(kind: Kind) -> Vec<(usize, usize)> {
                 (133, x::create_placed_resource_layout_x as usize),
             ]
         }
-        Kind::DescriptorHeap => vec![(8, heap_get_desc_x as usize), (9, heap_cpu_start_x as usize), (10, heap_gpu_start_x as usize)],
+        Kind::DescriptorHeap => vec![(9, heap_cpu_start_x as usize), (10, heap_gpu_start_x as usize)],
         Kind::Resource => vec![(11, res_gpu_va_x as usize)],
         Kind::Fence => vec![(12, super::fence_x::completed_value_address as usize)],
         // the console's allocator callback (slot 9; the PC chain ends at Reset #8)
@@ -1060,29 +1060,6 @@ fn console_slots(kind: Kind) -> Vec<(usize, usize)> {
         }
         _ => vec![],
     }
-}
-
-/// The (object, return buffer) of a struct-returning method called either way, `(this, ret)` or
-/// `(ret, this)`: `this_first` tells the two apart by which argument is an object XCL adopted.
-/// None when neither argument is one (not a call on an adopted object).
-unsafe fn get_desc_args(a: *mut c_void, b: *mut c_void) -> Option<(*mut c_void, *mut c_void)> {
-    if !is_adopted(a) && !is_adopted(b) {
-        return None;
-    }
-    Some(if this_first(a, b) { (a, b) } else { (b, a) })
-}
-
-/// descriptor heap #8 GetDesc: console callers may pass the 16-byte structure's return buffer
-/// first (`(ret, heap)` instead of the PC C++ `(heap, ret)`), as they do for the device's
-/// struct-returning methods. Both orders are accepted and the buffer's address comes back in
-/// rax. A wrong guess here writes the description over the heap's own vtable pointer.
-unsafe extern "system" fn heap_get_desc_x(a: *mut c_void, b: *mut c_void) -> *mut c_void {
-    let Some((this, ret)) = get_desc_args(a, b) else { return std::ptr::null_mut() };
-    if ret.is_null() {
-        return std::ptr::null_mut();
-    }
-    let f: unsafe extern "system" fn(*mut c_void, *mut c_void) -> *mut c_void = std::mem::transmute(orig_fn(this, 8));
-    f(this, ret)
 }
 
 /// descriptor heap #9 / #10 GetCPU / GetGPUDescriptorHandleForHeapStart: console code
@@ -5219,18 +5196,6 @@ unsafe fn queue_dispatch(slot: usize, this: *mut c_void, a1: usize, a2: usize, a
     if (slot == 14 || slot == 15) && !shifted && is_fence(a1) {
         QUEUE_OLDER.store(true, Ordering::Release);
     }
-    // #18 GetDesc takes the structure's return buffer either way round on the console
-    // (`get_desc_args`); the routing guard passes the argument registers unchanged, so a
-    // `(ret, queue)` call arrives with the buffer in `this`. Only the older layout's #18 is a
-    // GetDesc; in the newer one it is GetTimestampFrequency.
-    let (this, a1) = if slot == 18 && !shifted {
-        match get_desc_args(this, a1 as *mut c_void) {
-            Some((o, r)) => (o, r as usize),
-            None => (this, a1),
-        }
-    } else {
-        (this, a1)
-    };
     // the method in the older layout's numbering
     let older = if shifted && slot >= 16 { slot - 2 } else if shifted { usize::MAX } else { slot };
     let pc = |s: usize| orig_fn(this, s);
@@ -5902,95 +5867,6 @@ mod queue_tests {
             assert_eq!(out, [1, 2, 3, 4], "older layout: the whole description");
         }
         QUEUE_OLDER.store(false, Ordering::Release);
-    }
-
-    /// A fake 16-byte struct-returning method: the description into `out`, the buffer back.
-    unsafe extern "system" fn desc_method(_: *mut c_void, out: *mut c_void) -> *mut c_void {
-        let d = [1u32, 2, 3, 4];
-        std::ptr::copy_nonoverlapping(d.as_ptr() as *const u8, out as *mut u8, 16);
-        out
-    }
-
-    /// An object of `n` words whose vtable is a registered extension table whose PC table has
-    /// `slot` = `desc_method`; the caller leaks it (a fake adopted object).
-    fn fake_object(slot: usize) -> (*mut c_void, usize) {
-        let mut pc = [0usize; 32];
-        pc[slot] = desc_method as usize;
-        let pc: &'static [usize] = Box::leak(pc.to_vec().into_boxed_slice());
-        let table: &'static [usize] = Box::leak(vec![pc.as_ptr() as usize, 0].into_boxed_slice());
-        let vtbl = table.as_ptr() as usize + 8;
-        EXTS.lock().unwrap().get_or_insert_with(HashSet::new).insert(vtbl);
-        (Box::into_raw(Box::new([vtbl, 0usize])) as *mut c_void, vtbl)
-    }
-
-    /// Queue #18 GetDesc accepts the console's argument order `(out, queue)` as well as the PC's
-    /// `(queue, out)`, also when the out buffer holds a stale copy of the object's vtable
-    /// pointer; the queue object itself is never written.
-    #[test]
-    fn queue_get_desc_accepts_the_console_argument_order() {
-        let (obj, vtbl) = fake_object(18);
-        QUEUE_SHIFTED.store(false, Ordering::Release);
-        QUEUE_OLDER.store(true, Ordering::Release);
-        unsafe {
-            let mut out = [0xAAAA_AAAAu32; 4];
-            let r = queue_dispatch(18, obj, out.as_mut_ptr() as usize, 0, 0, 0, 0);
-            assert_eq!(r, out.as_ptr() as usize);
-            assert_eq!(out, [1, 2, 3, 4], "PC order");
-            let mut buf = [vtbl as u32, (vtbl >> 32) as u32, 0xAAAA_AAAA, 0xAAAA_AAAA];
-            let r = queue_dispatch(18, buf.as_mut_ptr() as *mut c_void, obj as usize, 0, 0, 0, 0);
-            assert_eq!(r, buf.as_ptr() as usize);
-            assert_eq!(buf, [1, 2, 3, 4], "console order writes the description into the caller's buffer");
-            assert_eq!((*(obj as *const [usize; 2]))[0], vtbl, "the queue object is untouched");
-        }
-        QUEUE_OLDER.store(false, Ordering::Release);
-        if let Some(g) = EXTS.lock().unwrap().as_mut() {
-            g.remove(&vtbl);
-        }
-    }
-
-    /// Descriptor heap #8 GetDesc: both argument orders, chosen by `get_desc_args`; console
-    /// callers use `(out, heap)` (the buffer's address comes back in rax).
-    #[test]
-    fn heap_get_desc_accepts_the_console_argument_order() {
-        assert!(
-            console_slots(Kind::DescriptorHeap).iter().any(|&(s, f)| s == 8 && f == heap_get_desc_x as usize),
-            "heap #8 is routed to the console GetDesc"
-        );
-        let (obj, vtbl) = fake_object(8);
-        unsafe {
-            let mut out = [0xAAAA_AAAAu32; 4];
-            let r = heap_get_desc_x(obj, out.as_mut_ptr() as *mut c_void);
-            assert_eq!(r, out.as_mut_ptr() as *mut c_void);
-            assert_eq!(out, [1, 2, 3, 4], "PC order");
-            let mut buf = [vtbl as u32, (vtbl >> 32) as u32, 0xAAAA_AAAA, 0xAAAA_AAAA];
-            let r = heap_get_desc_x(buf.as_mut_ptr() as *mut c_void, obj);
-            assert_eq!(r, buf.as_mut_ptr() as *mut c_void);
-            assert_eq!(buf, [1, 2, 3, 4], "console order writes the description into the caller's buffer");
-            assert_eq!((*(obj as *const [usize; 2]))[0], vtbl, "the heap object is untouched");
-            // neither argument an adopted object: no call, no write
-            assert!(heap_get_desc_x(std::ptr::null_mut(), std::ptr::null_mut()).is_null());
-        }
-        if let Some(g) = EXTS.lock().unwrap().as_mut() {
-            g.remove(&vtbl);
-        }
-    }
-
-    /// Queue #31 on the newer layout is CopyPageMappingsBatchX: it is validated and answered
-    /// S_OK without touching the PC queue (XCL keeps title pages GPU-visible itself).
-    #[test]
-    fn queue_slot_31_validates_page_mapping_batches() {
-        let shifted = QUEUE_SHIFTED.swap(true, Ordering::AcqRel);
-        QUEUE_OLDER.store(false, Ordering::Release);
-        unsafe {
-            let null = std::ptr::null_mut();
-            assert_eq!(queue_dispatch(31, null, 0, 0, 0, 0, 0), S_OK as u32 as usize);
-            assert_eq!(
-                queue_dispatch(31, null, 1, 0, 0x1000, 1, 0),
-                E_INVALIDARG as u32 as usize,
-                "a non-zero count needs a batch array"
-            );
-        }
-        QUEUE_SHIFTED.store(shifted, Ordering::Release);
     }
 }
 
