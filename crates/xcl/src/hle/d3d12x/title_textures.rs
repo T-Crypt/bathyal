@@ -1766,8 +1766,17 @@ mod watch_bench {
                 assert!(hr >= 0 && !p.is_null(), "{label}: hr {hr:#x}");
                 let res = ID3D12Resource::from_raw(p);
                 let is_3d = u32::from_le_bytes(d[0..4].try_into().unwrap()) == 4;
-                if !is_3d || opts.TiledResourcesTier.0 >= D3D12_TILED_RESOURCES_TIER_3.0 {
-                    assert!(super::super::vram::is_placed_texture(res.as_raw() as usize), "{label} should use shared vram::Pages");
+                let array = u16::from_le_bytes(d[0x1C..0x1E].try_into().unwrap());
+                let placed = super::super::vram::is_placed_texture(res.as_raw() as usize);
+                if array > 1 && !is_3d {
+                    // arrays and cubes with packed mips: a driver may refuse them reserved (GitHub's
+                    // runner did with this cube); the texture is then committed – what the pixels
+                    // below check either way
+                    if !placed {
+                        println!("{label}: not reserved on this adapter (committed instead)");
+                    }
+                } else if !is_3d || opts.TiledResourcesTier.0 >= D3D12_TILED_RESOURCES_TIER_3.0 {
+                    assert!(placed, "{label} should use shared vram::Pages");
                 }
                 write_tiled(base, &d, 0x71);
                 refresh(queue.as_raw());
