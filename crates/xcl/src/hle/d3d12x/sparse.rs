@@ -1345,14 +1345,17 @@ pub fn mapped_ranges() -> Vec<(usize, usize)> {
     s.runs.clone().unwrap_or_default()
 }
 
-/// time spent and pages found by the write-watch scans (`refresh_once`), for the timing line
-static WATCH: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+/// time spent, pages found, ranges read and bytes watched by the write-watch scans
+/// (`refresh_once`), for the timing line
+static WATCH: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 /// [lock wait, chunk scan, upload] in µs, runs uploaded
 static PHASES: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 
-pub fn note_watch(t: std::time::Duration, pages: usize) {
+pub fn note_watch(t: std::time::Duration, pages: usize, ranges: usize, bytes: usize) {
     WATCH[0].fetch_add(t.as_micros() as u64, Ordering::Relaxed);
     WATCH[1].fetch_add(pages as u64, Ordering::Relaxed);
+    WATCH[2].fetch_add(ranges as u64, Ordering::Relaxed);
+    WATCH[3].fetch_add(bytes as u64, Ordering::Relaxed);
 }
 
 /// Before the title's ExecuteCommandLists on `queue`: the pages the CPU wrote (`dirty`, 4 KiB
@@ -1422,9 +1425,11 @@ pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: 
             crate::xlog_info!("sparse windows: {n} submits, {} MB of CPU writes uploaded, {} ms spent, {} tiles mapped", b >> 20, us / 1000, s.mapped.len());
             let ms = |x: &AtomicU64| x.load(Ordering::Relaxed) / 1000;
             crate::xlog_info!(
-                "sparse windows timing: write-watch {} ms ({} dirty pages), lock wait {} ms, chunk scan {} ms, upload {} ms ({} runs)",
+                "sparse windows timing: write-watch {} ms ({} dirty pages, {} ranges, {} MB watched), lock wait {} ms, chunk scan {} ms, upload {} ms ({} runs)",
                 ms(&WATCH[0]),
                 WATCH[1].load(Ordering::Relaxed),
+                WATCH[2].load(Ordering::Relaxed),
+                WATCH[3].load(Ordering::Relaxed) >> 20,
                 ms(&PHASES[0]),
                 ms(&PHASES[1]),
                 ms(&PHASES[2]),

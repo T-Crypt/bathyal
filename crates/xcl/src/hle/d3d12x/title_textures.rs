@@ -394,7 +394,15 @@ fn watch_threads() -> usize {
 }
 
 /// GetWriteWatch with reset over `ranges`: every written page's address goes to `dirty`.
+///
+/// When the buffer fills, the call reports the pages that fitted and leaves the rest dirty, and
+/// the next call walks the whole range again from its base (measured: a 2 GiB range with 100k
+/// dirty pages and a 16384-entry buffer costs one walk per bufferful). A look that finds more
+/// pages than the buffer holds therefore costs several walks; the buffer grows to hold what the
+/// range has, up to `MAX_WATCH_BUF` entries.
 unsafe fn watch_into(ranges: &[(usize, usize)], buf: &mut Vec<*mut c_void>, dirty: &mut Vec<usize>, page: &mut u32) {
+    /// 4M pages (16 GiB of 4 KiB pages) held as 32 MiB of pointers
+    const MAX_WATCH_BUF: usize = 4 << 20;
     if buf.len() < 16384 {
         buf.resize(16384, std::ptr::null_mut());
     }
@@ -407,6 +415,9 @@ unsafe fn watch_into(ranges: &[(usize, usize)], buf: &mut Vec<*mut c_void>, dirt
             dirty.extend(buf[..n].iter().map(|&p| p as usize));
             if n < buf.len() {
                 break;
+            }
+            if buf.len() < MAX_WATCH_BUF {
+                buf.resize((buf.len() * 4).min(MAX_WATCH_BUF), std::ptr::null_mut());
             }
         }
     }
@@ -505,7 +516,12 @@ unsafe fn refresh_once(queue: *mut c_void) {
         dirty.sort_unstable();
         dirty.len()
     });
-    super::sparse::note_watch(watch_t0.elapsed(), dirty_len);
+    super::sparse::note_watch(
+        watch_t0.elapsed(),
+        dirty_len,
+        if scan { ranges.len() } else { 0 },
+        if scan { ranges.iter().map(|r| r.1).sum() } else { 0 },
+    );
     if super::present::trace_frame() {
         // every 600th look: what the CPU's view of a few textures holds now (does the title's
         // data reach the address at all, and is the texture still kept in step?)
@@ -753,9 +769,12 @@ unsafe fn upload_queue(dev: &ID3D12Device, device: usize) -> Result<ID3D12Comman
     Ok(made)
 }
 
-/// Ranges closer than this are scanned as one (a gap costs little to scan; a call per texture –
-/// thousands of them – a lot)
-const WATCH_GAP: usize = 1 << 20;
+/// Ranges closer than this are scanned as one. A gap costs the walk over it, a call costs its
+/// fixed cost, and both were measured on a 2 GiB synthetic reservation: about 6.9 µs a call and
+/// 0.35 µs a MiB walked (squarely kernel-side: the same bytes in one call are 13× cheaper than
+/// in 512 calls). So a gap under about 19 MiB is cheaper to walk as part of a bigger range than
+/// to leave as a call of its own; 16 MiB keeps margin under that break-even.
+const WATCH_GAP: usize = 16 << 20;
 
 /// The parts of `wanted` (start, end) inside `regions` (base, size), merged (gaps under
 /// `WATCH_GAP` too) and sorted, as (base, size) – each within one region (a write-watch call
@@ -913,9 +932,14 @@ mod tests {
         let regions = [(0x10000, 0x10000), (0x40000, 0x10000), (0x1000_0000, 0x1000_0000)];
         let wanted = vec![(0x12000, 0x13000), (0x11000, 0x12800), (0x1F000, 0x41000), (0x60000, 0x61000)];
         assert_eq!(watch_ranges(&regions, wanted), vec![(0x11000, 0xF000), (0x40000, 0x10000)]);
-        // ranges a gap of under 1 MiB apart: one scan; further apart: two
+        // ranges a gap of 512 KiB apart: one scan; 240 MiB apart: two
         let wanted = vec![(0x1000_0000, 0x1000_1000), (0x1008_0000, 0x1008_1000), (0x1100_0000, 0x1100_1000)];
         assert_eq!(watch_ranges(&regions, wanted), vec![(0x1000_0000, 0x8_1000), (0x1100_0000, 0x1000)]);
+        // a call costs more than the walk over a gap of up to `WATCH_GAP`: 8 MiB merges, 40 MiB not
+        let wanted = vec![(0x1000_0000, 0x1000_1000), (0x1080_1000, 0x1080_2000)];
+        assert_eq!(watch_ranges(&regions, wanted), vec![(0x1000_0000, 0x80_2000)]);
+        let wanted = vec![(0x1000_0000, 0x1000_1000), (0x1280_0000, 0x1280_1000)];
+        assert_eq!(watch_ranges(&regions, wanted), vec![(0x1000_0000, 0x1000), (0x1280_0000, 0x1000)]);
     }
 }
 
@@ -933,5 +957,148 @@ mod watch_parts_tests {
         assert!(parts.len() > 1 && parts.len() <= 8, "{} parts", parts.len());
         let flat: Vec<(usize, usize)> = parts.concat();
         assert_eq!(flat, big, "every range exactly once, in order");
+    }
+}
+
+/// What the write-watch costs, measured on this machine (Windows only): the kernel walk over a
+/// synthetic write-watched reservation, and how that cost splits into a fixed part per call, a
+/// part per page and a part per dirty page. `XCL_BENCH_WATCH_MB` (default 512) is the size of the
+/// reservation the benches use.
+///
+/// `cargo test -q --lib watch_bench -- --ignored --nocapture` runs the benches; the first test
+/// runs in the normal suite (64 MiB).
+#[cfg(all(test, windows))]
+mod watch_bench {
+    use super::{watch_into, GetWriteWatch, WRITE_WATCH_FLAG_RESET};
+    use std::ffi::c_void;
+    use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE};
+
+    const MEM_WRITE_WATCH: u32 = 0x20_0000;
+
+    /// `len` bytes of write-watched memory, freed on drop.
+    struct Watched(*mut c_void, usize);
+
+    impl Watched {
+        fn new(len: usize) -> Self {
+            let p = unsafe { VirtualAlloc(std::ptr::null(), len, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE) };
+            assert!(!p.is_null(), "VirtualAlloc({len}, MEM_WRITE_WATCH) failed");
+            Watched(p, len)
+        }
+
+        /// write one byte of `pages` 4 KiB pages, spread over the range
+        fn touch(&self, pages: usize) {
+            let step = (self.1 / pages.max(1) & !0xFFF).max(0x1000);
+            for k in 0..pages {
+                unsafe { std::ptr::write_volatile((self.0 as *mut u8).add(k * step), 1) };
+            }
+        }
+    }
+
+    impl Drop for Watched {
+        fn drop(&mut self) {
+            unsafe { VirtualFree(self.0, 0, MEM_RELEASE) };
+        }
+    }
+
+    fn mb() -> usize {
+        std::env::var("XCL_BENCH_WATCH_MB").ok().and_then(|v| v.parse().ok()).unwrap_or(512).clamp(16, 2048)
+    }
+
+    /// More dirty pages than the buffer starts with: `watch_into` grows the buffer and returns
+    /// every page without a second walk over the range.
+    #[test]
+    fn more_dirty_pages_than_the_buffer_holds_are_all_returned() {
+        let w = Watched::new(128 << 20);
+        let pages = 20_000usize;
+        w.touch(pages);
+        let mut buf: Vec<*mut c_void> = Vec::new();
+        let mut dirty: Vec<usize> = Vec::new();
+        let mut gran = 0u32;
+        unsafe { watch_into(&[(w.0 as usize, w.1)], &mut buf, &mut dirty, &mut gran) };
+        dirty.sort_unstable();
+        dirty.dedup();
+        assert_eq!(dirty.len(), pages, "every written page reported once");
+        assert!(buf.len() >= pages, "the buffer grew to hold the range's pages ({} entries)", buf.len());
+    }
+
+    #[test]
+    #[ignore = "bench: up to 2 GiB, cost by bytes and by dirty pages"]
+    fn get_write_watch_cost_by_bytes_and_dirty_pages() {
+        let mb = mb();
+        let w = Watched::new(mb << 20);
+        let mut buf = vec![std::ptr::null_mut::<c_void>(); 1 << 16];
+        for &dirty in &[0usize, 16, 1024, 16384] {
+            w.touch(dirty);
+            let t = std::time::Instant::now();
+            let (mut n, mut gran) = (buf.len(), 0u32);
+            let r = unsafe { GetWriteWatch(WRITE_WATCH_FLAG_RESET, w.0, w.1, buf.as_mut_ptr(), &mut n, &mut gran) };
+            let d = t.elapsed().as_secs_f64();
+            assert_eq!(r, 0, "GetWriteWatch failed");
+            assert_eq!(n, dirty, "{dirty} pages written, {n} reported");
+            println!(
+                "watched {mb} MiB ({:.0} pages), {n} dirty: {:.2} ms ({:.2} ns/page, {:.3} µs/dirty page)",
+                w.1 as f64 / 4096.0,
+                d * 1e3,
+                d * 1e9 / (w.1 as f64 / 4096.0),
+                d * 1e6 / n.max(1) as f64
+            );
+        }
+    }
+
+    /// The same bytes in one call and in many: the fixed cost of a call.
+    #[test]
+    #[ignore = "bench: 512 MiB in 1 call vs calls of 1, 4 and 16 MiB"]
+    fn cost_of_many_small_ranges() {
+        let len = mb() << 20;
+        let w = Watched::new(len);
+        let mut buf = vec![std::ptr::null_mut::<c_void>(); 1 << 16];
+        for chunk in [len, 16 << 20, 4 << 20, 1 << 20] {
+            w.touch(64);
+            let mut got = 0usize;
+            let t = std::time::Instant::now();
+            for base in (0..len).step_by(chunk) {
+                let (mut n, mut gran) = (buf.len(), 0u32);
+                let r = unsafe { GetWriteWatch(WRITE_WATCH_FLAG_RESET, (w.0 as *const u8).add(base) as *const c_void, chunk, buf.as_mut_ptr(), &mut n, &mut gran) };
+                assert_eq!(r, 0);
+                got += n;
+            }
+            let d = t.elapsed().as_secs_f64();
+            println!(
+                "{} MiB in {} calls of {} MiB: {:.2} ms, {got} pages ({:.1} µs a call)",
+                len >> 20,
+                len / chunk,
+                chunk >> 20,
+                d * 1e3,
+                d * 1e6 / (len / chunk) as f64
+            );
+            assert_eq!(got, 64);
+        }
+    }
+
+    /// A buffer that fills: the call reports what fitted and the rest stay dirty, so the next
+    /// call walks the whole range again (why `watch_into` grows the buffer).
+    #[test]
+    #[ignore = "bench: 2 GiB, 100k dirty pages, small vs grown buffer"]
+    fn a_full_buffer_costs_one_walk_per_bufferful() {
+        let w = Watched::new(2048 << 20);
+        let dirty = 100_000usize;
+        for entries in [16384usize, 0] {
+            w.touch(dirty);
+            let mut buf = vec![std::ptr::null_mut::<c_void>(); if entries == 0 { dirty + 1024 } else { entries }];
+            let t = std::time::Instant::now();
+            let (mut got, mut calls, mut gran) = (0usize, 0usize, 0u32);
+            loop {
+                let mut n = buf.len();
+                let r = unsafe { GetWriteWatch(WRITE_WATCH_FLAG_RESET, w.0, w.1, buf.as_mut_ptr(), &mut n, &mut gran) };
+                assert_eq!(r, 0);
+                got += n;
+                calls += 1;
+                if n < buf.len() {
+                    break;
+                }
+            }
+            println!("buffer {} entries: {calls} calls, {got} of {dirty} pages, {:.2} ms", buf.len(), t.elapsed().as_secs_f64() * 1e3);
+            assert_eq!(got, dirty);
+        }
     }
 }
