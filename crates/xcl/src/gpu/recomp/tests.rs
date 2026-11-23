@@ -8246,3 +8246,152 @@ fn gpu_padded_compute_groups_look_the_same_to_the_program() {
         assert!(tg_size[0] == tg_size[1] && tg_size[0] == tg_size[2], "{dims:?}, wave{lanes}: TG_SIZE with and without padding");
     }
 }
+
+/// DXC cost of a folder of console shader containers (`XCL_BENCH_DIR`): every program
+/// translated (`XCL_BENCH_SPLIT=1`: the split wave64 form, `XCL_BENCH_WINDOWS=n`: n memory windows), then
+/// compiled on `XCL_BENCH_THREADS` threads (default: the DXC pool's) with `XCL_DXC_ARGS`.
+/// Prints translate time, HLSL bytes and digest, DXC wall time, sum of per-shader times and
+/// DXIL bytes. `XCL_BENCH_NO_DXC=1`: translation and digest only.
+#[test]
+#[ignore]
+fn dxc_bench_folder() {
+    let Ok(dir) = std::env::var("XCL_BENCH_DIR") else { return };
+    let split = std::env::var("XCL_BENCH_SPLIT").is_ok_and(|v| v == "1");
+    // `XCL_BENCH_WINDOWS=4`: the memory windows of a running title (`Uma::for_runtime`)
+    let windows = std::env::var("XCL_BENCH_WINDOWS").ok().and_then(|v| v.parse().ok()).unwrap_or(1u32);
+    let args = std::env::var("XCL_DXC_ARGS").unwrap_or_default();
+    let extra: Vec<&str> = args.split_whitespace().collect();
+    let mut files: Vec<_> = std::fs::read_dir(&dir).unwrap().flatten().map(|e| e.path()).collect();
+    files.sort();
+    // `XCL_BENCH_SLICE=k/n`: every n-th file from the k-th (processes side by side)
+    if let Some((k, n)) = std::env::var("XCL_BENCH_SLICE").ok().and_then(|v| v.split_once('/').and_then(|(k, n)| Some((k.parse::<usize>().ok()?, n.parse::<usize>().ok()?)))) {
+        files = files.into_iter().skip(k).step_by(n.max(1)).collect();
+    }
+    if let Ok(out) = std::env::var("XCL_BENCH_HLSL_OUT") {
+        let _ = std::fs::create_dir_all(&out);
+    }
+    let t0 = std::time::Instant::now();
+    let mut jobs: Vec<(String, String, &'static str)> = Vec::new();
+    // `XCL_BENCH_HLSL=1`: the folder holds saved HLSL (`<name>.<profile>.hlsl`) instead
+    let hlsl_dir = std::env::var("XCL_BENCH_HLSL").is_ok_and(|v| v == "1");
+    for path in files.iter().filter(|_| hlsl_dir) {
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        let profile = ["vs_6_6", "ps_6_6", "cs_6_6"].into_iter().find(|p| name.contains(p)).unwrap_or("cs_6_6");
+        let stem = name.strip_suffix(".hlsl").and_then(|n| n.strip_suffix(profile)).and_then(|n| n.strip_suffix('.')).unwrap_or(&name).to_string();
+        jobs.push((stem, std::fs::read_to_string(path).unwrap(), profile));
+    }
+    for path in files.iter().filter(|_| !hlsl_dir) {
+        let Ok(blob) = std::fs::read(path) else { continue };
+        let Some(sh) = crate::gpu::xbox::parse(&blob) else { continue };
+        for f in &sh.fssm {
+            let Some(mode) = super::interface(&blob, &sh, f) else { continue };
+            let profile = match &mode {
+                Mode::Vertex(_) => "vs_6_6",
+                Mode::Pixel(_) => "ps_6_6",
+                Mode::Compute(_) => "cs_6_6",
+                _ => continue,
+            };
+            for p in &f.programs {
+                let code = &f.data[p.offset..p.offset + p.len];
+                let opt = Options { mode: mode.clone(), wave64: super::detect_wave64(code), split_wave64: split, mem_windows: windows, ..Default::default() };
+                let Ok(t) = translate(code, &opt) else { continue };
+                if t.complete() {
+                    let name = path.file_name().unwrap().to_string_lossy().into_owned();
+                    if let Ok(out) = std::env::var("XCL_BENCH_HLSL_OUT") {
+                        let _ = std::fs::write(std::path::Path::new(&out).join(format!("{name}.{profile}.hlsl")), &t.hlsl);
+                    }
+                    jobs.push((name, t.hlsl, profile));
+                }
+            }
+        }
+    }
+    let translate_s = t0.elapsed().as_secs_f64();
+    let mut digest = 0xcbf2_9ce4_8422_2325u64;
+    for (_, h, p) in &jobs {
+        for b in h.bytes().chain(p.bytes()).chain([0]) {
+            digest ^= b as u64;
+            digest = digest.wrapping_mul(0x100_0000_01b3);
+        }
+    }
+    let bytes: usize = jobs.iter().map(|j| j.1.len()).sum();
+    let distinct: std::collections::HashSet<(&str, &str)> = jobs.iter().map(|j| (j.1.as_str(), j.2)).collect();
+    println!(
+        "programs {}, distinct HLSL {}, HLSL {:.1} MB, digest {digest:016x}, translate {translate_s:.2} s (one thread)",
+        jobs.len(),
+        distinct.len(),
+        bytes as f64 / 1048576.0
+    );
+    if std::env::var("XCL_BENCH_NO_DXC").is_ok() {
+        return;
+    }
+    let threads = std::env::var("XCL_BENCH_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or_else(super::dxc::compile_threads);
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let results: std::sync::Mutex<Vec<(f64, usize, usize, String)>> = Default::default();
+    let dxil_digest = std::sync::atomic::AtomicU64::new(0);
+    let t1 = std::time::Instant::now();
+    std::thread::scope(|s| {
+        for _ in 0..threads {
+            s.spawn(|| loop {
+                let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let Some((name, h, p)) = jobs.get(i) else { break };
+                let t = std::time::Instant::now();
+                let r = super::dxc::compile(h, "main", p, &extra);
+                let secs = t.elapsed().as_secs_f64();
+                let n = r.as_ref().map_or(0, |b| b.len());
+                // DXIL digest per program, combined by name below (order-free)
+                let mut d = 0xcbf2_9ce4_8422_2325u64;
+                for &b in r.as_deref().unwrap_or(&[]).iter().chain(name.as_bytes()).chain(p.as_bytes()) {
+                    d ^= b as u64;
+                    d = d.wrapping_mul(0x100_0000_01b3);
+                }
+                dxil_digest.fetch_xor(d, std::sync::atomic::Ordering::Relaxed);
+                if let Err(e) = &r {
+                    println!("  {name}: {}", e.lines().find(|l| l.contains("error")).unwrap_or(""));
+                }
+                results.lock().unwrap().push((secs, h.len(), n, name.clone()));
+            });
+        }
+    });
+    let wall = t1.elapsed().as_secs_f64();
+    if let Ok(out) = std::env::var("XCL_BENCH_TIMES") {
+        let t: String = results.lock().unwrap().iter().map(|(s, l, _, n)| format!("{n}	{s:.4}	{l}
+")).collect();
+        let _ = std::fs::write(out, t);
+    }
+    let mut r = results.into_inner().unwrap();
+    r.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let sum: f64 = r.iter().map(|x| x.0).sum();
+    let dxil: usize = r.iter().map(|x| x.2).sum();
+    let failed = r.iter().filter(|x| x.2 == 0).count();
+    let q = |f: f64| r[((r.len() - 1) as f64 * f) as usize].0;
+    println!(
+        "DXC {extra:?} threads {threads}: wall {wall:.2} s, {:.0} programs/s, per-program sum {sum:.1} s (median {:.3}, p90 {:.3}, max {:.2}), DXIL {:.1} MB (digest {:016x}), failed {failed}",
+        r.len() as f64 / wall,
+        q(0.5),
+        q(0.9),
+        q(1.0),
+        dxil as f64 / 1048576.0,
+        dxil_digest.into_inner()
+    );
+    for (secs, len, _, name) in r.iter().rev().take(3) {
+        println!("  {secs:.2} s, HLSL {} KB: {name}", len / 1024);
+    }
+    // cost by size: ms per HLSL KB in size buckets (is DXC linear in the source?)
+    let mut buckets = std::collections::BTreeMap::<usize, (usize, f64, usize)>::new();
+    for (secs, len, _, _) in &r {
+        let b = buckets.entry((*len / 1024).next_power_of_two()).or_default();
+        b.0 += 1;
+        b.1 += secs;
+        b.2 += len;
+    }
+    for (kb, (n, secs, len)) in buckets {
+        println!("  size <= {kb} KB: {n} programs, {:.1} ms each, {:.2} ms/KB", secs * 1e3 / n as f64, secs * 1e3 / (len as f64 / 1024.0));
+    }
+    unsafe {
+        use windows_sys::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
+        let mut c: PROCESS_MEMORY_COUNTERS = std::mem::zeroed();
+        c.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
+        GetProcessMemoryInfo(windows_sys::Win32::System::Threading::GetCurrentProcess(), &mut c, c.cb);
+        println!("  peak commit {} MB", c.PeakPagefileUsage >> 20);
+    }
+}

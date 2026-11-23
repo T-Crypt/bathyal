@@ -1415,7 +1415,12 @@ of the title (it writes to address 0 after a failed D3D12 call: `call 0x14068c76
   call; it stays 2 s after the last one). XDefiant from an empty cache: ~1750 shaders in ~2 min 15 s. Before,
   `dxc::wait_for_memory` held each compile up to a minute while less than 6 GB of commit was left, and with
   XDefiant's own ~10 GB committed only ~4 GB were: its last ~160 shaders came a few a minute (it looked hung at
-  ~1600). Now a compile goes at once with 6 GB left, else alone (one at a time). After a cold-cache run
+  ~1600). Now a compile goes at once with 6 GB left, else alone (one at a time). Since 2026-11-23: at once while
+  commit covers 6 GB + 300 MB per running compile (their current use is already out of the available commit, so only
+  their growth is reserved; #113 reserved 1 GB each on top: with 8.1 GB free, Minecraft's 716 programs, 15 threads,
+  12.7–15.2 s → 6.4–6.7 s, 5.3–5.6 s with no gate); the count only rises from the value a decision saw (no burst on
+  one reading); after a minute's wait one compile per minute goes in regardless (it was every waiting one); waiters
+  wake when a compile ends (`may_start`, `gate_tests`). Driver PSO compiles are still not gated. After a cold-cache run
   XDefiant's logo / UI text was missing at times. Cold-cache runs (empty `XCL_DXIL_CACHE`, 1 756 shaders) show
   the logo at ~70 s and the text ~15 s later, by themselves; draws wait for pipelines still being built
   (`resolve_wait` in `bind::graphics_bound`, 0 draws with stand-ins). The text missing for good (also warm) on
@@ -1626,7 +1631,7 @@ of the title (it writes to address 0 after a failed D3D12 call: `call 0x14068c76
 - **Ending a run without a stuck process**: a host killed from outside with GPU work in flight stayed in the driver
   holding 12–16 GB. `XCL_RUN_SECONDS=n` ends the title itself: every fence the title created is signalled to the
   maximum (GPU waits on future values complete), the queues drain, then TerminateProcess (`real::end_title`). Shader
-  compiles: at most 6 at once and they wait while the system has < 6 GB of commit left (`dxc::wait_for_memory`).
+  compiles: `dxc::compile_threads` at once, gated by commit left (`dxc::wait_for_memory`).
 - **Window**: titles create their window with CreateWindowExA / RegisterClassExA but DefWindowProcW (its title showed
   as CJK characters); `hle::user` makes them Unicode calls. The window stays white (console titles never paint it).
 - Diagnostics: `XCL_TRACE_FRAME=1` (what console code does with each presented resource; render-target binds, UAV
