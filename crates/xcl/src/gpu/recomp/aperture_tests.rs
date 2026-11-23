@@ -133,6 +133,11 @@ fn device() -> Option<(ID3D12Device, String)> {
             return None;
         }
         let (a, desc) = crate::gpu::adapter::candidates(&factory, &sel).into_iter().next()?;
+        if crate::gpu::adapter::software(&desc) {
+            // a software device cannot reserve sparse resources or map a 4 GiB aperture
+            super::runner::skip_test("no GPU");
+            return None;
+        }
         let dev = crate::gpu::agility::create_device(&a, D3D_FEATURE_LEVEL_12_0).ok()?;
         Some((dev, crate::gpu::adapter::name(&desc)))
     }

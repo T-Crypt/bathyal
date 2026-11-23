@@ -60,6 +60,9 @@ struct Gpu {
     fence: ID3D12Fence,
     value: u64,
     adapter: String,
+    /// a software renderer (WARP or the Basic Render Driver): kernels run, but the tests
+    /// that need sparse reservations or a real mesh pipeline skip
+    software: bool,
     wave64: bool,
     /// 32-lane waves (`[WaveSize(32)]`: the split wave64 form; WARP has neither 32 nor 64)
     wave32: bool,
@@ -122,14 +125,14 @@ fn init() -> Result<Gpu, String> {
         let factory: IDXGIFactory6 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(werr)?;
         // `XCL_ADAPTER` picks the adapter (default: the first in high-performance order)
         let sel = crate::gpu::adapter::Selector::from_env_or("auto");
-        let (adapter, name): (IDXGIAdapter1, String) = if sel == crate::gpu::adapter::Selector::Warp {
-            (factory.EnumWarpAdapter().map_err(werr)?, "WARP (software renderer)".into())
+        let (adapter, name, software): (IDXGIAdapter1, String, bool) = if sel == crate::gpu::adapter::Selector::Warp {
+            (factory.EnumWarpAdapter().map_err(werr)?, "WARP (software renderer)".into(), true)
         } else {
             let (a, desc) = crate::gpu::adapter::candidates(&factory, &sel)
                 .into_iter()
                 .next()
                 .ok_or_else(|| crate::gpu::adapter::no_match(&factory, &sel))?;
-            (a, crate::gpu::adapter::name(&desc))
+            (a, crate::gpu::adapter::name(&desc), crate::gpu::adapter::software(&desc))
         };
         let dev = crate::gpu::agility::create_device(&adapter, D3D_FEATURE_LEVEL_12_0).map_err(werr)?;
         let mut sm = D3D12_FEATURE_DATA_SHADER_MODEL { HighestShaderModel: D3D_SHADER_MODEL_6_6 };
@@ -152,7 +155,7 @@ fn init() -> Result<Gpu, String> {
             dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() }).map_err(werr)?;
         let rs = root_signature(&dev, false)?;
         let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).map_err(werr)?;
-        Ok(Gpu { dev, queue, rs, fence, value: 0, adapter: name, wave64, wave32, mesh })
+        Ok(Gpu { dev, queue, rs, fence, value: 0, adapter: name, software, wave64, wave32, mesh })
     }
 }
 
@@ -393,6 +396,12 @@ fn transition(r: &ID3D12Resource, before: D3D12_RESOURCE_STATES, after: D3D12_RE
 /// Name of the GPU the kernels run on (None: no usable GPU).
 pub fn adapter() -> Result<String, String> {
     with_gpu(|g| Ok(g.adapter.clone()))
+}
+
+/// Whether a hardware GPU backs the device: false on WARP and on the Basic Render Driver,
+/// which run kernels but have no sparse reservations, real mesh pipeline or 4 GiB aperture.
+pub fn hardware_gpu() -> bool {
+    with_gpu(|g| Ok(!g.software)).unwrap_or(false)
 }
 
 pub fn wave64_supported() -> Result<bool, String> {
