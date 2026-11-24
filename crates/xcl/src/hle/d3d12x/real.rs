@@ -1547,7 +1547,7 @@ pub(super) fn set_test_buffer_delta(res: usize, delta: Option<u64>) {
 
 /// Whether the PC's Map works on `res`: not a reserved resource, and its heap has CPU pages.
 unsafe fn pc_can_map(res: *mut c_void) -> bool {
-    !is_reserved(res as usize) && pc_mappable(heap_properties(res))
+    !is_reserved(res) && pc_mappable(heap_properties(res))
 }
 
 /// The heap `res` lives in (not to be asked of a reserved resource).
@@ -3228,19 +3228,28 @@ creator!(dev_create_placed_resource1, "CreatePlacedResource1", Kind::Resource, [
 creator!(pc_create_reserved_resource, "CreateReservedResource", Kind::Resource, [a1, a2, a3]);
 creator!(pc_create_reserved_resource1, "CreateReservedResource1", Kind::Resource, [a1, a2, a3, a4]);
 
-/// Resources made with CreateReservedResource(1): they have no heap, so `res_map` asks none of
-/// them (GetHeapProperties on one is an invalid call too, debug layer 901).
-static RESERVED: Mutex<Option<HashSet<usize>>> = Mutex::new(None);
+/// Resources made with CreateReservedResource(1), with their description: they have no heap, so
+/// `res_map` asks none of them (GetHeapProperties on one is an invalid call too, debug layer
+/// 901). The description guards against an address a later resource reuses without the last
+/// Release having been seen.
+static RESERVED: Mutex<Option<HashMap<usize, D3D12_RESOURCE_DESC>>> = Mutex::new(None);
+
+unsafe fn desc_of(res: *mut c_void) -> Option<D3D12_RESOURCE_DESC> {
+    ID3D12Resource::from_raw_borrowed(&res).map(|r| r.GetDesc())
+}
 
 unsafe fn note_reserved(hr: HRESULT, ppv: *mut *mut c_void) -> HRESULT {
     if hr >= 0 && !ppv.is_null() && !(*ppv).is_null() {
-        RESERVED.lock().unwrap().get_or_insert_with(HashSet::new).insert(*ppv as usize);
+        if let Some(d) = desc_of(*ppv) {
+            RESERVED.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, d);
+        }
     }
     hr
 }
 
-fn is_reserved(res: usize) -> bool {
-    RESERVED.lock().unwrap().as_ref().is_some_and(|s| s.contains(&res))
+unsafe fn is_reserved(res: *mut c_void) -> bool {
+    let kept = RESERVED.lock().unwrap().as_ref().and_then(|m| m.get(&(res as usize)).copied());
+    kept.is_some_and(|k| desc_of(res) == Some(k))
 }
 
 /// CreateReservedResource
@@ -7363,11 +7372,19 @@ mod map_tests {
             if dev.CreateReservedResource(&desc, D3D12_RESOURCE_STATE_COMMON, None, &mut reserved).is_ok() {
                 let r = reserved.unwrap();
                 let mut raw = r.as_raw();
-                assert!(!is_reserved(raw as usize));
                 // what dev_create_reserved_resource does with what the PC made
                 note_reserved(S_OK, &mut raw);
-                assert!(is_reserved(raw as usize) && !pc_can_map(raw), "a reserved resource is not asked for its heap");
-                RESERVED.lock().unwrap().as_mut().unwrap().remove(&(raw as usize));
+                assert!(is_reserved(raw) && !pc_can_map(raw), "a reserved resource is not asked for its heap");
+                // a buffer at an address a reserved resource left without its last Release seen
+                // is not taken for it (its description differs)
+                let upload = buffer(heap(D3D12_HEAP_TYPE_UPLOAD), D3D12_RESOURCE_STATE_GENERIC_READ);
+                let stale = desc_of(r.as_raw()).unwrap();
+                RESERVED.lock().unwrap().as_mut().unwrap().insert(upload.as_raw() as usize, stale);
+                assert!(!is_reserved(upload.as_raw()) && mappable(&upload));
+                let mut g = RESERVED.lock().unwrap();
+                let m = g.as_mut().unwrap();
+                m.remove(&(raw as usize));
+                m.remove(&(upload.as_raw() as usize));
             }
         }
     }
