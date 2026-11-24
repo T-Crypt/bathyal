@@ -204,6 +204,7 @@ pub(super) fn poll() {
             }
             !busy
         });
+        eprintln!("poll: after retain deferred={:x?} free={:x?}", st.deferred, free.iter().map(|x| x.0).collect::<Vec<_>>());
         let waiting: HashSet<usize> = st.deferred.iter().copied().collect();
         st.in_flight.retain_mut(|s| {
             if s.done {
