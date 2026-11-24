@@ -119,7 +119,11 @@ impl Ticket {
 
     /// Forget the item now.
     pub fn finish(mut self) {
+        let (kind, seq) = (self.kind, self.seq);
         self.seq = 0;
+        if seq != 0 && (kind as usize) < KINDS {
+            registry(kind as usize).lock().unwrap_or_else(|e| e.into_inner()).remove(&seq);
+        }
     }
 }
 
