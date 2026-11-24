@@ -30,8 +30,6 @@ pub mod sparse;
 pub mod title_list;
 pub mod title_textures;
 pub mod vram;
-#[cfg(test)]
-mod lifetime_tests;
 
 use std::ffi::c_void;
 use std::sync::OnceLock;
