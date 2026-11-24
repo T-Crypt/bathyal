@@ -140,9 +140,9 @@ bathyal shaders D:\data\shaders.rpf --top 50   # pack statistics; --recomp / --c
 bathyal rpf D:\data\shaders.rpf --extract NAME --out folder
 ```
 
-- **Without a command line** (bathyal.exe opened from Explorer) Bathyal shows a small menu: *Choose a
-  game…* (pick its exe or `MicrosoftGame.config`) or *Run again* (the last one). On an error the
-  window stays open until Enter.
+- **Without a command line** (bathyal.exe opened from Explorer) Bathyal shows a small menu: *Add a
+  game folder…* (pick the folder of the game's unpacked files), *Choose a game…* (pick its exe or
+  `MicrosoftGame.config`) or *Run again* (the last one). On an error the window stays open until Enter.
 - Bathyal works on **unpacked** game files you own; it contains nothing for decrypting or
   circumventing DRM.
 - **The game folder is never modified** – writes go to the overlay.
