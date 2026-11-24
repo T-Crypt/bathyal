@@ -1835,6 +1835,21 @@ mod tests {
         assert!(LIST_NOTES.lock().unwrap().get(&l1).is_none());
     }
 
+    /// A write in the gap between two watched ranges is still watched: a gap is walked, never a
+    /// place a write hides.
+    #[test]
+    fn a_write_between_two_watched_ranges_is_still_seen() {
+        let regions = [(0x2000_0000usize, 0x1000_0000usize)];
+        // two watched pages 64 KiB apart, one page written between them
+        let wanted = vec![(0x2000_0000usize, 0x2000_1000usize), (0x2001_0000, 0x2001_1000)];
+        let written = 0x2000_8000usize;
+        for gap in [1usize << 20, 4 << 20, 16 << 20] {
+            let out = watch_ranges_gap(&regions, wanted.clone(), gap);
+            assert!(out.iter().any(|&(lo, n)| lo <= written && written + 0x1000 <= lo + n), "gap {gap:#x} must walk the page between the ranges");
+        }
+        assert_eq!(watch_ranges_gap(&regions, wanted, 0), vec![(0x2000_0000, 0x1000), (0x2001_0000, 0x1000)]);
+    }
+
     /// Only the wanted parts of the watched regions are scanned, merged, one region each.
     #[test]
     fn watch_ranges_clip_and_merge() {
