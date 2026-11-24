@@ -4858,7 +4858,11 @@ unsafe fn graphics_pso(this: *mut c_void, desc: *const c_void, riid: *const GUID
     // lazy pipelines (the first use builds): a console shader is copied here and built on a
     // worker; the title's thread translates nothing, not even for a cache key
     if super::pso_async::lazy() && graphics_has_console_shader(desc) {
-        return defer_graphics(this, f, desc, riid, ppv);
+        let hr = defer_graphics(this, f, desc, riid, ppv);
+        if hr >= 0 {
+            return hr;
+        }
+        // the stand-in was refused (no root signature to go with it, say): translate in the call
     }
     let (translated, missed) = if super::pso_async::enabled() { attempt(|| translated_graphics_pso(this, f, desc, riid, ppv)) } else { (translated_graphics_pso(this, f, desc, riid, ppv), false) };
     if missed {
