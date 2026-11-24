@@ -36,6 +36,18 @@ pub struct Tables {
     pub preset: [Option<[u8; 4]>; 256],
 }
 
+/// The 8-bit symbol whose even bits are `even` and odd bits `odd` (lane 0's two units).
+pub(super) fn interleave(even: u8, odd: u8) -> u8 {
+    let mut x = 0u8;
+    for k in 0..4 {
+        x |= ((odd >> k) & 1) << (2 * k);
+    }
+    for k in 0..3 {
+        x |= ((even >> (k + 1)) & 1) << (2 * k + 1);
+    }
+    x
+}
+
 /// The distance back to the block whose endpoints predict block `i`, from lane 0's symbols.
 pub fn distance(e: u8, o: u8) -> usize {
     let mut x = 0usize;

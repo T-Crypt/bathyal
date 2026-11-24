@@ -816,10 +816,6 @@ pub unsafe extern "system" fn XNetworkingUnregisterConnectivityHintChanged(_toke
 }
 
 #[cfg(test)]
-#[path = "networking_tests.rs"]
-mod tests;
-
-#[cfg(test)]
 mod tests {
     use std::cell::RefCell;
 
