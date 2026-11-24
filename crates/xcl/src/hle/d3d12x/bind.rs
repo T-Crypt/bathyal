@@ -1561,11 +1561,12 @@ mod tests {
         let c = clamp_groups([x as u32, y as u32, z as u32], 64, 1 << 27).expect("clamped");
         let threads = c.iter().map(|&g| g as u64).product::<u64>() * 64;
         assert!(threads <= 1 << 27, "{c:?} is {threads} threads");
-        // proportional: both equal axes are divided by the same k
-        assert_eq!(c, [1000, 1000, 2]);
+        // proportional: the two equal axes keep their ratio; z falls to its minimum of 1
+        assert_eq!((c[0], c[1]), (1428, 1428));
+        assert_eq!(c[2], 1);
         // k is the smallest divisor that fits: one less would be over
-        let k = 39u64;
-        assert!((x / k) * (y / k) * (z / k) * 64 > 1 << 27);
+        let k = 27u64;
+        assert!((x / k).max(1) * (y / k).max(1) * (z / k).max(1) * 64 > 1 << 27);
     }
 
     #[test]
