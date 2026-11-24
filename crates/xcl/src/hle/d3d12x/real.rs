@@ -675,7 +675,7 @@ fn kind_of(ext: usize) -> Option<Kind> {
 /// The release path that frees `handle` once nothing in flight names it, for the kinds a
 /// recorded command list can reference (`lifetime::note`). None: not such an object.
 pub(super) unsafe fn free_fn(handle: usize) -> Option<super::lifetime::FreeFn> {
-    let ext = vt(handle as *mut c_void);
+    let ext = vt(handle as *mut c_void) as usize;
     if !is_ext(ext) {
         return None;
     }
