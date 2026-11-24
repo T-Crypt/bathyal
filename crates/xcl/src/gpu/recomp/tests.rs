@@ -9450,3 +9450,54 @@ fn gpu_ps_reductions_in_branches_and_loops() {
     }
     assert_eq!(bad, 0);
 }
+
+/// The split wave64 form on a GPU with 32-lane waves: a branch on a path to an `s_barrier` is
+/// combined across the two halves (`xcl_x_wide`), so a branch condition that differed between
+/// them (a non-coherent scalar load, a pair whose exchange gave up) can no longer leave one
+/// half waiting at the barrier; a branch that leads to no barrier is left as it is.
+#[test]
+fn split_wave64_barriers_keep_both_halves_on_one_path() {
+    let split = |code: &[u8]| {
+        let t = translate(code, &Options { mode: Mode::Compute(cs_of([64, 1, 1], false)), wave64: true, split_wave64: true, ..Default::default() }).unwrap();
+        assert!(t.complete(), "{:?}", t.unsupported_why);
+        assert!(t.hlsl.contains("[WaveSize(32)]") && t.hlsl.contains("bool xcl_x_wide(bool b)"), "{}", t.hlsl);
+        t
+    };
+    // (a) straight code: the barrier, no combined condition
+    let straight = split(&prog(&[("S_BARRIER", "ENC_SOPP", &[], None)]));
+    assert!(straight.hlsl.contains("\n    GroupMemoryBarrierWithGroupSync();"), "{}", straight.hlsl);
+    assert!(!straight.hlsl.contains(" = xcl_x_wide("), "{}", straight.hlsl);
+    // (b) a barrier an `s_cbranch_execz` skips: the guard takes both halves' EXEC
+    let execz = split(&prog(&[
+        ("V_CMP_GT_U32", "ENC_VOPC", &[("SRC0", V), ("VSRC1", 1)], None),
+        ("S_AND_SAVEEXEC_B64", "ENC_SOP1", &[("SDST", 6), ("SSRC0", 106)], None),
+        ("S_CBRANCH_EXECZ", "ENC_SOPP", &[("SIMM16", 1)], None),
+        ("S_BARRIER", "ENC_SOPP", &[], None),
+    ]));
+    assert!(execz.hlsl.contains(" = xcl_x_wide(((exec_lo | exec_hi) == 0u));"), "{}", execz.hlsl);
+    assert!(execz.hlsl.contains("if (!(") && execz.hlsl.contains("GroupMemoryBarrierWithGroupSync();"), "{}", execz.hlsl);
+    // the same skip with no barrier behind it: no exchange
+    let skip = split(&prog(&[
+        ("V_CMP_GT_U32", "ENC_VOPC", &[("SRC0", V), ("VSRC1", 1)], None),
+        ("S_AND_SAVEEXEC_B64", "ENC_SOP1", &[("SDST", 6), ("SSRC0", 106)], None),
+        ("S_CBRANCH_EXECZ", "ENC_SOPP", &[("SIMM16", 1)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 1), ("SRC0", 128)], None),
+    ]));
+    assert!(!skip.hlsl.contains(" = xcl_x_wide("), "{}", skip.hlsl);
+    // (c) a barrier inside a loop: the latch's exit test takes both halves' SCC
+    let loopy = split(&prog(&[
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 0), ("SSRC0", 131)], None),
+        ("S_BARRIER", "ENC_SOPP", &[], None),
+        ("S_SUB_U32", "ENC_SOP2", &[("SDST", 0), ("SSRC0", 0), ("SSRC1", 129)], None),
+        ("S_CMP_LG_U32", "ENC_SOPC", &[("SSRC0", 0), ("SSRC1", 128)], None),
+        ("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 0xFFFC)], None),
+    ]));
+    assert!(loopy.hlsl.contains(" = xcl_x_wide((scc != 0u));"), "{}", loopy.hlsl);
+    assert!(loopy.hlsl.contains("[loop] for (;;)"), "{}", loopy.hlsl);
+    // the result compiles
+    if super::dxc::location().is_ok() {
+        for t in [&execz, &loopy] {
+            super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl));
+        }
+    }
+}

@@ -1369,6 +1369,18 @@ fn constant_samplers(insts: &[Decoded], leaders: &BTreeSet<u64>) -> BTreeMap<u64
     out
 }
 
+/// Split wave64 programs translated with an `s_barrier` inside a branch or loop (each such
+/// program counted once); logged at the first and every power of two, so a game run shows how
+/// many real programs depend on the combined branch conditions.
+fn count_barrier_in_control_flow() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static N: AtomicUsize = AtomicUsize::new(0);
+    let n = N.fetch_add(1, Ordering::Relaxed) + 1;
+    if n.is_power_of_two() {
+        crate::xlog_info!("recomp: split wave64 programs with a barrier inside a branch or loop: {n}");
+    }
+}
+
 pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
     let normalized;
     let opt = if opt.mem_windows & HEAP_WINDOWS != 0 {
@@ -1424,6 +1436,16 @@ pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
         em.mask_whole_live = x64_masks::by_pc(&insts, matches!(opt.mode, Mode::Kernel));
     } else if matches!(opt.mode, Mode::Pixel(_)) {
         em.mask_whole_live = x64_masks::by_pc(&insts, false);
+    }
+    // split wave64: the halves hold the same masks, so their branch conditions agree unless a
+    // scalar value they are computed from differs (a non-coherent scalar load, a pair whose
+    // exchange gave up). A branch on a path to an `s_barrier` is combined across the halves
+    // anyway, so a barrier is reached by both or by neither (`xcl_x_wide`)
+    if emit::split_form(opt) {
+        em.wide_cond = x64_masks::branches_reaching_barrier(&insts);
+        if !em.wide_cond.is_empty() {
+            count_barrier_in_control_flow();
+        }
     }
     // pixel shaders: a mask written in a loop takes its helper lanes' bits from quad reads of
     // the compare's vector operands (`quad_bits`, #134)
