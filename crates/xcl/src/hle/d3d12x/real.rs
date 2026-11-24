@@ -211,6 +211,10 @@ pub(super) fn uma_window_buffer(p: usize, len: usize) -> Option<(usize, u64)> {
 
 /// GPU virtual address of a UMA address (None: not in UMA or not open on the GPU).
 pub fn uma_va_of(p: usize) -> Option<u64> {
+    // a block of XCL's GPU_UPLOAD heap: CPU-written video memory (not a console address)
+    if let Some(va) = crate::gpu::upload::va_of(p) {
+        return Some(va);
+    }
     let u = crate::gpu::uma::get()?;
     let k = u.window_of(p)?;
     Some(*uma_window_vas().get(k)? + (p - u.window(k).0) as u64)
@@ -359,6 +363,7 @@ unsafe fn open_uma(device: &ID3D12Device) {
         w0_va
     );
     *UMA_HEAPS.lock().unwrap() = heaps;
+    crate::gpu::upload::init(device);
     *UMA_BUFFER.lock().unwrap() = bufs;
 }
 

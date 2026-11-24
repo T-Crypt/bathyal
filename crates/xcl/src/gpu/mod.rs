@@ -17,6 +17,7 @@ pub mod texture;
 pub mod tiling;
 mod tiling_tables;
 pub mod uma;
+pub mod upload;
 pub mod xbox;
 
 pub use rdna2_spec::ARCH as RDNA2_ARCH;

@@ -624,6 +624,9 @@ pub fn pc_pso(pso: *mut c_void) -> *mut c_void {
 unsafe fn free_uma(blocks: &[usize]) {
     if let Some(u) = crate::gpu::uma::get() {
         for &b in blocks {
+            if crate::gpu::upload::free(b) {
+                continue;
+            }
             if u.is_sparse(b) {
                 super::sparse::free(b);
             } else {

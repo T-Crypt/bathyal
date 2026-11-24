@@ -811,6 +811,15 @@ unsafe fn translated_dispatch(this: *mut c_void, list: &ID3D12GraphicsCommandLis
     Ok(())
 }
 
+/// `bytes` in the GPU_UPLOAD heap (None: the path is off or full – the caller uses unified
+/// memory). The block lives until the recording's allocator resets, like the arena's blocks.
+unsafe fn upload_block(this: *mut c_void, bytes: &[u8]) -> Option<usize> {
+    let p = crate::gpu::upload::alloc(bytes.len().max(16), 256)?;
+    std::ptr::copy_nonoverlapping(bytes.as_ptr(), p as *mut u8, bytes.len());
+    with(this, |s| s.uma.push(p));
+    Some(p)
+}
+
 /// XCL's ABI for a translated pipeline: its root signature, the user SGPRs (`io`, the kept
 /// arguments the console's way – compute or graphics) and the argument table in unified
 /// memory, u1 res, u2… the memory windows; then the pipeline.
@@ -837,8 +846,19 @@ unsafe fn bind_abi(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usi
         None => vec![table_at as u32, (table_at >> 32) as u32],
     };
     io.resize(crate::gpu::recomp::KERNEL_SGPRS, 0);
-    let io_at = copy(&io.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<u8>>())?;
-    let res_at = copy(&[0u8; 256])?;
+    // XCL's own GPU-read, CPU-written blocks: in the GPU_UPLOAD heap when it exists (the CPU
+    // writes video memory directly: no write-watch page, no upload before the submit). The
+    // argument table above stays in console memory – shaders dereference it by address.
+    let io_bytes: Vec<u8> = io.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let io_at = match upload_block(this, &io_bytes) {
+        Some(p) => p,
+        None => copy(&io_bytes)?,
+    };
+    let zero = [0u8; 256];
+    let res_at = match upload_block(this, &zero) {
+        Some(p) => p,
+        None => copy(&zero)?,
+    };
     let va = |p: usize| super::real::uma_va_of(p).unwrap_or(first);
     let rs = super::real::pso_root_signature(real).or_else(|| super::real::abi_rs_cached().map(|p| p as usize)).ok_or("no XCL ABI root signature")?;
     let rs = rs as *mut c_void;
