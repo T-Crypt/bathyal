@@ -1308,167 +1308,6 @@ mod tests {
         let wanted = vec![(0x1000_0000, 0x1000_1000), (0x1280_0000, 0x1280_1000)];
         assert_eq!(watch_ranges(&regions, wanted), vec![(0x1000_0000, 0x1000), (0x1280_0000, 0x1000)]);
     }
-}
-
-#[cfg(test)]
-mod watch_parts_tests {
-    use super::split_watch;
-
-    #[test]
-    fn small_sets_stay_serial_and_large_ones_split_without_losing_a_range() {
-        let small = vec![(0x1000usize, 0x10000usize), (0x20000, 0x10000)];
-        assert_eq!(split_watch(&small, 8), vec![small.clone()]);
-        let big: Vec<(usize, usize)> = (0..40).map(|i| (0x1_0000_0000 + i * (64 << 20), 64 << 20)).collect();
-        assert_eq!(split_watch(&big, 1), vec![big.clone()], "one thread: the serial loop");
-        let parts = split_watch(&big, 8);
-        assert!(parts.len() > 1 && parts.len() <= 8, "{} parts", parts.len());
-        let flat: Vec<(usize, usize)> = parts.concat();
-        assert_eq!(flat, big, "every range exactly once, in order");
-    }
-}
-
-/// What the write-watch costs, measured on this machine (Windows only): the kernel walk over a
-/// synthetic write-watched reservation, and how that cost splits into a fixed part per call, a
-/// part per page and a part per dirty page. `XCL_BENCH_WATCH_MB` (default 512) is the size of the
-/// reservation the benches use.
-///
-/// `cargo test -q --lib watch_bench -- --ignored --nocapture` runs the benches; the first test
-/// runs in the normal suite (64 MiB).
-#[cfg(all(test, windows))]
-mod watch_bench {
-    use super::{watch_into, GetWriteWatch, WRITE_WATCH_FLAG_RESET};
-    use std::ffi::c_void;
-    use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE};
-
-    const MEM_WRITE_WATCH: u32 = 0x20_0000;
-
-    /// `len` bytes of write-watched memory, freed on drop.
-    struct Watched(*mut c_void, usize);
-
-    impl Watched {
-        fn new(len: usize) -> Self {
-            let p = unsafe { VirtualAlloc(std::ptr::null(), len, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE) };
-            assert!(!p.is_null(), "VirtualAlloc({len}, MEM_WRITE_WATCH) failed");
-            Watched(p, len)
-        }
-
-        /// write one byte of `pages` 4 KiB pages, spread over the range
-        fn touch(&self, pages: usize) {
-            let step = (self.1 / pages.max(1) & !0xFFF).max(0x1000);
-            for k in 0..pages {
-                unsafe { std::ptr::write_volatile((self.0 as *mut u8).add(k * step), 1) };
-            }
-        }
-    }
-
-    impl Drop for Watched {
-        fn drop(&mut self) {
-            unsafe { VirtualFree(self.0, 0, MEM_RELEASE) };
-        }
-    }
-
-    fn mb() -> usize {
-        std::env::var("XCL_BENCH_WATCH_MB").ok().and_then(|v| v.parse().ok()).unwrap_or(512).clamp(16, 2048)
-    }
-
-    /// More dirty pages than the buffer starts with: `watch_into` grows the buffer and returns
-    /// every page without a second walk over the range.
-    #[test]
-    fn more_dirty_pages_than_the_buffer_holds_are_all_returned() {
-        let w = Watched::new(128 << 20);
-        let pages = 20_000usize;
-        w.touch(pages);
-        let mut buf: Vec<*mut c_void> = Vec::new();
-        let mut dirty: Vec<usize> = Vec::new();
-        let mut gran = 0u32;
-        unsafe { watch_into(&[(w.0 as usize, w.1)], &mut buf, &mut dirty, &mut gran) };
-        dirty.sort_unstable();
-        dirty.dedup();
-        assert_eq!(dirty.len(), pages, "every written page reported once");
-        assert!(buf.len() >= pages, "the buffer grew to hold the range's pages ({} entries)", buf.len());
-    }
-
-    #[test]
-    #[ignore = "bench: up to 2 GiB, cost by bytes and by dirty pages"]
-    fn get_write_watch_cost_by_bytes_and_dirty_pages() {
-        let mb = mb();
-        let w = Watched::new(mb << 20);
-        let mut buf = vec![std::ptr::null_mut::<c_void>(); 1 << 16];
-        for &dirty in &[0usize, 16, 1024, 16384] {
-            w.touch(dirty);
-            let t = std::time::Instant::now();
-            let (mut n, mut gran) = (buf.len(), 0u32);
-            let r = unsafe { GetWriteWatch(WRITE_WATCH_FLAG_RESET, w.0, w.1, buf.as_mut_ptr(), &mut n, &mut gran) };
-            let d = t.elapsed().as_secs_f64();
-            assert_eq!(r, 0, "GetWriteWatch failed");
-            assert_eq!(n, dirty, "{dirty} pages written, {n} reported");
-            println!(
-                "watched {mb} MiB ({:.0} pages), {n} dirty: {:.2} ms ({:.2} ns/page, {:.3} µs/dirty page)",
-                w.1 as f64 / 4096.0,
-                d * 1e3,
-                d * 1e9 / (w.1 as f64 / 4096.0),
-                d * 1e6 / n.max(1) as f64
-            );
-        }
-    }
-
-    /// The same bytes in one call and in many: the fixed cost of a call.
-    #[test]
-    #[ignore = "bench: 512 MiB in 1 call vs calls of 1, 4 and 16 MiB"]
-    fn cost_of_many_small_ranges() {
-        let len = mb() << 20;
-        let w = Watched::new(len);
-        let mut buf = vec![std::ptr::null_mut::<c_void>(); 1 << 16];
-        for chunk in [len, 16 << 20, 4 << 20, 1 << 20] {
-            w.touch(64);
-            let mut got = 0usize;
-            let t = std::time::Instant::now();
-            for base in (0..len).step_by(chunk) {
-                let (mut n, mut gran) = (buf.len(), 0u32);
-                let r = unsafe { GetWriteWatch(WRITE_WATCH_FLAG_RESET, (w.0 as *const u8).add(base) as *const c_void, chunk, buf.as_mut_ptr(), &mut n, &mut gran) };
-                assert_eq!(r, 0);
-                got += n;
-            }
-            let d = t.elapsed().as_secs_f64();
-            println!(
-                "{} MiB in {} calls of {} MiB: {:.2} ms, {got} pages ({:.1} µs a call)",
-                len >> 20,
-                len / chunk,
-                chunk >> 20,
-                d * 1e3,
-                d * 1e6 / (len / chunk) as f64
-            );
-            assert_eq!(got, 64);
-        }
-    }
-
-    /// A buffer that fills: the call reports what fitted and the rest stay dirty, so the next
-    /// call walks the whole range again (why `watch_into` grows the buffer).
-    #[test]
-    #[ignore = "bench: 2 GiB, 100k dirty pages, small vs grown buffer"]
-    fn a_full_buffer_costs_one_walk_per_bufferful() {
-        let w = Watched::new(2048 << 20);
-        let dirty = 100_000usize;
-        for entries in [16384usize, 0] {
-            w.touch(dirty);
-            let mut buf = vec![std::ptr::null_mut::<c_void>(); if entries == 0 { dirty + 1024 } else { entries }];
-            let t = std::time::Instant::now();
-            let (mut got, mut calls, mut gran) = (0usize, 0usize, 0u32);
-            loop {
-                let mut n = buf.len();
-                let r = unsafe { GetWriteWatch(WRITE_WATCH_FLAG_RESET, w.0, w.1, buf.as_mut_ptr(), &mut n, &mut gran) };
-                assert_eq!(r, 0);
-                got += n;
-                calls += 1;
-                if n < buf.len() {
-                    break;
-                }
-            }
-            println!("buffer {} entries: {calls} calls, {got} of {dirty} pages, {:.2} ms", buf.len(), t.elapsed().as_secs_f64() * 1e3);
-            assert_eq!(got, dirty);
-        }
-    }
-
     fn console_desc(dim: u32, w: u64, h: u32, array_or_depth: u16, mips: u16, format: u32, layout: u32) -> [u8; 0x38] {
         let mut d = [0u8; 0x38];
         d[0..4].copy_from_slice(&dim.to_le_bytes());
@@ -1796,4 +1635,165 @@ mod watch_bench {
             uma.free(base);
         }
     }
+}
+
+#[cfg(test)]
+mod watch_parts_tests {
+    use super::split_watch;
+
+    #[test]
+    fn small_sets_stay_serial_and_large_ones_split_without_losing_a_range() {
+        let small = vec![(0x1000usize, 0x10000usize), (0x20000, 0x10000)];
+        assert_eq!(split_watch(&small, 8), vec![small.clone()]);
+        let big: Vec<(usize, usize)> = (0..40).map(|i| (0x1_0000_0000 + i * (64 << 20), 64 << 20)).collect();
+        assert_eq!(split_watch(&big, 1), vec![big.clone()], "one thread: the serial loop");
+        let parts = split_watch(&big, 8);
+        assert!(parts.len() > 1 && parts.len() <= 8, "{} parts", parts.len());
+        let flat: Vec<(usize, usize)> = parts.concat();
+        assert_eq!(flat, big, "every range exactly once, in order");
+    }
+}
+
+/// What the write-watch costs, measured on this machine (Windows only): the kernel walk over a
+/// synthetic write-watched reservation, and how that cost splits into a fixed part per call, a
+/// part per page and a part per dirty page. `XCL_BENCH_WATCH_MB` (default 512) is the size of the
+/// reservation the benches use.
+///
+/// `cargo test -q --lib watch_bench -- --ignored --nocapture` runs the benches; the first test
+/// runs in the normal suite (64 MiB).
+#[cfg(all(test, windows))]
+mod watch_bench {
+    use super::{watch_into, GetWriteWatch, WRITE_WATCH_FLAG_RESET};
+    use std::ffi::c_void;
+    use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE};
+
+    const MEM_WRITE_WATCH: u32 = 0x20_0000;
+
+    /// `len` bytes of write-watched memory, freed on drop.
+    struct Watched(*mut c_void, usize);
+
+    impl Watched {
+        fn new(len: usize) -> Self {
+            let p = unsafe { VirtualAlloc(std::ptr::null(), len, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE) };
+            assert!(!p.is_null(), "VirtualAlloc({len}, MEM_WRITE_WATCH) failed");
+            Watched(p, len)
+        }
+
+        /// write one byte of `pages` 4 KiB pages, spread over the range
+        fn touch(&self, pages: usize) {
+            let step = (self.1 / pages.max(1) & !0xFFF).max(0x1000);
+            for k in 0..pages {
+                unsafe { std::ptr::write_volatile((self.0 as *mut u8).add(k * step), 1) };
+            }
+        }
+    }
+
+    impl Drop for Watched {
+        fn drop(&mut self) {
+            unsafe { VirtualFree(self.0, 0, MEM_RELEASE) };
+        }
+    }
+
+    fn mb() -> usize {
+        std::env::var("XCL_BENCH_WATCH_MB").ok().and_then(|v| v.parse().ok()).unwrap_or(512).clamp(16, 2048)
+    }
+
+    /// More dirty pages than the buffer starts with: `watch_into` grows the buffer and returns
+    /// every page without a second walk over the range.
+    #[test]
+    fn more_dirty_pages_than_the_buffer_holds_are_all_returned() {
+        let w = Watched::new(128 << 20);
+        let pages = 20_000usize;
+        w.touch(pages);
+        let mut buf: Vec<*mut c_void> = Vec::new();
+        let mut dirty: Vec<usize> = Vec::new();
+        let mut gran = 0u32;
+        unsafe { watch_into(&[(w.0 as usize, w.1)], &mut buf, &mut dirty, &mut gran) };
+        dirty.sort_unstable();
+        dirty.dedup();
+        assert_eq!(dirty.len(), pages, "every written page reported once");
+        assert!(buf.len() >= pages, "the buffer grew to hold the range's pages ({} entries)", buf.len());
+    }
+
+    #[test]
+    #[ignore = "bench: up to 2 GiB, cost by bytes and by dirty pages"]
+    fn get_write_watch_cost_by_bytes_and_dirty_pages() {
+        let mb = mb();
+        let w = Watched::new(mb << 20);
+        let mut buf = vec![std::ptr::null_mut::<c_void>(); 1 << 16];
+        for &dirty in &[0usize, 16, 1024, 16384] {
+            w.touch(dirty);
+            let t = std::time::Instant::now();
+            let (mut n, mut gran) = (buf.len(), 0u32);
+            let r = unsafe { GetWriteWatch(WRITE_WATCH_FLAG_RESET, w.0, w.1, buf.as_mut_ptr(), &mut n, &mut gran) };
+            let d = t.elapsed().as_secs_f64();
+            assert_eq!(r, 0, "GetWriteWatch failed");
+            assert_eq!(n, dirty, "{dirty} pages written, {n} reported");
+            println!(
+                "watched {mb} MiB ({:.0} pages), {n} dirty: {:.2} ms ({:.2} ns/page, {:.3} µs/dirty page)",
+                w.1 as f64 / 4096.0,
+                d * 1e3,
+                d * 1e9 / (w.1 as f64 / 4096.0),
+                d * 1e6 / n.max(1) as f64
+            );
+        }
+    }
+
+    /// The same bytes in one call and in many: the fixed cost of a call.
+    #[test]
+    #[ignore = "bench: 512 MiB in 1 call vs calls of 1, 4 and 16 MiB"]
+    fn cost_of_many_small_ranges() {
+        let len = mb() << 20;
+        let w = Watched::new(len);
+        let mut buf = vec![std::ptr::null_mut::<c_void>(); 1 << 16];
+        for chunk in [len, 16 << 20, 4 << 20, 1 << 20] {
+            w.touch(64);
+            let mut got = 0usize;
+            let t = std::time::Instant::now();
+            for base in (0..len).step_by(chunk) {
+                let (mut n, mut gran) = (buf.len(), 0u32);
+                let r = unsafe { GetWriteWatch(WRITE_WATCH_FLAG_RESET, (w.0 as *const u8).add(base) as *const c_void, chunk, buf.as_mut_ptr(), &mut n, &mut gran) };
+                assert_eq!(r, 0);
+                got += n;
+            }
+            let d = t.elapsed().as_secs_f64();
+            println!(
+                "{} MiB in {} calls of {} MiB: {:.2} ms, {got} pages ({:.1} µs a call)",
+                len >> 20,
+                len / chunk,
+                chunk >> 20,
+                d * 1e3,
+                d * 1e6 / (len / chunk) as f64
+            );
+            assert_eq!(got, 64);
+        }
+    }
+
+    /// A buffer that fills: the call reports what fitted and the rest stay dirty, so the next
+    /// call walks the whole range again (why `watch_into` grows the buffer).
+    #[test]
+    #[ignore = "bench: 2 GiB, 100k dirty pages, small vs grown buffer"]
+    fn a_full_buffer_costs_one_walk_per_bufferful() {
+        let w = Watched::new(2048 << 20);
+        let dirty = 100_000usize;
+        for entries in [16384usize, 0] {
+            w.touch(dirty);
+            let mut buf = vec![std::ptr::null_mut::<c_void>(); if entries == 0 { dirty + 1024 } else { entries }];
+            let t = std::time::Instant::now();
+            let (mut got, mut calls, mut gran) = (0usize, 0usize, 0u32);
+            loop {
+                let mut n = buf.len();
+                let r = unsafe { GetWriteWatch(WRITE_WATCH_FLAG_RESET, w.0, w.1, buf.as_mut_ptr(), &mut n, &mut gran) };
+                assert_eq!(r, 0);
+                got += n;
+                calls += 1;
+                if n < buf.len() {
+                    break;
+                }
+            }
+            println!("buffer {} entries: {calls} calls, {got} of {dirty} pages, {:.2} ms", buf.len(), t.elapsed().as_secs_f64() * 1e3);
+            assert_eq!(got, dirty);
+        }
+    }
+
 }
