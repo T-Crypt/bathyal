@@ -93,6 +93,7 @@ fn a_resource_released_after_submit_outlives_its_submission() {
         for r in [&src, &dst] {
             lifetime::note(backing as usize, r.as_raw() as usize);
         }
+        assert!(lifetime::held(src.as_raw() as usize), "the recording did not name the source");
         list.Close().expect("Close");
 
         let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() }).expect("queue");
