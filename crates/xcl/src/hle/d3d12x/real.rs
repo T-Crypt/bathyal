@@ -3081,6 +3081,9 @@ pub(super) const PC_RESOURCE_STATES: u32 = 0x1 | 0x2 | 0x4 | 0x8 | 0x10 | 0x20 |
 /// buffers-only heap) is made the PC's way (`device_x::pc_resource_desc`, the console's state
 /// bits dropped). Logged with the console's values.
 pub(super) unsafe extern "system" fn dev_create_placed_resource_x(this: *mut c_void, heap: usize, offset: usize, desc: usize, state: usize, clear: usize, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+    // the clear value in the PC's format of the resource (D3D12 wants the two to match)
+    let mut clear_buf = [0u8; 24];
+    let clear = super::device_x::pc_clear(clear as *const c_void, &mut clear_buf) as usize;
     // a buffer in a heap that has unified memory (`note_heap_uma`): that memory at its offset
     if desc != 0 && crate::gpu::shader::readable(desc, 0x38) {
         let x: [u8; 0x38] = (desc as *const [u8; 0x38]).read_unaligned();
