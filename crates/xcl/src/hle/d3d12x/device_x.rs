@@ -709,7 +709,6 @@ pub fn pc_resource_desc(x: &[u8; 0x38]) -> [u8; 0x38] {
             d[0x20..0x24].copy_from_slice(&t.to_le_bytes());
         }
     }
-    }
     // a depth buffer the console also lets shaders write (a retail game's: ALLOW_DEPTH_STENCIL |
     // ALLOW_UNORDERED_ACCESS): the PC refuses the pair – the depth buffer stays
     if flags & 2 != 0 {

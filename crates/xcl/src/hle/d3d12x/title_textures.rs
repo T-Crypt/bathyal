@@ -1061,7 +1061,7 @@ unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>, title: Option<&ID3D12C
             }
             device = dev;
             bytes += tex.size() as usize;
-            picked.push((r, va, Arc::new(mem), tex, states, res_key, h));
+            picked.push((r, va, mem, tex, states, res_key, h));
         }
         let subs = subresources_of_all(&picked, bytes);
         let mut batch = Vec::with_capacity(picked.len());
