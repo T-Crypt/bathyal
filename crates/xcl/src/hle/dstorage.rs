@@ -184,7 +184,8 @@ impl BcpackRefusals {
 
 static BCPACK: BcpackRefusals = BcpackRefusals::new();
 
-/// BCPack requests completed with a placeholder block (their mode has no decoder), by mode.
+/// BCPack requests that upstream cannot decode (`hle::bcpack` has no rebuild for the mode on
+/// this branch), completed with a placeholder block instead of failing, by mode.
 struct BcpackPlaceholders {
     requests: [AtomicU64; 16],
     bytes: [AtomicU64; 16],
@@ -199,12 +200,7 @@ impl BcpackPlaceholders {
     /// Count one completed request of `mode`; the placeholders so far, this one included.
     fn note(&self, mode: u8, bytes: usize) -> u64 {
         let i = mode as usize & 0xF;
-        if self.requests[i].fetch_add(1, Ordering::Relaxed) == 0 {
-            crate::xlog_info!(
-                "DirectStorage: BCPack {}: no decoder; the destination gets a placeholder block and the request succeeds",
-                bcpack_name(mode)
-            );
-        }
+        self.requests[i].fetch_add(1, Ordering::Relaxed);
         self.bytes[i].fetch_add(bytes as u64, Ordering::Relaxed);
         self.requests.iter().map(|r| r.load(Ordering::Relaxed)).sum()
     }
@@ -240,12 +236,15 @@ impl BcpackPlaceholders {
 
 static PLACEHOLDERS: BcpackPlaceholders = BcpackPlaceholders::new();
 
-/// Count one completed placeholder and log the running total on the first 16 and every power
-/// of two, as the refusals counter does.
+/// Count one completed placeholder, and log one line with the running total and its breakdown
+/// by mode on the first 16 and every power of two, as the refusals counter does.
 fn log_bcpack_placeholder(r: &Request) {
     let k = PLACEHOLDERS.note(r.bcpack(), r.destination_size as usize);
     if k <= 16 || k.is_power_of_two() {
-        crate::xlog_info!("DirectStorage: BCPack placeholders so far: {k} ({})", PLACEHOLDERS.summary());
+        crate::xlog_info!(
+            "DirectStorage: BCPack placeholders so far: {k} requests completed with a solid block (S_OK): {}",
+            PLACEHOLDERS.summary()
+        );
     }
 }
 
@@ -1438,12 +1437,13 @@ unsafe extern "system" fn queue_enqueue_request(p: *mut c_void, req: *const u8) 
     }
     let r = Request::parse(&*(req as *const [u8; REQUEST_BYTES]));
     if let Err(hr) = r.check(q.source_memory) {
-        // A BCPack mode with no block rebuild would fail every request with E_DECOMPRESSION at
-        // both stages; under the default switch it completes with a placeholder block instead.
+        // Nothing on this branch rebuilds BCPack blocks, so a request for one fails `check` at
+        // its stage with E_DECOMPRESSION. Under the default switch it completes with a solid
+        // block of its mode instead: a title that waits on the request got its data on the
+        // console, and a request it never sees complete ended its session.
         if hr == E_DECOMPRESSION
             && r.bcpack() != 0
             && r.swizzle() == 0
-            && !super::bcpack::can_decode(r.bcpack())
             && bcpack_placeholder_block(r.bcpack()).is_some()
             && q.bcpack_placeholder.load(Ordering::Relaxed)
         {
