@@ -306,7 +306,7 @@ fn sampler_index(pc_n: u32, keep: u32, scratch: u32, k: u32) -> u32 {
 /// heap of `n` slots whose PC heap has `pc_n`.
 fn sampler_layout(n: u32, pc_n: u32) -> (u32, u32) {
     if n <= pc_n {
-        return (pc_n, 0);
+        return (n, 0);
     }
     let scratch = (n - pc_n).min(pc_n / 4).max(1).min(pc_n);
     (pc_n - scratch, scratch)
@@ -956,10 +956,11 @@ mod tests {
         uniq.sort_unstable();
         uniq.dedup();
         assert_eq!(uniq, idx, "no two live slots share a descriptor");
-        // a released run is reused; a live one is not
-        free.push((4, SLOT_DESCRIPTORS));
-        assert_eq!(place(&mut free, &mut next, 20, &mut placed), Some(4));
-        assert!(!idx.contains(&4));
+        // a released run is reused (the last one placed), a live one is not
+        let last = *idx.last().unwrap();
+        free.push((last, SLOT_DESCRIPTORS));
+        assert_eq!(place(&mut free, &mut next, 20, &mut placed), Some(last));
+        assert_eq!(place(&mut free, &mut next, 21, &mut placed), None, "the cap is full again");
     }
 
     /// Minecraft's view heaps: eight of 73 727 slots. Each used slot takes its own two
@@ -1014,7 +1015,8 @@ mod tests {
         assert!(register(0xB100, 4, 4, 0x10_0000, 0, 32, false, true, true) && register(0xB101, 4, 4, 0x20_0000, 0, 32, false, true, true));
         let (a, b) = (slot(start(0xB100).unwrap()).unwrap(), slot(start(0xB101).unwrap()).unwrap());
         assert!(a.shared_srv != 0 && b.shared_srv != 0);
-        assert_eq!(a.index.abs_diff(b.index), 8, "two heaps of 4 slots lie 8 descriptors apart");
+        assert_eq!(a.index.abs_diff(b.index), SLOT_DESCRIPTORS, "each slot's run is its own two descriptors");
+        assert_eq!(slot(start(0xB100).unwrap() + SLOT as u64).unwrap().index.abs_diff(a.index), SLOT_DESCRIPTORS, "a heap's slots lie apart too");
         unregister(0xB100);
         unregister(0xB101);
     }
