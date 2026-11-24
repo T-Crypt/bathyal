@@ -74,6 +74,8 @@ unsafe fn present_x_frame(queue: *mut c_void, plane_count: u32, planes: *const u
         // every built pipeline is one or the other, so a second, warm run shows 0 misses
         let (hits, misses) = super::pso_disk::counts();
         crate::xlog_info!("D3D12.X: pipeline cache: {hits} hits, {misses} misses");
+        // what this run drew with, for the next run to build during load
+        super::pso_disk::flush_drawn();
     }
     super::real::stop_if_device_removed();
     if !PRESENTX.swap(true, Ordering::Relaxed) {

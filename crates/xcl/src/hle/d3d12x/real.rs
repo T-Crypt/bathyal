@@ -3392,7 +3392,7 @@ unsafe fn finish_pso_cached(this: *mut c_void, f: PsoFn, desc: *mut c_void, grap
             note_device_removed();
             return hr;
         }
-        super::pso_disk::forget(key);
+        super::pso_disk::rejected(key);
         apply(&[]);
     }
     if device_is_removed(this) {
@@ -3465,7 +3465,7 @@ unsafe fn finish_stream_cached(this: *mut c_void, f: PsoFn, stream: &[u8], key: 
             note_device_removed();
             return hr;
         }
-        super::pso_disk::forget(key);
+        super::pso_disk::rejected(key);
     }
     let _guard = super::pso_async::uncached_compile();
     super::pso_disk::note_lookup(false);
@@ -3706,6 +3706,7 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
     }
     TRANSLATED_PSO.fetch_add(1, Ordering::Relaxed);
     note_pso_rs(*ppv, rs);
+    super::pso_disk::note_pso_shader(*ppv as usize, super::pso_disk::shaders_sig(&[cs]));
     if let Some(n) = crate::gpu::recomp::pso::compute_user_sgprs(cs) {
         PSO_USER_SGPRS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, n);
     }
@@ -3809,6 +3810,14 @@ unsafe fn translated_graphics_pso_once(this: *mut c_void, f: PsoFn, desc: *const
     }
     let n = TRANSLATED_PSO.fetch_add(1, Ordering::Relaxed);
     note_pso_rs(*ppv, rs);
+    let mut stages = Vec::new();
+    for b in [&d.VS, &d.PS, &d.DS, &d.HS, &d.GS] {
+        if let Some(code) = shader_bytes(b) {
+            stages.push(code);
+        }
+    }
+    let sig = super::pso_disk::shaders_sig(&stages);
+    super::pso_disk::note_pso_shader(*ppv as usize, sig);
     TRANSLATED_GRAPHICS.lock().unwrap().get_or_insert_with(HashSet::new).insert(*ppv as usize);
     note_rect_list_gs(*ppv as usize, &copy, rect_gs.is_some());
     if super::present::trace_frame() {
@@ -3893,6 +3902,16 @@ impl OwnedDesc {
             OwnedDesc::Graphics(d, ..) => &**d as *const _ as *const c_void,
             OwnedDesc::Stream(d, ..) => &**d as *const _ as *const c_void,
         }
+    }
+
+    /// The console shaders this pipeline is built from, in `pso_disk::shaders_sig` order: what
+    /// the pipeline is known by before it has a translation (`pso_disk::note_pso_shader`
+    /// records the same at creation).
+    fn shader_sig(&self) -> u64 {
+        let blobs = match self {
+            OwnedDesc::Compute(_, b) | OwnedDesc::Graphics(_, b, ..) | OwnedDesc::Stream(_, _, b) => b,
+        };
+        super::pso_disk::shaders_sig(&blobs.iter().map(Vec::as_slice).collect::<Vec<_>>())
     }
 }
 
@@ -4028,7 +4047,13 @@ unsafe fn go_background(
         return None;
     }
     let dev = Dev(this as usize, f as usize);
-    let submit = if super::pso_async::lazy() { super::pso_async::submit_lazy } else { super::pso_async::submit };
+    // a pipeline drawn with in an earlier run is built now, while the title loads: its driver
+    // blob is in the library, so the build is quick and its first draw does not wait
+    let eager = super::pso_async::build_during_load(super::pso_async::lazy(), super::pso_disk::wanted_shader(owned.shader_sig()));
+    if eager && super::pso_async::lazy() {
+        super::pso_async::note_prewarmed();
+    }
+    let submit = if eager { super::pso_async::submit } else { super::pso_async::submit_lazy };
     submit(
         *ppv as usize,
         compute,
@@ -4278,7 +4303,9 @@ unsafe fn gs_fetch(this: *mut c_void, d: &D3D12_GRAPHICS_PIPELINE_STATE_DESC, vs
     cdesc.CS = bytecode(&cs);
     let iid = pc_iid(Kind::PipelineState);
     let mut pso: *mut c_void = std::ptr::null_mut();
-    let hr = fc(this, &cdesc as *const _ as *const c_void, &iid, &mut pso);
+    // the fetch's compute pipeline is kept too: its driver blob is read before it compiles
+    let key = super::pso_disk::compute_key(&cdesc, &[]);
+    let hr = finish_pso_cached(this, fc, &mut cdesc as *mut _ as *mut c_void, false, key, &iid, &mut pso);
     if hr < 0 || pso.is_null() {
         return Err(format!("the driver rejected the vertex fetch ({hr:#x})"));
     }
@@ -4376,7 +4403,7 @@ fn two_pass_ps(ps: Option<&[u8]>, split_wave64: bool) -> Result<(Option<Vec<u8>>
 /// the title gets the mesh pipeline state. `stream_key` is `pso_disk::stream_key` of that
 /// stream, so both halves come from the disk cache when it has them.
 #[allow(clippy::too_many_arguments)]
-unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, stream_key: u64, tp: crate::gpu::recomp::pso::TwoPass, mesh_rs: *mut c_void, kind: &'static str, fetch: Option<Result<GsFetch, String>>, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, stream_key: u64, sig: u64, tp: crate::gpu::recomp::pso::TwoPass, mesh_rs: *mut c_void, kind: &'static str, fetch: Option<Result<GsFetch, String>>, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
     let Some(rs) = abi_rs_for(this, &tp.samplers) else { return E_INVALIDARG };
     let fs: PsoFn = std::mem::transmute(orig_fn(this, slot_of(this, "CreatePipelineState")));
     let hr = finish_stream_cached(this, fs, &stream.0, stream_key, riid, ppv);
@@ -4390,7 +4417,10 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, stream_key: u64
     cdesc.CS = bytecode(&tp.cs);
     let iid = pc_iid(Kind::PipelineState);
     let mut compute: *mut c_void = std::ptr::null_mut();
-    let hc = driver_pso(fc, this, &cdesc as *const _ as *const c_void, &iid, &mut compute);
+    // the compute pass is a pipeline like any other: its driver blob is read before it
+    // compiles, and saved after (a warm run builds both passes without the driver's compiler)
+    let key = super::pso_disk::compute_key(&cdesc, &tp.samplers);
+    let hc = finish_pso_cached(this, fc, &mut cdesc as *mut _ as *mut c_void, false, key, &iid, &mut compute);
     if hc < 0 || compute.is_null() {
         note_translation_error(format!("the driver rejected the compute pass of the console {kind} ({hc:#x})"));
         let release: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*(*(*ppv as *const *const usize)).add(2));
@@ -4399,6 +4429,7 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, stream_key: u64
         return E_INVALIDARG;
     }
     note_pso_rs(*ppv, mesh_rs);
+    super::pso_disk::note_pso_shader(*ppv as usize, sig);
     TWO_PASS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, std::sync::Arc::new(TwoPassPso { compute: compute as usize, compute_rs: rs as usize, mesh_rs: mesh_rs as usize, record: tp.record, mesh_groups_per_record: tp.mesh_groups_per_record, kind, fetch }));
     let n = TRANSLATED_PSO.fetch_add(1, Ordering::Relaxed);
     if n < 5 || n % 1000 == 0 {
@@ -4485,7 +4516,8 @@ unsafe fn translated_mesh_stream_once(this: *mut c_void, desc: *const c_void, ri
             out.raw(*ty, payload, palign == 8);
         }
     }
-    Some(finish_two_pass(this, &out, super::pso_disk::stream_key(&out.0, &ps_samplers), tp, rs, "MS", None, riid, ppv))
+    let sig = super::pso_disk::shaders_sig(&subs.iter().filter(|s| matches!(s.0, 1..=6 | 24 | 25)).filter_map(|s| payload_shader(s.1)).collect::<Vec<_>>());
+    Some(finish_two_pass(this, &out, super::pso_disk::stream_key(&out.0, &ps_samplers), sig, tp, rs, "MS", None, riid, ppv))
 }
 
 /// A graphics PSO with a console VS + GS: the GS pipeline in two passes, as a mesh pipeline
@@ -4561,7 +4593,13 @@ unsafe fn translated_gs_pso(this: *mut c_void, d: &D3D12_GRAPHICS_PIPELINE_STATE
     if let Err(e) = &fetch {
         note_translation_error(format!("VS+GS vertex fetch: {e}"));
     }
-    finish_two_pass(this, &out, super::pso_disk::stream_key(&out.0, &ps_samplers), tp, rs, "GS", Some(fetch), riid, ppv)
+    let mut shaders = vec![vs];
+    if let Some(p) = shader_bytes(&d.PS) {
+        shaders.push(p);
+    }
+    shaders.push(gs);
+    let sig = super::pso_disk::shaders_sig(&shaders);
+    finish_two_pass(this, &out, super::pso_disk::stream_key(&out.0, &ps_samplers), sig, tp, rs, "GS", Some(fetch), riid, ppv)
 }
 
 /// Rewrite a pipeline state stream with stand-in shaders. None if not possible.
