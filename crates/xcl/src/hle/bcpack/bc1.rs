@@ -5,9 +5,9 @@
 //!   "none" (predict zeros), an even symbol `v` is `v / 2`, an odd one `255 - v / 2`. Block
 //!   `i - d` is meant, and before block 0 a built-in history of 255 endpoint sets, the same for
 //!   every stream ([`Tables::history`]). A stream never refers to the blocks of the previous
-//!   request, and a slot the table lacks is read as zeros (as bcpack-rs, this table's source,
-//!   does), so a fit that never saw the slot costs its blocks, not the whole chunk: real BC1
-//!   chunks do read slot 4, which bcpack-rs's fit lacks (its issue 4).
+//!   request. One slot real chunks do read, slot 4, is not in bcpack-rs's fit; it is ported
+//!   from ivall/xcl's dictionary (`bc1_fitted.rs`). A slot the table still lacks is read as
+//!   zeros, as bcpack-rs does, so one such block does not cost its whole chunk.
 //! * lane 1 was 0 in every stream the format notes describe,
 //! * lanes 2–7 are the differences of R0, G0, B0, R1, G1, B1 from the prediction, 0, -1, 1,
 //!   -2, 2 … for the symbols 0, 1, 2, 3, 4 …, modulo the channel's range (5, 6, 5 bits),
