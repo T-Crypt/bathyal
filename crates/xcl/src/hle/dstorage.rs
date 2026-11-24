@@ -336,9 +336,29 @@ fn bcpack_unpack(r: &Request, packed: &[u8], n: usize) -> Result<Vec<u8>, HRESUL
             if k <= 16 || k.is_power_of_two() {
                 crate::xlog_info!("DirectStorage: BCPack {} streams not unpacked so far: {k}", bcpack_name(bc));
             }
-            Err(E_DECOMPRESSION)
+            // a stream the decoder did not take completes with placeholder blocks, as a mode
+            // without a decoder does: the title never checks a request's result, and a failed
+            // one left the texture it waited for unwritten (every run that lost the device in
+            // the world load had one just before)
+            match placeholder_blocks(bc, n) {
+                Some(blocks) => {
+                    log_bcpack_placeholder(r);
+                    Ok(blocks)
+                }
+                None => Err(E_DECOMPRESSION),
+            }
         }
     }
+}
+
+/// `n` bytes of solid placeholder blocks of BCPack mode `bc` (None: placeholders are off, or
+/// the mode's block size is not known).
+fn placeholder_blocks(bc: u8, n: usize) -> Option<Vec<u8>> {
+    if !bcpack_placeholder_enabled() {
+        return None;
+    }
+    let block = bcpack_placeholder_block(bc)?;
+    Some(block.iter().copied().cycle().take(n).collect())
 }
 
 /// Log a refused BCPack request: one warning per mode and zlib stage, then a running count on
@@ -1809,6 +1829,22 @@ mod tests {
                 None => std::env::remove_var(self.0),
             }
         }
+    }
+
+    /// A stream the decoder refuses becomes whole placeholder blocks filling the destination;
+    /// with `XCL_BCPACK_PLACEHOLDER=0` it stays a failure.
+    #[test]
+    fn a_refused_bcpack_stream_becomes_placeholder_blocks() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _v = EnvVar::clear("XCL_BCPACK_PLACEHOLDER");
+        let b = placeholder_blocks(1, 24).expect("BC1 has a placeholder block");
+        assert_eq!(b.len(), 24);
+        assert!(b.chunks(8).all(|c| c == BC1_MAGENTA), "three whole BC1 blocks");
+        let b7 = placeholder_blocks(7, 32).expect("BC7 has a placeholder block");
+        assert!(b7.chunks(16).all(|c| c == BC7_GREY));
+        assert!(placeholder_blocks(9, 32).is_none(), "a mode without a known block size");
+        let _off = EnvVar::set("XCL_BCPACK_PLACEHOLDER", "0");
+        assert!(placeholder_blocks(1, 24).is_none(), "placeholders off: the request fails as before");
     }
 
     fn request(options: u64, dst: u64, dst_size: u32, src: u64, offset: u64, src_size: u32) -> [u8; REQUEST_BYTES] {
