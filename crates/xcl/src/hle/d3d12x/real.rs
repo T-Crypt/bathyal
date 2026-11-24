@@ -5746,6 +5746,15 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
         stop_if_device_removed();
         return;
     }
+    // XCL's own work (texture uploads on the submitting queue, sparse readbacks, staging
+    // copies) goes to the PC queue at once, as before the gate: it carries no title wait, and
+    // its caller reuses or releases the list as soon as this returns. Through the gate, a busy
+    // queue would park the list in its FIFO and submit it later, after its owner reset it.
+    if super::title_textures::is_own_work() {
+        f(this, n, lists);
+        stop_if_device_removed();
+        return;
+    }
     // console-shaped lists run as the PC lists they were translated into
     let mapped: Vec<*mut c_void> = std::slice::from_raw_parts(lists, n as usize)
         .iter()
