@@ -45,7 +45,7 @@ unsafe fn tracked_buffer(dev: &ID3D12Device, heap: D3D12_HEAP_TYPE, state: D3D12
     };
     let hp = D3D12_HEAP_PROPERTIES { Type: heap, ..Default::default() };
     let mut r: *mut c_void = std::ptr::null_mut();
-    let iid = ID3D12Resource::IID;
+    let iid: windows_sys::core::GUID = windows_sys::core::GUID::from_u128(0x696442be_a72e_4059_bc79_5b5c98040fad);
     let hr = real::dev_create_committed_resource(
         dev.as_raw() as *mut c_void,
         &hp as *const _ as usize,
