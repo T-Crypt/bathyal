@@ -243,7 +243,7 @@ pub fn readable(p: usize, len: usize) -> bool {
 /// Whether each page of `[p, end)` (up to 16 pages) is in the working set with a readable
 /// protection, asked of the kernel for all the pages in one call that touches none of them.
 /// `readable` asks this first because `VirtualQuery` sizes the whole region around an address by
-/// walking it: in a title's 2 GB block of committed memory that took 20–25 ms a call, and a newer retail title's
+/// walking it: in a title's 2 GB block of committed memory that took 20–25 ms a call, and a
 /// streaming thread, which has the page arrays of its DirectStorage requests checked, spent most
 /// of the world load there. `false` for a page that is not resident (never touched, paged out,
 /// guard, reserved, no access): the `VirtualQuery` walk answers for those.

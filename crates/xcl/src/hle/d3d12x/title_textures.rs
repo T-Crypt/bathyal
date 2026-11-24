@@ -1418,9 +1418,11 @@ mod tests {
         let regions = [(0x10000, 0x10000), (0x40000, 0x10000), (0x1000_0000, 0x1000_0000)];
         let wanted = vec![(0x12000, 0x13000), (0x11000, 0x12800), (0x1F000, 0x41000), (0x60000, 0x61000)];
         assert_eq!(watch_ranges(&regions, wanted), vec![(0x11000, 0xF000), (0x40000, 0x10000)]);
-        // ranges a gap of under 1 MiB apart: one scan; further apart: two
+        // ranges a gap of under 16 MiB apart (`WATCH_GAP`) are one scan; further apart: two
         let wanted = vec![(0x1000_0000, 0x1000_1000), (0x1008_0000, 0x1008_1000), (0x1100_0000, 0x1100_1000)];
-        assert_eq!(watch_ranges(&regions, wanted), vec![(0x1000_0000, 0x8_1000), (0x1100_0000, 0x1000)]);
+        assert_eq!(watch_ranges(&regions, wanted), vec![(0x1000_0000, 0x1008_1000)]);
+        let wanted = vec![(0x1000_0000, 0x1000_1000), (0x1200_0000, 0x1200_1000)];
+        assert_eq!(watch_ranges(&regions, wanted), vec![(0x1000_0000, 0x1000), (0x1200_0000, 0x1000)]);
     }
 
     fn console_desc(dim: u32, w: u64, h: u32, array_or_depth: u16, mips: u16, format: u32, layout: u32) -> [u8; 0x38] {
