@@ -331,6 +331,20 @@ fn cached_watch_ranges(u: &crate::gpu::uma::Uma) -> Arc<Vec<(usize, usize)>> {
     let mut wanted: Vec<(usize, usize)> = TEXTURES.lock().unwrap().values().map(|e| (e.src & !0xFFF, (e.src + e.tex.size() as usize + 0xFFF) & !0xFFF)).collect();
     wanted.extend(super::sparse::mapped_ranges());
     let computed = Arc::new(watch_ranges(&regions, wanted));
+    if std::env::var_os("XCL_WATCH_TRACE").is_some() {
+        static N: AtomicU64 = AtomicU64::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed) + 1;
+        if n <= 4 || n.is_power_of_two() {
+            let mb = |v: usize| v >> 20;
+            crate::xlog_info!(
+                "watch trace #{n}: {} ranges {} MB watched, mapped {} MB, textures {} MB",
+                computed.len(),
+                mb(computed.iter().map(|r| r.1).sum()),
+                mb(super::sparse::mapped_ranges().iter().map(|r| r.1).sum()),
+                mb(TEXTURES.lock().unwrap().values().map(|e| e.tex.size() as usize).sum()),
+            );
+        }
+    }
     *WATCH_CACHE.lock().unwrap() = Some((key, Arc::clone(&computed)));
     computed
 }
