@@ -1240,30 +1240,39 @@ fn watch_ranges(regions: &[(usize, usize)], mut wanted: Vec<(usize, usize)>) -> 
     out
 }
 
-/// Copy `[start, end)` into `dst` (which must be pre-zeroed and at least `end - start` bytes),
-/// leaving any page that is concurrently unmapped or made unreadable as zero instead of faulting.
-unsafe fn copy_readable_range(start: usize, end: usize, dst: *mut u8) {
+/// Copy `[src, src + len)` into `dst` (pre-zeroed) without faulting if another thread unmaps or
+/// decommits a page concurrently: `ReadProcessMemory` catches the fault in kernel mode and returns
+/// `0`. Because Windows may return `read == 0` when a fault occurs later in the span, binary-split
+/// failed multi-page ranges at 4 KiB boundaries so all still-committed pages are copied in O(log N)
+/// calls and only unreadable pages stay zeroed.
+unsafe fn copy_committed_region(src: usize, dst: *mut u8, len: usize) {
     use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     const PAGE: usize = 0x1000;
-    let proc = GetCurrentProcess();
-    let mut cur = start;
-    while cur < end {
+
+    unsafe fn copy_rec(proc: *mut c_void, src: usize, dst: *mut u8, len: usize) {
+        if len == 0 {
+            return;
+        }
         let mut read = 0usize;
-        let want = end - cur;
-        let ok = ReadProcessMemory(proc, cur as *const c_void, dst.add(cur - start) as *mut c_void, want, &mut read);
-        if ok != 0 {
-            break;
+        if ReadProcessMemory(proc, src as *const c_void, dst as *mut c_void, len, &mut read) != 0 {
+            return;
         }
-        // A page at `cur + read` became unreadable between VirtualQuery and ReadProcessMemory
-        // (e.g. a streaming thread unmapped physical pages): skip that page (stays zero) and
-        // continue with the remainder of the range.
-        let next = ((cur.saturating_add(read)) & !(PAGE - 1)).saturating_add(PAGE);
-        if next <= cur {
-            break;
+        let read = read.min(len);
+        let src = src + read;
+        let dst = dst.add(read);
+        let len = len - read;
+        let page_end = (src & !(PAGE - 1)).saturating_add(PAGE).min(src + len);
+        if page_end == src + len {
+            return;
         }
-        cur = next;
+        let mid = ((src + len / 2) & !(PAGE - 1)).max(page_end);
+        let left = mid - src;
+        copy_rec(proc, src, dst, left);
+        copy_rec(proc, mid, dst.add(left), len - left);
     }
+
+    copy_rec(GetCurrentProcess(), src, dst, len);
 }
 
 /// `len` bytes at `at`: the committed, readable pages copied, the rest zero (a streaming pool
@@ -1271,6 +1280,7 @@ unsafe fn copy_readable_range(start: usize, end: usize, dst: *mut u8) {
 unsafe fn read_committed(at: usize, len: usize) -> Vec<u8> {
     use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT};
     let mut out = vec![0u8; len];
+    let Some(limit) = at.checked_add(len) else { return out };
     // (the coherent window is committed as a whole: no `VirtualQuery`, which sizes a region by
     // walking it)
     if crate::gpu::uma::get().is_some_and(|u| u.in_committed_window(at, len)) {
@@ -1281,7 +1291,7 @@ unsafe fn read_committed(at: usize, len: usize) -> Vec<u8> {
     let mut p = at;
     while p < limit {
         let mut m: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
-        if VirtualQuery(p as *const c_void, &mut m, std::mem::size_of_val(&m)) == 0 {
+        if VirtualQuery(p as *const c_void, &mut m, std::mem::size_of_val(&m)) == 0 || m.RegionSize == 0 {
             break;
         }
         let end = (m.BaseAddress as usize).saturating_add(m.RegionSize).min(limit);
@@ -1290,7 +1300,7 @@ unsafe fn read_committed(at: usize, len: usize) -> Vec<u8> {
         }
         let readable = m.State == MEM_COMMIT && m.Protect & 0xEE != 0 && m.Protect & 0x100 == 0; // R / RW / WC / X-R…, no guard
         if readable {
-            copy_readable_range(p, end, out.as_mut_ptr().add(p - at));
+            copy_committed_region(p, out.as_mut_ptr().add(p - at), end - p);
         }
         p = end;
     }
@@ -2125,48 +2135,75 @@ mod tests {
         }
     }
 
+    /// `read_committed` copies committed pages and leaves uncommitted gaps zeroed, including
+    /// unaligned start/end offsets.
     #[test]
-    fn read_committed_skips_unmapped_holes_and_survives_concurrent_decommit() {
-        use std::sync::atomic::{AtomicBool, Ordering};
-        use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_DECOMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE};
-        const PAGES: usize = 32;
-        const PAGE: usize = 0x1000;
-        const SIZE: usize = PAGES * PAGE;
+    fn read_committed_copies_committed_pages_and_zeroes_gaps() {
+        use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE};
+        const PAGE: usize = 0x10000;
         unsafe {
-            let base = VirtualAlloc(std::ptr::null(), SIZE, MEM_RESERVE, PAGE_READWRITE) as usize;
-            assert!(base != 0);
-            // Commit first and last 4 pages, leave the middle reserved (unmapped hole).
-            assert!(!VirtualAlloc(base as *mut c_void, 4 * PAGE, MEM_COMMIT, PAGE_READWRITE).is_null());
-            assert!(!VirtualAlloc((base + (PAGES - 4) * PAGE) as *mut c_void, 4 * PAGE, MEM_COMMIT, PAGE_READWRITE).is_null());
-            std::slice::from_raw_parts_mut(base as *mut u8, 4 * PAGE).fill(0x5A);
-            std::slice::from_raw_parts_mut((base + (PAGES - 4) * PAGE) as *mut u8, 4 * PAGE).fill(0xA5);
+            let base = VirtualAlloc(std::ptr::null(), 3 * PAGE, MEM_RESERVE, PAGE_READWRITE) as usize;
+            assert_ne!(base, 0);
+            assert_ne!(VirtualAlloc(base as *const c_void, PAGE, MEM_COMMIT, PAGE_READWRITE), std::ptr::null_mut());
+            assert_ne!(VirtualAlloc((base + 2 * PAGE) as *const c_void, PAGE, MEM_COMMIT, PAGE_READWRITE), std::ptr::null_mut());
+            std::ptr::write_bytes(base as *mut u8, 0x3A, PAGE);
+            std::ptr::write_bytes((base + 2 * PAGE) as *mut u8, 0x7C, PAGE);
 
-            // Non-page-aligned start/end crossing committed -> hole -> committed.
-            let got = read_committed(base + 123, SIZE - 246);
-            assert!(got[..4 * PAGE - 123].iter().all(|&b| b == 0x5A));
-            assert!(got[4 * PAGE - 123..(PAGES - 4) * PAGE - 123].iter().all(|&b| b == 0));
-            assert!(got[(PAGES - 4) * PAGE - 123..].iter().all(|&b| b == 0xA5));
+            let start = base + 0x0B00;
+            let len = 2 * PAGE + 0x0500;
+            let got = read_committed(start, len);
+            assert_eq!(got.len(), len);
+            assert!(got[..PAGE - 0x0B00].iter().all(|&b| b == 0x3A));
+            assert!(got[PAGE - 0x0B00..2 * PAGE - 0x0B00].iter().all(|&b| b == 0));
+            assert!(got[2 * PAGE - 0x0B00..].iter().all(|&b| b == 0x7C));
 
-            // Stress the TOCTOU window: one thread toggles commit/decommit on middle pages while
-            // read_committed reads the whole span. Previously this faulted with 0xC0000005.
+            VirtualFree(base as *mut c_void, 0, MEM_RELEASE);
+        }
+    }
+
+    /// `read_committed` must not fault with 0xC0000005 when another thread concurrently
+    /// decommits/recommits pages between `VirtualQuery` and the copy, and surrounding committed
+    /// pages must remain intact.
+    #[test]
+    fn read_committed_tolerates_concurrent_decommit() {
+        use std::sync::atomic::AtomicBool;
+        use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_DECOMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE};
+        const PAGE: usize = 0x10000;
+        const PAGES: usize = 16;
+        unsafe {
+            let base = VirtualAlloc(std::ptr::null(), PAGES * PAGE, MEM_RESERVE, PAGE_READWRITE) as usize;
+            assert_ne!(base, 0);
+            assert_ne!(VirtualAlloc(base as *const c_void, PAGES * PAGE, MEM_COMMIT, PAGE_READWRITE), std::ptr::null_mut());
+            // Keep first and last 64 KiB pages permanently committed with known sentinels; race the middle.
+            std::ptr::write_bytes(base as *mut u8, 0x5A, PAGE);
+            std::ptr::write_bytes((base + (PAGES - 1) * PAGE) as *mut u8, 0xA5, PAGE);
+
             let stop = Arc::new(AtomicBool::new(false));
             let stop_w = Arc::clone(&stop);
             let mutator = std::thread::spawn(move || {
-                let mid = (base + 4 * PAGE) as *mut c_void;
-                let mid_len = (PAGES - 8) * PAGE;
+                let mut i = 0usize;
                 while !stop_w.load(Ordering::Relaxed) {
-                    if !VirtualAlloc(mid, mid_len, MEM_COMMIT, PAGE_READWRITE).is_null() {
-                        std::ptr::write_bytes(mid as *mut u8, 0x3C, mid_len);
-                        VirtualFree(mid, mid_len, MEM_DECOMMIT);
+                    let slot = 1 + (i % (PAGES - 2));
+                    let p = (base + slot * PAGE) as *const c_void;
+                    let _ = VirtualFree(p as *mut c_void, PAGE, MEM_DECOMMIT);
+                    let q = VirtualAlloc(p, PAGE, MEM_COMMIT, PAGE_READWRITE);
+                    if !q.is_null() {
+                        std::ptr::write_bytes(q as *mut u8, 0x3C, 4096);
                     }
+                    i = i.wrapping_add(1);
                 }
             });
+
+            // Unaligned start/end across the racing region (mirrors the streaming pool layout).
+            let off = 0x0B00;
+            let len = (PAGES - 1) * PAGE + 0x0500;
             for _ in 0..400 {
-                let buf = read_committed(base, SIZE);
-                assert_eq!(buf.len(), SIZE);
-                assert!(buf[..4 * PAGE].iter().all(|&b| b == 0x5A));
-                assert!(buf[(PAGES - 4) * PAGE..].iter().all(|&b| b == 0xA5));
+                let out = read_committed(base + off, len);
+                assert_eq!(out.len(), len);
+                assert!(out[..PAGE - off].iter().all(|&b| b == 0x5A));
+                assert!(out[len - (off + 0x0500)..].iter().all(|&b| b == 0xA5));
             }
+
             stop.store(true, Ordering::Relaxed);
             mutator.join().unwrap();
             VirtualFree(base as *mut c_void, 0, MEM_RELEASE);
