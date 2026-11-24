@@ -1317,18 +1317,6 @@ pub unsafe fn free(p: usize) -> bool {
     u.sparse_release(p).is_some()
 }
 
-/// Whether any sparse window exists at all (the cheap test before per-address ones).
-pub(super) fn has_windows() -> bool {
-    STATE.lock().unwrap().as_ref().is_some_and(|s| !s.windows.is_empty())
-}
-
-/// Whether `a` lies in a sparse window: only there does the GPU write into memory the CPU
-/// view does not hold, so only there is a tile readback due (a value a shader wrote has no
-/// recorded `Write32/64BitValue` to go by).
-pub(super) fn in_window(a: usize) -> bool {
-    STATE.lock().unwrap().as_ref().is_some_and(|s| s.window_index(a).is_some())
-}
-
 /// After `queue.ExecuteCommandLists`: copy GPU-written sparse ranges (e.g. `Write32/64`,
 /// `FillMemoryWith32BitValueX`, `CopyMemoryToMemoryX`) back to their CPU view so CPU reads
 /// and spin-waits see the GPU writes without clobbering `sent` hashes. The copy runs on `queue`
@@ -1339,7 +1327,32 @@ pub unsafe fn readback_after_execute(queue: &ID3D12CommandQueue, ranges: &[(usiz
     if ranges.is_empty() {
         return;
     }
-    let mut g = STATE.lock().unwrap();
+    readback_locked(queue, ranges, STATE.lock().unwrap());
+}
+
+/// As `readback_after_execute`, but only when the sparse state is free at once. The queue gate
+/// calls this from inside a submission, which XCL's own sparse code can make while it holds the
+/// state: waiting there would wait for this thread itself. A skipped readback is made after the
+/// next submission, and a held item still goes after the gate's timeout.
+pub(super) unsafe fn readback_if_free(queue: &ID3D12CommandQueue, ranges: &[(usize, usize)]) {
+    if ranges.is_empty() {
+        return;
+    }
+    let g = match STATE.try_lock() {
+        Ok(g) => g,
+        Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => {
+            SKIPPED_HELD_READBACKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return;
+        }
+    };
+    readback_locked(queue, ranges, g);
+}
+
+/// Gate readbacks skipped because the sparse state was busy (shown in the gate's telemetry).
+pub(super) static SKIPPED_HELD_READBACKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+unsafe fn readback_locked(queue: &ID3D12CommandQueue, ranges: &[(usize, usize)], mut g: std::sync::MutexGuard<'_, Option<State>>) {
     let Some(s) = g.as_mut() else { return };
     let mut filtered: Vec<(usize, usize)> = ranges.iter().copied().filter(|&(a, n)| n > 0 && s.window_index(a).is_some()).collect();
     if filtered.is_empty() {

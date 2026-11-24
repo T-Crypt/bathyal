@@ -287,22 +287,20 @@ fn start_thread() {
     });
 }
 
-/// The addresses the gate still holds a submission for, where they lie in a sparse window:
-/// the GPU's value there is not in the CPU view until a readback puts it there.
-fn held_window_ranges() -> Vec<(usize, usize)> {
-    if !super::sparse::has_windows() {
-        return Vec::new();
-    }
+/// The addresses the gate still holds a submission for. Only the gate's own lock is taken here:
+/// `submit_now` runs inside XCL's sparse code too (a readback's copy on the title's queue, made
+/// while the sparse state is locked), so this must not touch the sparse lock. The readback
+/// keeps only the ranges that lie in a sparse window.
+fn held_wait_ranges() -> Vec<(usize, usize)> {
     let g = GATES.lock().unwrap_or_else(|e| e.into_inner());
     let Some(m) = g.as_ref() else { return Vec::new() };
     let mut out = Vec::new();
     for state in m.values() {
         for item in &state.fifo {
             for w in &item.waits {
-                let va = w.va as usize;
-                let n = w.width as usize;
-                if super::sparse::in_window(va) && !out.contains(&(va, n)) {
-                    out.push((va, n));
+                let r = (w.va as usize, w.width as usize);
+                if !out.contains(&r) {
+                    out.push(r);
                 }
             }
         }
@@ -458,10 +456,15 @@ pub(super) unsafe fn submit_now(queue: usize, lists: &[*mut c_void]) -> i32 {
     // a value a compute shader wrote into a sparse window has no recorded `Write*Value`: read
     // the windows the gate still waits on back after this submission, on this queue, so the
     // next check of the held item sees it
-    let held = held_window_ranges();
-    if !held.is_empty() {
-        if let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&q_raw) {
-            super::sparse::readback_after_execute(q, &held);
+    // XCL's own copies (uploads, readbacks) carry no title wait, and they are made with the
+    // sparse state locked: only the title's submissions read the held windows back, and that
+    // readback never waits for the sparse lock (busy: the next submission reads them back)
+    if !super::title_textures::is_own_work() {
+        let held = held_wait_ranges();
+        if !held.is_empty() {
+            if let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&q_raw) {
+                super::sparse::readback_if_free(q, &held);
+            }
         }
     }
     0
