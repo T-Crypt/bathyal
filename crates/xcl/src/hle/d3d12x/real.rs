@@ -2241,7 +2241,6 @@ fn pc_srv(created: Option<u32>, rd: &D3D12_RESOURCE_DESC, v: Option<&D3D12_SHADE
                     v.Anonymous.Texture2D = D3D12_TEX2D_SRV { MipLevels: u32::MAX, ..Default::default() };
                 }
             }
-            }
             v
         }
     };
