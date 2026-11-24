@@ -1378,6 +1378,8 @@ mod tests {
             XGameSaveCloseProvider(p);
             let _ = std::fs::remove_dir_all(root);
         }
+    }
+
     /// #325: `%` + ASCII + multi-byte UTF-8 must not panic; `%+1` stays literal.
     #[test]
     fn dec_handles_percent_before_non_ascii_and_rejects_signed_hex() {
