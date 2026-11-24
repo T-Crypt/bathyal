@@ -5145,6 +5145,9 @@ unsafe fn fallback_stream(desc: *const u8) -> Option<(Vec<u8>, [usize; 2])> {
         let (psize, palign) = super::null::subobject_payload(ty)?;
         let poff = if palign == 8 { 8 } else { 4 };
         let at = off + poff;
+        if at.checked_add(psize)? > size {
+            return None; // SizeInBytes ends inside the payload
+        }
         let put = |buf: &mut Vec<u8>, b: &[u8]| {
             // no shader: a null pointer – an empty slice's is dangling (0x1), which the driver
             // refused (a retail game's mesh stand-ins, E_INVALIDARG)
@@ -6303,6 +6306,28 @@ mod rect_list_pso_tests {
             assert_eq!(g.PrimitiveTopologyType, D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE);
             assert!(untranslated_stream_desc(desc(&tri), true).is_none());
             assert!(untranslated_stream_desc(desc(&rect), false).is_none());
+        }
+    }
+}
+
+#[cfg(test)]
+mod fallback_stream_tests {
+    use super::*;
+
+    /// A stream whose SizeInBytes ends inside its last subobject's payload (a VS subobject with
+    /// 8 of its 16 bytecode bytes) is not rewritten: None, not a range panic in the device hook
+    /// (which aborts the title). The whole subobject gets the stand-in VS.
+    #[test]
+    fn a_stream_ending_inside_a_payload_is_not_rewritten() {
+        let vs = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS.0 as u64;
+        let stream = [vs, 0x1234, 0x10];
+        unsafe {
+            let cut: [usize; 2] = [16, stream.as_ptr() as usize];
+            assert!(fallback_stream(cut.as_ptr() as *const u8).is_none());
+            let whole: [usize; 2] = [24, stream.as_ptr() as usize];
+            let (buf, size) = fallback_stream(whole.as_ptr() as *const u8).expect("a whole VS subobject");
+            assert_eq!((buf.len(), size), (24, [24, 0]));
+            assert_eq!(u64::from_le_bytes(buf[16..24].try_into().unwrap()), dummy().vs.len() as u64);
         }
     }
 }
