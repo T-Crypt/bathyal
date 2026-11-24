@@ -871,6 +871,34 @@ mod tests {
         assert_eq!(released(standin_b), real_b);
     }
 
+    /// A mesh pipeline's stand-in (`go_background` with `compute = false`, as `build_stream` is
+    /// built) is returned to the title before its build ends. Until then a DispatchMesh finds no
+    /// two-pass parts (`real::two_pass_of` → None) and skips the draw, as a graphics draw with an
+    /// unbuilt stand-in does; once the build lands, the lookup resolves to the real pipeline.
+    #[test]
+    fn a_mesh_pipeline_gets_its_stand_in_before_its_build_ends() {
+        let (standin, real) = (0x7420_0001usize, 0x7420_0002usize);
+        let (tx, rx) = mpsc::channel::<()>();
+        submit_lazy(
+            standin,
+            false,
+            Box::new(move || {
+                let _ = rx.recv_timeout(Duration::from_secs(10));
+                real
+            }),
+        );
+        let b = budget();
+        let t = Instant::now();
+        assert_eq!(resolve_within(standin, Some(Duration::from_millis(100)), 1, &b), standin, "the stand-in goes back at once");
+        assert!(t.elapsed() < Duration::from_secs(2), "the mesh stand-in came back after {:?}", t.elapsed());
+        assert!(is_pending(standin), "still building on a worker");
+        assert!(super::super::real::two_pass_of(standin).is_none(), "DispatchMesh skips while the mesh builds");
+        tx.send(()).unwrap();
+        assert_eq!(resolve_for_draw(standin), real, "the draw after the build uses the real pipeline");
+        assert!(!is_pending(standin));
+        let _ = released(standin);
+    }
+
     /// A pipeline whose shaders were drawn with in an earlier run is built while the title
     /// loads, so its first draw finds it ready within the per-frame bound; one the title never
     /// drew waits for its first use (the lazy stand-in).
