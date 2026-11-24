@@ -22,6 +22,7 @@ use std::ffi::c_void;
 use std::mem::{transmute_copy, ManuallyDrop};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
+#[cfg(test)]
 use std::time::{Duration, Instant};
 
 use windows::core::Interface;
