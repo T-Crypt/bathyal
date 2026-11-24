@@ -475,7 +475,7 @@ unsafe fn run(queue: usize, op: &Op, immediates: &[u64]) -> i32 {
                 std::mem::transmute_copy(&super::real::orig_fn(q_raw, PC_SIGNAL));
             let hr = f(q_raw, *fence as *mut c_void, *value);
             if hr >= 0 {
-                super::fence_x::note_queue_signal(*fence, *value);
+                super::fence_x::note_queue_signal(queue, *fence, *value);
             }
             hr
         }
