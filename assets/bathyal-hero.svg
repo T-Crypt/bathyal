@@ -1,0 +1,122 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 520" width="1200" height="520" role="img" aria-labelledby="zt zd">
+  <title id="zt">Bathyal: Xbox Series X|S programs running on Windows</title>
+  <desc id="zd">A night sky darkening upward to near-black, above a horizon line low in the frame. One bright point sits
+at the top centre: the zenith. A thin halo rings it. From the horizon a faint lattice of straight lines rises and
+converges on that point, one line for each translated GPU program, joined by three shallow arcs. Below the horizon a
+row of monospace measurements states what the project has built: 26,503 GPU programs translated, 8,500 mesh pipelines
+built, 30 fps through the menus. The wordmark Bathyal is centred under the point, with the subtitle Xbox Series X|S
+programs on Windows.</desc>
+  <defs>
+    <linearGradient id="zsky" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#02040a"/>
+      <stop offset="0.5" stop-color="#050912"/>
+      <stop offset="0.82" stop-color="#0a1120"/>
+      <stop offset="1" stop-color="#0e1729"/>
+    </linearGradient>
+    <radialGradient id="zhalo" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0" stop-color="#9fb4ff" stop-opacity="0.5"/>
+      <stop offset="0.35" stop-color="#8fa8ff" stop-opacity="0.16"/>
+      <stop offset="1" stop-color="#8fa8ff" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="zground" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0" stop-color="#8fa8ff" stop-opacity="0.1"/>
+      <stop offset="1" stop-color="#8fa8ff" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="zhz" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#9fb4ff" stop-opacity="0"/>
+      <stop offset="0.2" stop-color="#c9d5ff" stop-opacity="0.55"/>
+      <stop offset="0.5" stop-color="#ffffff" stop-opacity="0.95"/>
+      <stop offset="0.8" stop-color="#c9d5ff" stop-opacity="0.55"/>
+      <stop offset="1" stop-color="#9fb4ff" stop-opacity="0"/>
+    </linearGradient>
+    <linearGradient id="zbeam" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#9fb4ff" stop-opacity="0.34"/>
+      <stop offset="1" stop-color="#9fb4ff" stop-opacity="0.02"/>
+    </linearGradient>
+    <filter id="zglow" x="-200%" y="-200%" width="500%" height="500%">
+      <feGaussianBlur stdDeviation="3.2" result="b"/>
+      <feMerge>
+        <feMergeNode in="b"/>
+        <feMergeNode in="b"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+    <filter id="zsoft" x="-10%" y="-400%" width="120%" height="900%">
+      <feGaussianBlur stdDeviation="2.4" result="b"/>
+      <feMerge>
+        <feMergeNode in="b"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+    <linearGradient id="zlat" gradientUnits="userSpaceOnUse" x1="0" y1="432" x2="0" y2="86">
+      <stop offset="0" stop-color="#8fa8ff" stop-opacity="0.02"/>
+      <stop offset="0.45" stop-color="#8fa8ff" stop-opacity="0.1"/>
+      <stop offset="1" stop-color="#c9d5ff" stop-opacity="0.22"/>
+    </linearGradient>
+    <clipPath id="zskyClip">
+      <rect x="0" y="0" width="1200" height="430"/>
+    </clipPath>
+  </defs>
+
+  <!-- night sky -->
+  <rect width="1200" height="520" fill="url(#zsky)"/>
+  <ellipse cx="600" cy="430" rx="620" ry="120" fill="url(#zground)"/>
+
+  <!-- lattice of translated programs: horizon to zenith -->
+  <g clip-path="url(#zskyClip)" stroke="url(#zlat)" stroke-width="0.8" fill="none">
+    <g>
+      <line x1="40" y1="430" x2="600" y2="86"/>
+      <line x1="120" y1="430" x2="600" y2="86"/>
+      <line x1="200" y1="430" x2="600" y2="86"/>
+      <line x1="280" y1="430" x2="600" y2="86"/>
+      <line x1="352" y1="430" x2="600" y2="86"/>
+      <line x1="424" y1="430" x2="600" y2="86"/>
+      <line x1="492" y1="430" x2="600" y2="86"/>
+      <line x1="546" y1="430" x2="600" y2="86"/>
+      <line x1="580" y1="430" x2="600" y2="86"/>
+      <line x1="620" y1="430" x2="600" y2="86"/>
+      <line x1="654" y1="430" x2="600" y2="86"/>
+      <line x1="708" y1="430" x2="600" y2="86"/>
+      <line x1="776" y1="430" x2="600" y2="86"/>
+      <line x1="848" y1="430" x2="600" y2="86"/>
+      <line x1="920" y1="430" x2="600" y2="86"/>
+      <line x1="1000" y1="430" x2="600" y2="86"/>
+      <line x1="1080" y1="430" x2="600" y2="86"/>
+      <line x1="1160" y1="430" x2="600" y2="86"/>
+    </g>
+    <g stroke-opacity="0.9">
+      <path d="M372 306 Q 600 268 828 306"/>
+      <path d="M420 226 Q 600 194 780 226"/>
+      <path d="M462 156 Q 600 134 738 156"/>
+      <path d="M494 116 Q 600 100 706 116"/>
+    </g>
+  </g>
+
+  <!-- the axis and the measured point overhead -->
+  <line x1="600" y1="86" x2="600" y2="430" stroke="url(#zbeam)" stroke-width="1" stroke-dasharray="2 10"/>
+  <circle cx="600" cy="86" r="104" fill="url(#zhalo)"/>
+  <circle cx="600" cy="86" r="30" fill="none" stroke="#9fb4ff" stroke-opacity="0.4" stroke-width="0.8"/>
+  <circle cx="600" cy="86" r="7.5" fill="#eaf0ff" filter="url(#zglow)"/>
+  <circle cx="600" cy="86" r="2.4" fill="#ffffff"/>
+
+  <!-- horizon, low in the frame -->
+  <g filter="url(#zsoft)">
+    <line x1="0" y1="430" x2="1200" y2="430" stroke="url(#zhz)" stroke-width="1.8"/>
+  </g>
+  <line x1="60" y1="435" x2="1140" y2="435" stroke="#9fb4ff" stroke-opacity="0.16" stroke-width="0.7"/>
+  <rect x="0" y="430" width="1200" height="90" fill="#02040a" opacity="0.45"/>
+
+  <!-- wordmark and subtitle -->
+  <g font-family="system-ui, sans-serif" text-anchor="middle">
+    <text x="600" y="322" font-size="76" font-weight="600" letter-spacing="-1.5" fill="#eef2ff">Bathyal</text>
+    <text x="600" y="362" font-size="24" fill="#b9c6f0">Xbox Series X|S programs on Windows</text>
+  </g>
+
+  <!-- measured facts -->
+  <line x1="80" y1="452" x2="1120" y2="452" stroke="#9fb4ff" stroke-opacity="0.12" stroke-width="1"/>
+  <g font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="13" text-anchor="middle" fill="#cfd8ff">
+    <text x="320" y="478">26,503 GPU programs translated</text>
+    <text x="600" y="478">8,500 mesh pipelines built</text>
+    <text x="880" y="478">30 fps through the menus</text>
+  </g>
+</svg>
