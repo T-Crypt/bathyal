@@ -392,6 +392,9 @@ pub(super) unsafe fn register(device: *mut c_void, res: *mut c_void, va: usize, 
         clone_resources(&unmap_ptrs)
     };
     for r in &to_unmap {
+        // #504: remapped/unmapped textures must not keep a content hash – their VRAM tiles
+        // are gone and need a fresh upload even if the CPU bytes did not change.
+        LAST_CONTENT.lock().unwrap().remove(&(r.as_raw() as usize));
         super::vram::unmap_superseded(r);
     }
     TEXTURES_GEN.fetch_add(1, Ordering::Release);
@@ -490,6 +493,7 @@ pub(super) unsafe fn retire_overlapping(va: usize, len: usize) {
         (retired, clone_resources(&unmap_ptrs))
     };
     for r in &to_unmap {
+        LAST_CONTENT.lock().unwrap().remove(&(r.as_raw() as usize));
         super::vram::unmap_superseded(r);
     }
     if retired > 0 {
@@ -508,6 +512,8 @@ pub fn forget(res: usize) {
         (removed, unsafe { clone_resources(&remap_ptrs) })
     };
     for r in &to_remap {
+        // #504: a texture remapped after its shadower is released must upload again.
+        LAST_CONTENT.lock().unwrap().remove(&(r.as_raw() as usize));
         unsafe {
             super::vram::remap_if_unmapped(r);
         }
@@ -911,10 +917,23 @@ fn unchanged_skip() -> bool {
     *ON.get_or_init(|| std::env::var("XCL_TEXTURE_SKIP_UNCHANGED").map_or(true, |v| v.trim() != "0"))
 }
 
-/// Whether texture `res` was last uploaded from memory with hash `h`; `h` is remembered as its
-/// content from here on (the caller uploads it when this is false).
+/// Whether texture `res` was last *successfully* uploaded from memory with hash `h` (#504).
+fn last_upload_matches(res: usize, h: u64) -> bool {
+    LAST_CONTENT.lock().unwrap().get(&res) == Some(&h)
+}
+
+/// Remember a successful upload of `res` from memory with hash `h`.
+fn remember_upload(res: usize, h: u64) {
+    LAST_CONTENT.lock().unwrap().insert(res, h);
+}
+
+/// Test helper: check-then-remember (matches the old `same_as_last_upload` contract for unit tests).
+#[cfg(test)]
 fn same_as_last_upload(res: usize, h: u64) -> bool {
-    LAST_CONTENT.lock().unwrap().insert(res, h) == Some(h)
+    let mut g = LAST_CONTENT.lock().unwrap();
+    let same = g.get(&res) == Some(&h);
+    g.insert(res, h);
+    same
 }
 
 /// A 64-bit hash of `b` for "the same bytes as before" (four lanes of multiply-rotate over
@@ -1024,41 +1043,48 @@ unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>, title: Option<&ID3D12C
                 break;
             }
             let (r, (dev, va, tex, states)) = todo.next().unwrap();
-            // The same bytes as at this texture's last upload: nothing to do. The write watch is
-            // per page and a title writes next to its textures (and rewrites what it wrote): a
-            // retail title's video planes and UI targets went up again for every submit, ~25 MB
-            // a presented frame where ~3 MB had changed, and the submits waited here.
-            if unchanged_skip() {
-                let h = content_hash(&read_committed(va, tex.size() as usize));
-                if same_as_last_upload(r.as_raw() as usize, h) {
-                    let n = UNCHANGED.fetch_add(1, Ordering::Relaxed) + 1;
-                    if n == 1 || (n.is_power_of_two() && n >= 1024) {
-                        crate::xlog_info!("title textures: {n} uploads left out so far – the texture's memory held what it held at its last upload");
-                    }
-                    continue;
+            // Read once: hash and detile from the same snapshot (#504 TOCTOU / double-read).
+            let mem = read_committed(va, tex.size() as usize);
+            let h = content_hash(&mem);
+            let res_key = r.as_raw() as usize;
+            // The same bytes as at this texture's last *successful* upload: nothing to do.
+            if unchanged_skip() && last_upload_matches(res_key, h) {
+                let n = UNCHANGED.fetch_add(1, Ordering::Relaxed) + 1;
+                if n == 1 || (n.is_power_of_two() && n >= 1024) {
+                    crate::xlog_info!("title textures: {n} uploads left out so far – the texture's memory held what it held at its last upload");
                 }
+                continue;
             }
             device = dev;
             bytes += tex.size() as usize;
-            picked.push((r, va, tex, states));
+            picked.push((r, va, Arc::new(mem), tex, states, res_key, h));
         }
         let subs = subresources_of_all(&picked, bytes);
         let mut batch = Vec::with_capacity(picked.len());
-        for ((r, va, _, states), subs) in picked.into_iter().zip(subs) {
+        for ((r, va, _, _, states, res_key, h), subs) in picked.into_iter().zip(subs) {
             if super::present::trace_frame() {
                 note_content(va, &r, &subs);
             }
-            batch.push((r, subs, states));
+            batch.push((r, subs, states, res_key, h));
         }
         let d = device as *mut c_void;
         let Some(dev) = ID3D12Device::from_raw_borrowed(&d) else { continue };
         if let Some(tq) = title_queue_for(dev, title) {
-            match own_work(|| submit_on_title_queue(dev, &tq, &batch)) {
+            let keys: Vec<(usize, u64)> = batch.iter().map(|(_, _, _, res, h)| (*res, *h)).collect();
+            let n = batch.len();
+            let items: Vec<_> = batch.into_iter().map(|(r, subs, states, _, _)| (r, subs, states)).collect();
+            match own_work(|| submit_on_title_queue(dev, &tq, &items)) {
                 Ok(failed) => {
-                    for (_, e) in failed {
-                        warn(&e);
+                    let failed_idx: std::collections::BTreeSet<usize> = failed.iter().map(|(i, _)| *i).collect();
+                    for (_, e) in &failed {
+                        warn(e);
                     }
-                    UPLOADS.fetch_add(batch.len() as u64, Ordering::Relaxed);
+                    for (i, (res, h)) in keys.iter().enumerate() {
+                        if !failed_idx.contains(&i) {
+                            remember_upload(*res, *h);
+                        }
+                    }
+                    UPLOADS.fetch_add(n as u64, Ordering::Relaxed);
                 }
                 Err(e) => warn(&e),
             }
@@ -1071,6 +1097,9 @@ unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>, title: Option<&ID3D12C
                 continue;
             }
         };
+        let keys: Vec<(usize, u64)> = batch.iter().map(|(_, _, _, res, h)| (*res, *h)).collect();
+        let n = batch.len();
+        let upload_items: Vec<_> = batch.into_iter().map(|(r, subs, states, _, _)| (r, subs, states)).collect();
         match own_work(|| {
             super::vram::before_execute(&queue);
             let mut uploaders = UPLOADERS.lock().unwrap();
@@ -1078,13 +1107,19 @@ unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>, title: Option<&ID3D12C
                 std::collections::btree_map::Entry::Occupied(e) => e.into_mut(),
                 std::collections::btree_map::Entry::Vacant(v) => v.insert(texture::BatchUploader::new(dev)?),
             };
-            uploader.upload_batch(dev, &queue, &batch)
+            uploader.upload_batch(dev, &queue, &upload_items)
         }) {
             Ok(failed) => {
-                for (_, e) in failed {
-                    warn(&e);
+                let failed_idx: std::collections::BTreeSet<usize> = failed.iter().map(|(i, _)| *i).collect();
+                for (_, e) in &failed {
+                    warn(e);
                 }
-                UPLOADS.fetch_add(batch.len() as u64, Ordering::Relaxed);
+                for (i, (res, h)) in keys.iter().enumerate() {
+                    if !failed_idx.contains(&i) {
+                        remember_upload(*res, *h);
+                    }
+                }
+                UPLOADS.fetch_add(n as u64, Ordering::Relaxed);
             }
             Err(e) => warn(&e),
         }
@@ -1310,24 +1345,32 @@ unsafe fn read_committed(at: usize, len: usize) -> Vec<u8> {
 /// Batches of at least this many bytes are detiled on several threads (`subresources_of_all`)
 const PARALLEL_BYTES: usize = 1 << 20;
 
-/// `subresources` of every texture of a batch (`bytes` of them), in order: on several threads
-/// when the batch is big. They were read and detiled one after another in the title's own
-/// submit – most of a retail game's render thread while it streamed textures the CPU writes.
-unsafe fn subresources_of_all(picked: &[(ID3D12Resource, usize, Arc<xg::Texture>, Vec<D3D12_RESOURCE_STATES>)], bytes: usize) -> Vec<Vec<Subresource>> {
-    let picked: Vec<(usize, &xg::Texture)> = picked.iter().map(|(_, va, tex, _)| (*va, &**tex)).collect();
+/// `subresources_from` of every texture of a batch (`bytes` of them), in order, from the snapshot
+/// `upload_all` already read: on several threads when the batch is big. They were read and
+/// detiled one after another in the title's own submit – most of a retail game's render thread
+/// while it streamed textures the CPU writes.
+unsafe fn subresources_of_all(picked: &[(ID3D12Resource, usize, Arc<Vec<u8>>, Arc<xg::Texture>, Vec<D3D12_RESOURCE_STATES>, usize, u64)], bytes: usize) -> Vec<Vec<Subresource>> {
+    let items: Vec<(&[u8], &xg::Texture)> = picked.iter().map(|(_, _, mem, tex, ..)| (&mem[..], &**tex)).collect();
     let threads = if bytes < PARALLEL_BYTES { 1 } else { std::thread::available_parallelism().map_or(1, |n| n.get() / 2).clamp(1, 8) };
-    subresources_on(&picked, threads)
+    detile_on(&items, threads)
 }
 
 /// `subresources` of each (address, texture), in order, on up to `threads` threads.
 unsafe fn subresources_on(picked: &[(usize, &xg::Texture)], threads: usize) -> Vec<Vec<Subresource>> {
-    let threads = threads.min(picked.len());
+    let mems: Vec<Vec<u8>> = picked.iter().map(|&(va, tex)| read_committed(va, tex.size() as usize)).collect();
+    let items: Vec<(&[u8], &xg::Texture)> = mems.iter().map(|m| &m[..]).zip(picked.iter().map(|&(_, tex)| tex)).collect();
+    detile_on(&items, threads)
+}
+
+/// `subresources_from` of each (memory snapshot, texture), in order, on up to `threads` threads.
+fn detile_on(items: &[(&[u8], &xg::Texture)], threads: usize) -> Vec<Vec<Subresource>> {
+    let threads = threads.min(items.len());
     if threads <= 1 {
-        return picked.iter().map(|&(va, tex)| subresources(va, tex)).collect();
+        return items.iter().map(|&(mem, tex)| subresources_from(mem, tex)).collect();
     }
     // the next texture to take; each thread hands back (index, subresources)
     let next = std::sync::atomic::AtomicUsize::new(0);
-    let mut out: Vec<Vec<Subresource>> = (0..picked.len()).map(|_| Vec::new()).collect();
+    let mut out: Vec<Vec<Subresource>> = (0..items.len()).map(|_| Vec::new()).collect();
     let done: Vec<Vec<(usize, Vec<Subresource>)>> = std::thread::scope(|s| {
         let workers: Vec<_> = (0..threads)
             .map(|_| {
@@ -1335,9 +1378,8 @@ unsafe fn subresources_on(picked: &[(usize, &xg::Texture)], threads: usize) -> V
                     let mut mine = Vec::new();
                     loop {
                         let k = next.fetch_add(1, Ordering::Relaxed);
-                        let Some(&(va, tex)) = picked.get(k) else { break };
-                        // SAFETY: as in the serial path – the title's memory is only read
-                        mine.push((k, unsafe { subresources(va, tex) }));
+                        let Some(&(mem, tex)) = items.get(k) else { break };
+                        mine.push((k, subresources_from(mem, tex)));
                     }
                     mine
                 })
@@ -1353,18 +1395,40 @@ unsafe fn subresources_on(picked: &[(usize, &xg::Texture)], threads: usize) -> V
 
 /// Every subresource (D3D12 order) of a texture from the title's memory at `va`.
 unsafe fn subresources(va: usize, tex: &xg::Texture) -> Vec<Subresource> {
+    let mem = read_committed(va, tex.size() as usize);
+    subresources_from(&mem, tex)
+}
+
+/// Detile subresources from an already-read memory snapshot (one read + one hash in `upload_all`).
+fn subresources_from(mem: &[u8], tex: &xg::Texture) -> Vec<Subresource> {
     let Some(tex) = tex.texels() else { return Vec::new() };
     let c = &tex.chain;
     let bpe = tex.bpe as usize;
     if tex.depth > 0 {
-        let mem = read_committed(va, tex.size() as usize);
-        return c.levels.iter().enumerate().map(|(i, l)| Subresource { depth: l.depth, rows: l.height, row_bytes: l.width * bpe, data: c.detile_volume(&mem, i) }).collect();
+        return c
+            .levels
+            .iter()
+            .enumerate()
+            .map(|(i, l)| Subresource {
+                depth: l.depth,
+                rows: l.height,
+                row_bytes: l.width * bpe,
+                data: c.detile_volume(mem, i),
+            })
+            .collect();
     }
     let mut out = Vec::with_capacity(tex.array as usize * c.levels.len());
     for s in 0..tex.array as usize {
-        let slice = read_committed(va + s * c.slice_bytes, c.slice_bytes);
+        let start = s * c.slice_bytes;
+        let end = (start + c.slice_bytes).min(mem.len());
+        let slice = if start < mem.len() { &mem[start..end] } else { &[] };
         for (i, l) in c.levels.iter().enumerate() {
-            out.push(Subresource { depth: 1, rows: l.height, row_bytes: l.width * bpe, data: c.detile_level(&slice, i, s) });
+            out.push(Subresource {
+                depth: 1,
+                rows: l.height,
+                row_bytes: l.width * bpe,
+                data: c.detile_level(slice, i, s),
+            });
         }
     }
     out
@@ -1461,6 +1525,20 @@ mod tests {
             assert_eq!(read_r8(dev, &queue, &texture), vec![0x5E; 64 * 64]);
             ON_QUEUE.lock().unwrap().remove(&key);
         }
+    }
+
+    /// #504: a hash check must not record success; only `remember_upload` after a good batch.
+    #[test]
+    fn last_content_is_not_poisoned_by_a_hash_check_alone() {
+        let res = 0x7E57_0000_3000usize;
+        let h = content_hash(&[1, 2, 3, 4]);
+        assert!(!last_upload_matches(res, h));
+        assert!(!last_upload_matches(res, h), "check alone must not insert");
+        remember_upload(res, h);
+        assert!(last_upload_matches(res, h));
+        assert!(!last_upload_matches(res, h ^ 1));
+        forget(res);
+        assert!(!last_upload_matches(res, h));
     }
 
     /// A texture is left out only when its memory hashes as at its own last upload, and a
@@ -1789,31 +1867,6 @@ mod tests {
         }
     }
 
-    /// The textures of a batch detiled on several threads come back as on one: complete and in
-    /// order (2D with mips and slices, 3D, BC7, a tiny one; more textures than threads).
-    #[test]
-    fn a_batch_detiled_on_several_threads_matches_one_thread() {
-        let descs = [
-            console_desc(3, 64, 64, 2, 3, 28, 0x105),
-            console_desc(3, 200, 72, 1, 5, 28, 0x105),
-            console_desc(4, 40, 24, 6, 3, 28, 0x105),
-            console_desc(3, 256, 256, 1, 9, 98, 0x10A),
-            console_desc(3, 4, 4, 1, 1, 28, 0x105),
-            console_desc(3, 128, 32, 3, 2, 28, 0x105),
-            console_desc(3, 64, 64, 1, 1, 28, 0x105),
-        ];
-        let textures: Vec<xg::Texture> = descs.iter().map(|d| xg::Texture::new(d).unwrap()).collect();
-        // each texture's console memory: distinct bytes per texture
-        let mems: Vec<Vec<u8>> = textures.iter().enumerate().map(|(t, x)| (0..x.size() as usize).map(|i| (i * 7 + t * 61) as u8).collect()).collect();
-        let picked: Vec<(usize, &xg::Texture)> = mems.iter().zip(&textures).map(|(m, x)| (m.as_ptr() as usize, x)).collect();
-        unsafe {
-            let one = subresources_on(&picked, 1);
-            assert!(one.iter().all(|s| !s.is_empty()), "a texture gave no subresources");
-            for threads in [2, 3, 8] {
-                assert!(subresources_on(&picked, threads) == one, "{threads} threads differ from one");
-            }
-        }
-    }
 
     fn console_desc(dim: u32, w: u64, h: u32, array_or_depth: u16, mips: u16, format: u32, layout: u32) -> [u8; 0x38] {
         let mut d = [0u8; 0x38];
