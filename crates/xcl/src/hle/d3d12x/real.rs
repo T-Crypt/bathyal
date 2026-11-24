@@ -525,20 +525,27 @@ pub fn init() -> Result<String, String> {
                 }
             }
         }
-        // `XCL_DRED=1`: on a device removal the faulting address and the last GPU operations
-        // (logged by `log_device_removed`); no debug layer needed. Opt-in: with it XDefiant
-        // stalled in its first seconds twice.
-        if std::env::var_os("XCL_DRED").is_some() {
-            match crate::gpu::agility::configuration_interface::<ID3D12DeviceRemovedExtendedDataSettings>(
+        // `XCL_DRED=1`: auto-breadcrumbs with context strings and page-fault data, logged on
+        // a device removal by `log_device_removed`; no debug layer needed. Opt-in: with it
+        // XDefiant stalled in its first seconds twice.
+        if std::env::var("XCL_DRED").is_ok_and(|v| v != "0" && !v.is_empty()) {
+            match crate::gpu::agility::configuration_interface::<ID3D12DeviceRemovedExtendedDataSettings1>(
                 &CLSID_D3D12DeviceRemovedExtendedData,
             ) {
                 Ok(d) => {
                     d.SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
                     d.SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+                    d.SetBreadcrumbContextEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+                    crate::xlog_info!("D3D12: DRED on: auto-breadcrumbs with context strings, page-fault data");
                 }
-                Err(e) => {
-                    crate::xlog_warn!("D3D12: DRED requested but unavailable: {e}");
-                }
+                Err(e) => match crate::gpu::agility::configuration_interface::<ID3D12DeviceRemovedExtendedDataSettings>(&CLSID_D3D12DeviceRemovedExtendedData) {
+                    Ok(d) => {
+                        d.SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+                        d.SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+                        crate::xlog_warn!("D3D12: DRED without breadcrumb context strings ({e})");
+                    }
+                    Err(e) => crate::xlog_warn!("D3D12: DRED requested but unavailable: {e}"),
+                },
             }
         }
         let factory: IDXGIFactory6 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(|e| format!("DXGI: {e}"))?;
@@ -3626,6 +3633,8 @@ fn device_is_removed(_this: *mut c_void) -> bool {
 
 fn note_device_removed() {
     PSO_DEVICE_REMOVED.store(true, Ordering::Release);
+    // the first failure that looks like a removal: the driver's DRED data is logged once
+    log_device_removed();
 }
 
 /// Create `desc` (a graphics or compute pipeline desc). A blob saved for `key` is tried
@@ -5839,7 +5848,8 @@ pub fn drain_gpu() {
 }
 
 /// If the device was removed: the reason, DRED's page fault (address, the allocations around
-/// it) and the operations each command list got to – into the log, once.
+/// it) and, for each command list, the ops around the last one that completed – into the log,
+/// once. Every DRED pointer may be null: none is dereferenced unchecked.
 pub fn log_device_removed() {
     static DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     let raw = device_raw();
@@ -5848,38 +5858,155 @@ pub fn log_device_removed() {
     if DONE.swap(true, Ordering::AcqRel) {
         return;
     }
-    crate::xlog_error!("D3D12 device removed: {:#x} {}", e.code().0 as u32, e.message());
+    crate::xlog_warn!("D3D12 device removed: {:#x} {}", e.code().0 as u32, e.message());
     unsafe {
-        let Ok(dred) = dev.cast::<ID3D12DeviceRemovedExtendedData>() else { return };
-        if let Ok(pf) = dred.GetPageFaultAllocationOutput() {
-            let names = |mut n: *const D3D12_DRED_ALLOCATION_NODE| {
-                let mut v = Vec::new();
-                while !n.is_null() && v.len() < 8 {
-                    let a = &*n;
-                    let name = if a.ObjectNameA.is_null() { String::new() } else { std::ffi::CStr::from_ptr(a.ObjectNameA as *const std::ffi::c_char).to_string_lossy().into_owned() };
-                    v.push(format!("type {} {}", a.AllocationType.0, name));
-                    n = a.pNext;
-                }
-                v.join(", ")
-            };
-            let va = pf.PageFaultVA;
-            let window = uma_window_vas().iter().position(|&w| va >= w && va < w + 0x1_0000_0000).map(|k| format!(" = window {k} + {:#x}", va - uma_window_vas()[k])).unwrap_or_default();
-            crate::xlog_error!("DRED page fault at GPU VA {va:#x}{window}; allocations there: [{}]; recently freed: [{}]", names(pf.pHeadExistingAllocationNode), names(pf.pHeadRecentFreedAllocationNode));
+        if let Ok(dred) = dev.cast::<ID3D12DeviceRemovedExtendedData1>() {
+            log_dred1(&dred);
+        } else if let Ok(dred) = dev.cast::<ID3D12DeviceRemovedExtendedData>() {
+            log_dred0(&dred);
+        } else {
+            crate::xlog_warn!("DRED: the device has no ID3D12DeviceRemovedExtendedData interface");
         }
-        if let Ok(bc) = dred.GetAutoBreadcrumbsOutput() {
-            let mut n = bc.pHeadAutoBreadcrumbNode;
-            let mut k = 0;
-            while !n.is_null() && k < 64 {
-                let node = &*n;
-                let count = node.BreadcrumbCount as usize;
-                let done = if node.pLastBreadcrumbValue.is_null() { 0 } else { *node.pLastBreadcrumbValue as usize };
-                if done < count {
-                    let ops: Vec<String> = (done.saturating_sub(3)..(done + 3).min(count)).map(|i| format!("{}{}", if i == done { ">" } else { "" }, (*node.pCommandHistory.add(i)).0)).collect();
-                    crate::xlog_error!("DRED: list {:p} on queue {:p}: {done} of {count} operations done, around: {}", node.pCommandList.as_ref().map_or(std::ptr::null_mut(), |l| l.as_raw()), node.pCommandQueue.as_ref().map_or(std::ptr::null_mut(), |q| q.as_raw()), ops.join(" "));
-                }
-                n = node.pNext;
-                k += 1;
+    }
+}
+
+/// At most this many command lists and allocations are read from the DRED lists.
+const DRED_MAX_NODES: usize = 16;
+const DRED_MAX_ALLOCATIONS: usize = 8;
+
+/// A debug name the driver stored for a command list, queue or allocation: wide first, then
+/// ANSI. Null and empty names are `None`.
+unsafe fn dred_debug_name(wide: windows::core::PCWSTR, ansi: *const u8) -> Option<String> {
+    if !wide.is_null() {
+        if let Ok(s) = wide.to_string() {
+            if !s.is_empty() {
+                return Some(s);
             }
+        }
+    }
+    if !ansi.is_null() {
+        let s = std::ffi::CStr::from_ptr(ansi as *const std::ffi::c_char).to_string_lossy().into_owned();
+        if !s.is_empty() {
+            return Some(s);
+        }
+    }
+    None
+}
+
+/// The first 8 allocation names and types of a DRED list.
+unsafe fn dred_allocations(mut n: *const D3D12_DRED_ALLOCATION_NODE1) -> String {
+    let mut v = Vec::new();
+    while !n.is_null() && v.len() < DRED_MAX_ALLOCATIONS {
+        let a = &*n;
+        let name = dred_debug_name(a.ObjectNameW, a.ObjectNameA).unwrap_or_else(|| "(unnamed)".to_string());
+        v.push(format!("type {} {name}", a.AllocationType.0));
+        n = a.pNext;
+    }
+    if v.is_empty() {
+        "(none)".to_string()
+    } else {
+        v.join(", ")
+    }
+}
+
+/// The page fault line, in the UMA window terms the rest of the log uses.
+unsafe fn log_dred_page_fault(va: u64, existing: String, freed: String) {
+    let window = uma_window_vas().iter().position(|&w| va >= w && va < w + 0x1_0000_0000).map(|k| format!(" = window {k} + {:#x}", va - uma_window_vas()[k])).unwrap_or_default();
+    crate::xlog_warn!("DRED page fault at GPU VA {va:#x}{window}; allocations there: [{existing}]; recently freed: [{freed}]");
+}
+
+/// Breadcrumb output of `ID3D12DeviceRemovedExtendedData1`: debug names and the context strings
+/// of each node.
+unsafe fn log_dred1(dred: &ID3D12DeviceRemovedExtendedData1) {
+    match dred.GetPageFaultAllocationOutput1() {
+        Ok(pf) => log_dred_page_fault(pf.PageFaultVA, dred_allocations(pf.pHeadExistingAllocationNode), dred_allocations(pf.pHeadRecentFreedAllocationNode)),
+        Err(e) => crate::xlog_warn!("DRED: GetPageFaultAllocationOutput1 failed: {e}"),
+    }
+    let bc = match dred.GetAutoBreadcrumbsOutput1() {
+        Ok(bc) => bc,
+        Err(e) => {
+            crate::xlog_warn!("DRED: GetAutoBreadcrumbsOutput1 failed: {e}");
+            return;
+        }
+    };
+    let mut n = bc.pHeadAutoBreadcrumbNode;
+    let mut k = 0;
+    while !n.is_null() && k < DRED_MAX_NODES {
+        let node = &*n;
+        let list = dred_debug_name(node.pCommandListDebugNameW, node.pCommandListDebugNameA).unwrap_or_else(|| format!("{:p}", node.pCommandList.as_ref().map_or(std::ptr::null_mut(), |l| l.as_raw())));
+        let queue = dred_debug_name(node.pCommandQueueDebugNameW, node.pCommandQueueDebugNameA).unwrap_or_else(|| format!("{:p}", node.pCommandQueue.as_ref().map_or(std::ptr::null_mut(), |q| q.as_raw())));
+        let count = (node.BreadcrumbCount as usize).min(1 << 16);
+        let done = if node.pLastBreadcrumbValue.is_null() { None } else { Some(*node.pLastBreadcrumbValue) };
+        let window = match done {
+            Some(d) if count > 0 && !node.pCommandHistory.is_null() => {
+                let ops = std::slice::from_raw_parts(node.pCommandHistory as *const i32, count);
+                format!(", around: {}", super::dred::breadcrumb_window(ops, d))
+            }
+            _ => String::new(),
+        };
+        let contexts = if node.pBreadcrumbContexts.is_null() || node.BreadcrumbContextsCount == 0 {
+            String::new()
+        } else {
+            let mut c = Vec::new();
+            for j in 0..(node.BreadcrumbContextsCount as usize).min(DRED_MAX_NODES) {
+                let ctx = &*node.pBreadcrumbContexts.add(j);
+                let s = if ctx.pContextString.is_null() { None } else { ctx.pContextString.to_string().ok() };
+                c.push(format!("{}:{}", ctx.BreadcrumbIndex, s.filter(|s| !s.is_empty()).unwrap_or_else(|| "(null)".to_string())));
+            }
+            format!("; contexts [{}]", c.join(", "))
+        };
+        let done = done.map(|d| d.to_string()).unwrap_or_else(|| "unknown".to_string());
+        crate::xlog_warn!("DRED: command list {list}, queue {queue}: BreadcrumbCount {count}, last completed {done}{window}{contexts}");
+        n = node.pNext;
+        k += 1;
+    }
+    if n.is_null() && k == 0 {
+        crate::xlog_warn!("DRED: no auto-breadcrumb nodes");
+    } else if !n.is_null() {
+        crate::xlog_warn!("DRED: more than {DRED_MAX_NODES} breadcrumb nodes, the rest not read");
+    }
+}
+
+/// Breadcrumb output of `ID3D12DeviceRemovedExtendedData` (no context strings).
+unsafe fn log_dred0(dred: &ID3D12DeviceRemovedExtendedData) {
+    if let Ok(pf) = dred.GetPageFaultAllocationOutput() {
+        let names = |mut n: *const D3D12_DRED_ALLOCATION_NODE| {
+            let mut v = Vec::new();
+            while !n.is_null() && v.len() < DRED_MAX_ALLOCATIONS {
+                let a = &*n;
+                let name = dred_debug_name(a.ObjectNameW, a.ObjectNameA).unwrap_or_else(|| "(unnamed)".to_string());
+                v.push(format!("type {} {name}", a.AllocationType.0));
+                n = a.pNext;
+            }
+            if v.is_empty() { "(none)".to_string() } else { v.join(", ") }
+        };
+        log_dred_page_fault(pf.PageFaultVA, names(pf.pHeadExistingAllocationNode), names(pf.pHeadRecentFreedAllocationNode));
+    }
+    if let Ok(bc) = dred.GetAutoBreadcrumbsOutput() {
+        let mut n = bc.pHeadAutoBreadcrumbNode;
+        let mut k = 0;
+        while !n.is_null() && k < DRED_MAX_NODES {
+            let node = &*n;
+            let list = dred_debug_name(node.pCommandListDebugNameW, node.pCommandListDebugNameA).unwrap_or_else(|| format!("{:p}", node.pCommandList.as_ref().map_or(std::ptr::null_mut(), |l| l.as_raw())));
+            let queue = dred_debug_name(node.pCommandQueueDebugNameW, node.pCommandQueueDebugNameA).unwrap_or_else(|| format!("{:p}", node.pCommandQueue.as_ref().map_or(std::ptr::null_mut(), |q| q.as_raw())));
+            let count = (node.BreadcrumbCount as usize).min(1 << 16);
+            let done = if node.pLastBreadcrumbValue.is_null() { None } else { Some(*node.pLastBreadcrumbValue) };
+            let window = match done {
+                Some(d) if count > 0 && !node.pCommandHistory.is_null() => {
+                    let ops = std::slice::from_raw_parts(node.pCommandHistory as *const i32, count);
+                    format!(", around: {}", super::dred::breadcrumb_window(ops, d))
+                }
+                _ => String::new(),
+            };
+            let done = done.map(|d| d.to_string()).unwrap_or_else(|| "unknown".to_string());
+            crate::xlog_warn!("DRED: command list {list}, queue {queue}: BreadcrumbCount {count}, last completed {done}{window}");
+            n = node.pNext;
+            k += 1;
+        }
+        if n.is_null() && k == 0 {
+            crate::xlog_warn!("DRED: no auto-breadcrumb nodes");
+        } else if !n.is_null() {
+            crate::xlog_warn!("DRED: more than {DRED_MAX_NODES} breadcrumb nodes, the rest not read");
         }
     }
 }
