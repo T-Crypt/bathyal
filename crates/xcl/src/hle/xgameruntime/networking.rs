@@ -64,18 +64,26 @@ static NEXT_TOKEN: AtomicU64 = AtomicU64::new(1);
 // UDP multiplayer port
 // ---------------------------------------------------------------------------------------
 
+/// # Safety
+/// `port` must be null or a valid, aligned, writable pointer to a `u16`.
 pub unsafe extern "system" fn XNetworkingQueryPreferredLocalUdpMultiplayerPort(port: *mut u16) -> HRESULT {
     if port.is_null() {
         return E_INVALIDARG;
     }
+    // SAFETY: `port` is non-null and caller guarantees it points to a valid, writable `u16`.
     *port = DEFAULT_UDP_PORT;
     S_OK
 }
 
+/// # Safety
+/// `b` must be null or a valid pointer to an initialized `XAsyncBlock` with a valid task queue.
 pub unsafe extern "system-unwind" fn XNetworkingQueryPreferredLocalUdpMultiplayerPortAsync(b: *mut XAsyncBlock) -> HRESULT {
+    // SAFETY: Caller guarantees `b` satisfies `begin_with`'s preconditions.
     begin_with(b, &UDP_PORT_ID as *const u8 as usize, || Ok(DEFAULT_UDP_PORT.to_le_bytes().to_vec()))
 }
 
+/// # Safety
+/// `b` must be a valid completed `XAsyncBlock`, and `port` must be null or writable for `u16`.
 pub unsafe extern "system-unwind" fn XNetworkingQueryPreferredLocalUdpMultiplayerPortAsyncResult(
     b: *mut XAsyncBlock,
     port: *mut u16,
@@ -83,9 +91,12 @@ pub unsafe extern "system-unwind" fn XNetworkingQueryPreferredLocalUdpMultiplaye
     if port.is_null() {
         return E_INVALIDARG;
     }
+    // SAFETY: `port` is non-null and writable for `size_of::<u16>()` bytes; `b` is validated by caller.
     XAsyncGetResult(b, &UDP_PORT_ID as *const u8 as *const c_void, std::mem::size_of::<u16>(), port as *mut c_void, std::ptr::null_mut())
 }
 
+/// # Safety
+/// `token` must be null or a valid, aligned, writable pointer to a `u64`.
 pub unsafe extern "system" fn XNetworkingRegisterPreferredLocalUdpMultiplayerPortChanged(
     _queue: *mut c_void,
     _ctx: *mut c_void,
@@ -95,10 +106,13 @@ pub unsafe extern "system" fn XNetworkingRegisterPreferredLocalUdpMultiplayerPor
     if token.is_null() {
         return E_INVALIDARG;
     }
+    // SAFETY: `token` is non-null and caller guarantees it points to a valid, writable `u64`.
     *token = NEXT_TOKEN.fetch_add(1, Ordering::Relaxed);
     S_OK
 }
 
+/// # Safety
+/// No pointers are dereferenced; declared `unsafe` to match the GDK C ABI signature.
 pub unsafe extern "system" fn XNetworkingUnregisterPreferredLocalUdpMultiplayerPortChanged(_token: u64, _wait: bool) -> bool {
     true
 }
@@ -119,6 +133,8 @@ fn default_security_info_bytes() -> Vec<u8> {
     out
 }
 
+/// # Safety
+/// `url` must be null or a valid pointer; `b` must be null or a valid `XAsyncBlock`.
 pub unsafe extern "system-unwind" fn XNetworkingQuerySecurityInformationForUrlAsync(
     url: *const u8,
     b: *mut XAsyncBlock,
@@ -126,17 +142,25 @@ pub unsafe extern "system-unwind" fn XNetworkingQuerySecurityInformationForUrlAs
     if url.is_null() {
         return E_INVALIDARG;
     }
+    // SAFETY: Caller guarantees `b` satisfies `begin_with`'s preconditions.
     begin_with(b, &SEC_INFO_ID as *const u8 as usize, || Ok(default_security_info_bytes()))
 }
 
+/// # Safety
+/// `b` and `size` must each be null or valid pointers to an `XAsyncBlock` and a writable `usize`.
 pub unsafe extern "system" fn XNetworkingQuerySecurityInformationForUrlAsyncResultSize(
     b: *mut XAsyncBlock,
     size: *mut usize,
 ) -> HRESULT {
+    // SAFETY: Caller guarantees `b` and `size` satisfy `XAsyncGetResultSize`'s preconditions.
     XAsyncGetResultSize(b, size)
 }
 
 /// Note the GDK parameter order: `buffer_used` precedes `buffer` and `out_ptr`.
+///
+/// # Safety
+/// `b` must be a valid `XAsyncBlock`, `buffer` must be writable for `buffer_size` bytes when non-null,
+/// and `buffer_used` and `out_ptr` must each be null or valid, aligned, writable pointers.
 pub unsafe extern "system-unwind" fn XNetworkingQuerySecurityInformationForUrlAsyncResult(
     b: *mut XAsyncBlock,
     buffer_size: usize,
@@ -144,9 +168,12 @@ pub unsafe extern "system-unwind" fn XNetworkingQuerySecurityInformationForUrlAs
     buffer: *mut u8,
     out_ptr: *mut *mut XNetworkingSecurityInformation,
 ) -> HRESULT {
+    // SAFETY: Caller guarantees `b`, `buffer[..buffer_size]`, `buffer_used`, and `out_ptr` are valid.
     security_info_result(&SEC_INFO_ID as *const u8 as *const c_void, b, buffer_size, buffer_used, buffer, out_ptr)
 }
 
+/// # Safety
+/// `url` must be null or a valid pointer; `b` must be null or a valid `XAsyncBlock`.
 pub unsafe extern "system-unwind" fn XNetworkingQuerySecurityInformationForUrlUtf16Async(
     url: *const u16,
     b: *mut XAsyncBlock,
@@ -154,16 +181,23 @@ pub unsafe extern "system-unwind" fn XNetworkingQuerySecurityInformationForUrlUt
     if url.is_null() {
         return E_INVALIDARG;
     }
+    // SAFETY: Caller guarantees `b` satisfies `begin_with`'s preconditions.
     begin_with(b, &SEC_INFO_UTF16_ID as *const u8 as usize, || Ok(default_security_info_bytes()))
 }
 
+/// # Safety
+/// `b` and `size` must each be null or valid pointers to an `XAsyncBlock` and a writable `usize`.
 pub unsafe extern "system" fn XNetworkingQuerySecurityInformationForUrlUtf16AsyncResultSize(
     b: *mut XAsyncBlock,
     size: *mut usize,
 ) -> HRESULT {
+    // SAFETY: Caller guarantees `b` and `size` satisfy `XAsyncGetResultSize`'s preconditions.
     XAsyncGetResultSize(b, size)
 }
 
+/// # Safety
+/// `b` must be a valid `XAsyncBlock`, `buffer` must be writable for `buffer_size` bytes when non-null,
+/// and `buffer_used` and `out_ptr` must each be null or valid, aligned, writable pointers.
 pub unsafe extern "system-unwind" fn XNetworkingQuerySecurityInformationForUrlUtf16AsyncResult(
     b: *mut XAsyncBlock,
     buffer_size: usize,
@@ -171,9 +205,13 @@ pub unsafe extern "system-unwind" fn XNetworkingQuerySecurityInformationForUrlUt
     buffer: *mut u8,
     out_ptr: *mut *mut XNetworkingSecurityInformation,
 ) -> HRESULT {
+    // SAFETY: Caller guarantees `b`, `buffer[..buffer_size]`, `buffer_used`, and `out_ptr` are valid.
     security_info_result(&SEC_INFO_UTF16_ID as *const u8 as *const c_void, b, buffer_size, buffer_used, buffer, out_ptr)
 }
 
+/// # Safety
+/// `b` must be null or a valid `XAsyncBlock`, `buffer` must be writable for `buffer_size` bytes,
+/// and `buffer_used` and `out_ptr` must each be null or valid, aligned, writable pointers.
 unsafe fn security_info_result(
     identity: *const c_void,
     b: *mut XAsyncBlock,
@@ -183,14 +221,18 @@ unsafe fn security_info_result(
     out_ptr: *mut *mut XNetworkingSecurityInformation,
 ) -> HRESULT {
     if !out_ptr.is_null() {
+        // SAFETY: `out_ptr` is non-null and caller guarantees it is aligned and writable.
         *out_ptr = std::ptr::null_mut();
     }
     let mut used = 0usize;
+    // SAFETY: Caller guarantees `b` and `buffer[..buffer_size]` satisfy `XAsyncGetResult`'s preconditions.
     let hr = XAsyncGetResult(b, identity, buffer_size, buffer as *mut c_void, &mut used);
     if !buffer_used.is_null() {
+        // SAFETY: `buffer_used` is non-null and caller guarantees it is aligned and writable.
         *buffer_used = used;
     }
     if hr >= 0 && !out_ptr.is_null() {
+        // SAFETY: `out_ptr` is valid and `XAsyncGetResult` succeeded into `buffer`.
         *out_ptr = buffer as *mut XNetworkingSecurityInformation;
     }
     hr
@@ -301,24 +343,118 @@ struct CryptoProcs {
 fn crypto_procs() -> Option<&'static CryptoProcs> {
     static PROCS: OnceLock<Option<CryptoProcs>> = OnceLock::new();
     PROCS
-        .get_or_init(|| unsafe {
+        .get_or_init(|| {
             use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryExW, LOAD_LIBRARY_SEARCH_SYSTEM32};
-            let wh = LoadLibraryExW(wide("winhttp.dll").as_ptr(), std::ptr::null_mut(), LOAD_LIBRARY_SEARCH_SYSTEM32);
-            let cr = LoadLibraryExW(wide("crypt32.dll").as_ptr(), std::ptr::null_mut(), LOAD_LIBRARY_SEARCH_SYSTEM32);
+            // SAFETY: Both DLL names are NUL-terminated UTF-16 literals loaded strictly from System32.
+            let (wh, cr) = unsafe {
+                (
+                    LoadLibraryExW(wide("winhttp.dll").as_ptr(), std::ptr::null_mut(), LOAD_LIBRARY_SEARCH_SYSTEM32),
+                    LoadLibraryExW(wide("crypt32.dll").as_ptr(), std::ptr::null_mut(), LOAD_LIBRARY_SEARCH_SYSTEM32),
+                )
+            };
             if wh.is_null() || cr.is_null() {
                 return None;
             }
-            let sym = |h, name: &[u8]| GetProcAddress(h, name.as_ptr()).map(|f| f as usize);
-            Some(CryptoProcs {
-                winhttp_query_option: std::mem::transmute(sym(wh, b"WinHttpQueryOption\0")?),
-                cert_get_chain: std::mem::transmute(sym(cr, b"CertGetCertificateChain\0")?),
-                cert_verify_policy: std::mem::transmute(sym(cr, b"CertVerifyCertificateChainPolicy\0")?),
-                cert_free_chain: std::mem::transmute(sym(cr, b"CertFreeCertificateChain\0")?),
-                cert_free_context: std::mem::transmute(sym(cr, b"CertFreeCertificateContext\0")?),
-                cert_get_prop: std::mem::transmute(sym(cr, b"CertGetCertificateContextProperty\0")?),
-            })
+            // SAFETY: `wh` and `cr` stay loaded for the process lifetime, every symbol name is
+            // NUL-terminated, and each exported function pointer matches its declared ABI signature.
+            unsafe {
+                let sym = |h, name: &[u8]| GetProcAddress(h, name.as_ptr()).map(|f| f as usize);
+                Some(CryptoProcs {
+                    winhttp_query_option: std::mem::transmute(sym(wh, b"WinHttpQueryOption\0")?),
+                    cert_get_chain: std::mem::transmute(sym(cr, b"CertGetCertificateChain\0")?),
+                    cert_verify_policy: std::mem::transmute(sym(cr, b"CertVerifyCertificateChainPolicy\0")?),
+                    cert_free_chain: std::mem::transmute(sym(cr, b"CertFreeCertificateChain\0")?),
+                    cert_free_context: std::mem::transmute(sym(cr, b"CertFreeCertificateContext\0")?),
+                    cert_get_prop: std::mem::transmute(sym(cr, b"CertGetCertificateContextProperty\0")?),
+                })
+            }
         })
         .as_ref()
+}
+
+/// RAII guard for an owned `CERT_CONTEXT` released via `CertFreeCertificateContext`.
+struct CertContextGuard {
+    free: CertFreeContextFn,
+    ptr: *const CertContext,
+}
+
+impl CertContextGuard {
+    /// Wraps a non-null owned `CERT_CONTEXT` pointer, returning `None` if `ptr` is null.
+    ///
+    /// # Safety
+    /// If `ptr` is non-null, it must be an owned `CERT_CONTEXT` valid for release via `free`.
+    unsafe fn new(free: CertFreeContextFn, ptr: *const CertContext) -> Option<Self> {
+        if ptr.is_null() {
+            None
+        } else {
+            Some(Self { free, ptr })
+        }
+    }
+
+    fn as_ptr(&self) -> *const CertContext {
+        self.ptr
+    }
+
+    /// # Safety
+    /// `self.ptr` must point to a readable `CERT_CONTEXT`.
+    unsafe fn cert_store(&self) -> *mut c_void {
+        // SAFETY: `self.ptr` was checked non-null in `new` and remains valid until `Drop`.
+        (*self.ptr).cert_store
+    }
+}
+
+impl Drop for CertContextGuard {
+    fn drop(&mut self) {
+        // SAFETY: `self.ptr` was checked non-null in `new` and is exclusively owned by this guard.
+        unsafe {
+            (self.free)(self.ptr);
+        }
+    }
+}
+
+/// RAII guard for an owned `CERT_CHAIN_CONTEXT` tied to the lifetime of its leaf `CertContextGuard`.
+struct CertChainGuard<'a> {
+    free: CertFreeChainFn,
+    ptr: *const c_void,
+    _cert: std::marker::PhantomData<&'a CertContextGuard>,
+}
+
+impl<'a> CertChainGuard<'a> {
+    /// Wraps a non-null owned `CERT_CHAIN_CONTEXT` pointer, returning `None` if `ptr` is null.
+    ///
+    /// # Safety
+    /// If `ptr` is non-null, it must be an owned `CERT_CHAIN_CONTEXT` valid for release via `free`.
+    unsafe fn new(free: CertFreeChainFn, ptr: *const c_void) -> Option<Self> {
+        if ptr.is_null() {
+            None
+        } else {
+            Some(Self {
+                free,
+                ptr,
+                _cert: std::marker::PhantomData,
+            })
+        }
+    }
+
+    fn as_ptr(&self) -> *const c_void {
+        self.ptr
+    }
+
+    /// # Safety
+    /// `self.ptr` must point to a valid `CERT_CHAIN_CONTEXT` populated by CryptoAPI.
+    unsafe fn certs(&self) -> Vec<*const CertContext> {
+        // SAFETY: `self.ptr` is live and points to a `CERT_CHAIN_CONTEXT` owned by this guard.
+        extract_chain_certs(self.ptr)
+    }
+}
+
+impl<'a> Drop for CertChainGuard<'a> {
+    fn drop(&mut self) {
+        // SAFETY: `self.ptr` was checked non-null in `new` and is exclusively owned by this guard.
+        unsafe {
+            (self.free)(self.ptr);
+        }
+    }
 }
 
 fn win32_failure_hr(err: u32) -> HRESULT {
@@ -362,6 +498,7 @@ fn url_host_and_is_plain_loopback(url: &str) -> (String, bool) {
 unsafe fn sha1_thumbprint(procs: &CryptoProcs, cert: *const CertContext) -> Vec<u8> {
     let mut buf = [0u8; 20];
     let mut len = buf.len() as u32;
+    // SAFETY: `cert` is a valid `CERT_CONTEXT`; `buf` is writable for `len` (20) bytes.
     if (procs.cert_get_prop)(cert, CERT_SHA1_HASH_PROP_ID, buf.as_mut_ptr() as *mut c_void, &mut len) == 0 {
         return Vec::new();
     }
@@ -371,14 +508,19 @@ unsafe fn sha1_thumbprint(procs: &CryptoProcs, cert: *const CertContext) -> Vec<
 /// Extract leaf-to-root certificate contexts from the primary simple chain in `CERT_CHAIN_CONTEXT`.
 unsafe fn extract_chain_certs(chain: *const c_void) -> Vec<*const CertContext> {
     let chain = chain as *const CertChainContext;
+    // SAFETY: Caller guarantees `chain` is null or a valid `CERT_CHAIN_CONTEXT`.
     if chain.is_null() || (*chain).chain_count == 0 || (*chain).chains.is_null() {
         return Vec::new();
     }
+    // SAFETY: `chain_count > 0` and `chains` is non-null, so `*chains` points to the primary `CERT_SIMPLE_CHAIN`.
     let first = *(*chain).chains;
+    // SAFETY: `first` is checked non-null before reading its fields.
     if first.is_null() || (*first).elements.is_null() {
         return Vec::new();
     }
+    // SAFETY: `first` is valid and `elements` points to `element_count` `CERT_CHAIN_ELEMENT` pointers.
     let elements = std::slice::from_raw_parts((*first).elements, (*first).element_count as usize);
+    // SAFETY: Null pointers are filtered out; each remaining element points to a readable `CertChainElement`.
     elements.iter().filter(|e| !e.is_null()).map(|&e| (*e).cert_context).filter(|c| !c.is_null()).collect()
 }
 
@@ -396,6 +538,7 @@ unsafe fn validate_thumbprint_metadata(security_info: *const XNetworkingSecurity
     if security_info.is_null() {
         return Ok(0);
     }
+    // SAFETY: `security_info` is non-null and caller guarantees it points to readable `XNetworkingSecurityInformation`.
     let info = std::ptr::read_unaligned(security_info);
     if info.thumbprint_count == 0 {
         return Ok(0);
@@ -410,6 +553,7 @@ unsafe fn validate_thumbprint_metadata(security_info: *const XNetworkingSecurity
         return Err(());
     }
     for i in 0..info.thumbprint_count {
+        // SAFETY: `info.thumbprints` is non-null, `table_bytes <= isize::MAX`, and caller guarantees `thumbprint_count` readable elements.
         let tp = std::ptr::read_unaligned(info.thumbprints.add(i));
         if tp.thumbprint_buffer.is_null() || tp.thumbprint_buffer_byte_count != SHA1_LEN || tp.thumbprint_type > 2 {
             return Err(());
@@ -419,14 +563,18 @@ unsafe fn validate_thumbprint_metadata(security_info: *const XNetworkingSecurity
 }
 
 unsafe fn check_thumbprints(security_info: *const XNetworkingSecurityInformation, chain_sha1s: &[Vec<u8>]) -> PinCheck {
+    // SAFETY: Caller guarantees `security_info` and its pin metadata are valid to read if non-null.
     let count = match validate_thumbprint_metadata(security_info) {
         Ok(0) => return PinCheck::NoPins,
         Ok(n) => n,
         Err(()) => return PinCheck::InvalidMetadata,
     };
+    // SAFETY: `validate_thumbprint_metadata` succeeded with `count > 0`, so `security_info` is non-null and readable.
     let info = std::ptr::read_unaligned(security_info);
     for i in 0..count {
+        // SAFETY: `i < count` and validation checked bounds and non-null `thumbprint_buffer` of `SHA1_LEN` bytes.
         let tp = std::ptr::read_unaligned(info.thumbprints.add(i));
+        // SAFETY: `tp.thumbprint_buffer` is non-null and caller guarantees `SHA1_LEN` (20) readable bytes.
         let expected = std::slice::from_raw_parts(tp.thumbprint_buffer, SHA1_LEN);
         let matched = match tp.thumbprint_type {
             0 => chain_sha1s.first().is_some_and(|c| c.as_slice() == expected),
@@ -445,10 +593,18 @@ unsafe fn check_thumbprints(security_info: *const XNetworkingSecurityInformation
 ///
 /// Rejects malformed pin metadata (nonzero count with null array, overflowing count,
 /// null or non-20-byte SHA-1 pin buffers, or unknown `XNetworkingThumbprintType` values).
+///
+/// # Safety
+/// If `security_info` is non-null, it and any referenced `XNetworkingThumbprint` entries and
+/// `thumbprint_buffer` slices must be valid and readable for the duration of this call.
 pub unsafe fn verify_thumbprints(security_info: *const XNetworkingSecurityInformation, chain_sha1s: &[Vec<u8>]) -> bool {
+    // SAFETY: Caller guarantees `security_info` and its nested pin buffers satisfy `check_thumbprints`'s preconditions.
     matches!(check_thumbprints(security_info, chain_sha1s), PinCheck::NoPins | PinCheck::Matched)
 }
 
+/// # Safety
+/// `request_handle` must be null or an open WinHTTP request handle (`HINTERNET`), and if
+/// `security_info` is non-null, it and its referenced thumbprint arrays/buffers must be readable.
 pub unsafe extern "system" fn XNetworkingVerifyServerCertificate(
     request_handle: *mut c_void,
     security_info: *const XNetworkingSecurityInformation,
@@ -456,6 +612,7 @@ pub unsafe extern "system" fn XNetworkingVerifyServerCertificate(
     if request_handle.is_null() {
         return E_INVALIDARG;
     }
+    // SAFETY: Caller guarantees `security_info` (if non-null) and its pin descriptors are readable.
     let Ok(pin_count) = validate_thumbprint_metadata(security_info) else {
         return E_INVALIDARG;
     };
@@ -465,7 +622,9 @@ pub unsafe extern "system" fn XNetworkingVerifyServerCertificate(
 
     let mut url_buf = [0u16; 2048];
     let mut url_bytes = (url_buf.len() * 2) as u32;
+    // SAFETY: `request_handle` is non-null; `url_buf` is writable for `url_bytes` bytes.
     if (procs.winhttp_query_option)(request_handle, WINHTTP_OPTION_URL, url_buf.as_mut_ptr() as *mut c_void, &mut url_bytes) == 0 {
+        // SAFETY: `GetLastError` reads thread-local Win32 error state.
         return win32_failure_hr(windows_sys::Win32::Foundation::GetLastError());
     }
     let url_bytes = url_bytes as usize;
@@ -484,18 +643,25 @@ pub unsafe extern "system" fn XNetworkingVerifyServerCertificate(
         return if pin_count > 0 { CERT_E_UNTRUSTEDROOT } else { S_OK };
     }
 
-    let mut cert: *const CertContext = std::ptr::null();
+    let mut cert_ptr: *const CertContext = std::ptr::null();
     let mut cert_size = std::mem::size_of::<*const CertContext>() as u32;
-    if (procs.winhttp_query_option)(
+    // SAFETY: `request_handle` is non-null; `&mut cert_ptr` receives a pointer-sized `CERT_CONTEXT`.
+    let cert = if (procs.winhttp_query_option)(
         request_handle,
         WINHTTP_OPTION_SERVER_CERT_CONTEXT,
-        &mut cert as *mut *const CertContext as *mut c_void,
+        &mut cert_ptr as *mut *const CertContext as *mut c_void,
         &mut cert_size,
     ) == 0
-        || cert.is_null()
     {
+        None
+    } else {
+        // SAFETY: On success `WinHttpQueryOption` yields an owned `CERT_CONTEXT` freed via `cert_free_context`.
+        CertContextGuard::new(procs.cert_free_context, cert_ptr)
+    };
+    let Some(cert) = cert else {
+        // SAFETY: `GetLastError` reads thread-local Win32 error state.
         return win32_failure_hr(windows_sys::Win32::Foundation::GetLastError());
-    }
+    };
 
     let para = CertChainPara {
         cb_size: std::mem::size_of::<CertChainPara>() as u32,
@@ -503,60 +669,65 @@ pub unsafe extern "system" fn XNetworkingVerifyServerCertificate(
         usage_identifier_count: 0,
         usage_identifiers: std::ptr::null(),
     };
-    let mut chain: *const c_void = std::ptr::null();
-    let got_chain = (procs.cert_get_chain)(
+    let mut chain_ptr: *const c_void = std::ptr::null();
+    // SAFETY: `cert` is a live `CERT_CONTEXT`; `para` and `&mut chain_ptr` match `CertGetCertificateChain`.
+    let chain = if (procs.cert_get_chain)(
         std::ptr::null_mut(),
-        cert,
+        cert.as_ptr(),
         std::ptr::null(),
-        (*cert).cert_store,
+        cert.cert_store(),
         &para,
         0,
         std::ptr::null_mut(),
-        &mut chain,
-    ) != 0
-        && !chain.is_null();
-
-    let mut hr = if got_chain {
-        S_OK
+        &mut chain_ptr,
+    ) == 0
+    {
+        None
     } else {
-        win32_failure_hr(windows_sys::Win32::Foundation::GetLastError())
+        // SAFETY: On success `CertGetCertificateChain` yields an owned `CERT_CHAIN_CONTEXT` freed via `cert_free_chain`.
+        CertChainGuard::new(procs.cert_free_chain, chain_ptr)
     };
-    if got_chain {
-        let host_w = wide(&host);
-        let ssl = SslExtraCertChainPolicyPara {
-            cb_size: std::mem::size_of::<SslExtraCertChainPolicyPara>() as u32,
-            auth_type: AUTHTYPE_SERVER,
-            fdw_checks: 0,
-            server_name: host_w.as_ptr(),
-        };
-        let policy_para = CertChainPolicyPara {
-            cb_size: std::mem::size_of::<CertChainPolicyPara>() as u32,
-            flags: 0,
-            extra_policy_para: &ssl as *const SslExtraCertChainPolicyPara as *const c_void,
-        };
-        let mut status = CertChainPolicyStatus {
-            cb_size: std::mem::size_of::<CertChainPolicyStatus>() as u32,
-            error: 0,
-            chain_index: -1,
-            element_index: -1,
-            extra_policy_status: std::ptr::null_mut(),
-        };
-        if (procs.cert_verify_policy)(CERT_CHAIN_POLICY_SSL, chain, &policy_para, &mut status) == 0 {
-            hr = win32_failure_hr(windows_sys::Win32::Foundation::GetLastError());
-        } else if status.error != 0 {
-            hr = policy_status_hr(status.error);
-        } else {
-            let prints: Vec<Vec<u8>> = extract_chain_certs(chain).into_iter().map(|c| sha1_thumbprint(procs, c)).collect();
-            hr = match check_thumbprints(security_info, &prints) {
-                PinCheck::NoPins | PinCheck::Matched => S_OK,
-                PinCheck::Mismatch => CERT_E_UNTRUSTEDROOT,
-                PinCheck::InvalidMetadata => E_INVALIDARG,
-            };
-        }
-        (procs.cert_free_chain)(chain);
+    let Some(chain) = chain else {
+        // SAFETY: `GetLastError` reads thread-local Win32 error state; `cert` drops automatically on return.
+        return win32_failure_hr(windows_sys::Win32::Foundation::GetLastError());
+    };
+
+    let host_w = wide(&host);
+    let ssl = SslExtraCertChainPolicyPara {
+        cb_size: std::mem::size_of::<SslExtraCertChainPolicyPara>() as u32,
+        auth_type: AUTHTYPE_SERVER,
+        fdw_checks: 0,
+        server_name: host_w.as_ptr(),
+    };
+    let policy_para = CertChainPolicyPara {
+        cb_size: std::mem::size_of::<CertChainPolicyPara>() as u32,
+        flags: 0,
+        extra_policy_para: &ssl as *const SslExtraCertChainPolicyPara as *const c_void,
+    };
+    let mut status = CertChainPolicyStatus {
+        cb_size: std::mem::size_of::<CertChainPolicyStatus>() as u32,
+        error: 0,
+        chain_index: -1,
+        element_index: -1,
+        extra_policy_status: std::ptr::null_mut(),
+    };
+    // SAFETY: `chain` is live, `host_w` outlives `ssl`/`policy_para`, and `status` is writable.
+    if (procs.cert_verify_policy)(CERT_CHAIN_POLICY_SSL, chain.as_ptr(), &policy_para, &mut status) == 0 {
+        // SAFETY: `GetLastError` reads thread-local Win32 error state; `chain` then `cert` drop automatically.
+        return win32_failure_hr(windows_sys::Win32::Foundation::GetLastError());
     }
-    (procs.cert_free_context)(cert);
-    hr
+    if status.error != 0 {
+        return policy_status_hr(status.error);
+    }
+
+    // SAFETY: `chain` is live and each extracted `CERT_CONTEXT` stays valid while `chain` lives.
+    let prints: Vec<Vec<u8>> = chain.certs().into_iter().map(|c| sha1_thumbprint(procs, c)).collect();
+    // SAFETY: `security_info` and its pin descriptors were validated by `validate_thumbprint_metadata`.
+    match check_thumbprints(security_info, &prints) {
+        PinCheck::NoPins | PinCheck::Matched => S_OK,
+        PinCheck::Mismatch => CERT_E_UNTRUSTEDROOT,
+        PinCheck::InvalidMetadata => E_INVALIDARG,
+    }
 }
 
 // ---------------------------------------------------------------------------------------
@@ -577,18 +748,24 @@ type GetConnectivityHintFn = unsafe extern "system" fn(*mut NlNetworkConnectivit
 
 fn host_connectivity_hint() -> Option<NlNetworkConnectivityHint> {
     static FN: OnceLock<Option<GetConnectivityHintFn>> = OnceLock::new();
-    let f = (*FN.get_or_init(|| unsafe {
+    let f = (*FN.get_or_init(|| {
         use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryExW, LOAD_LIBRARY_SEARCH_SYSTEM32};
-        let h = LoadLibraryExW(wide("iphlpapi.dll").as_ptr(), std::ptr::null_mut(), LOAD_LIBRARY_SEARCH_SYSTEM32);
+        // SAFETY: `"iphlpapi.dll"` is a NUL-terminated UTF-16 literal loaded strictly from System32.
+        let h = unsafe { LoadLibraryExW(wide("iphlpapi.dll").as_ptr(), std::ptr::null_mut(), LOAD_LIBRARY_SEARCH_SYSTEM32) };
         if h.is_null() {
             return None;
         }
-        GetProcAddress(h, b"GetNetworkConnectivityHint\0".as_ptr()).map(|p| std::mem::transmute(p))
+        // SAFETY: `h` remains loaded for the process lifetime, symbol name is NUL-terminated, and
+        // `GetNetworkConnectivityHint` matches `GetConnectivityHintFn`.
+        unsafe { GetProcAddress(h, b"GetNetworkConnectivityHint\0".as_ptr()).map(|p| std::mem::transmute(p)) }
     }))?;
     let mut hint = NlNetworkConnectivityHint::default();
+    // SAFETY: `f` is `GetNetworkConnectivityHint` and `&mut hint` is a valid, aligned, writable struct.
     if unsafe { f(&mut hint) } == 0 { Some(hint) } else { None }
 }
 
+/// # Safety
+/// `out` must be null or a valid, aligned, writable pointer to an `XNetworkingConnectivityHint`.
 pub unsafe extern "system" fn XNetworkingGetConnectivityHint(out: *mut XNetworkingConnectivityHint) -> HRESULT {
     if out.is_null() {
         return E_INVALIDARG;
@@ -603,6 +780,7 @@ pub unsafe extern "system" fn XNetworkingGetConnectivityHint(out: *mut XNetworki
         Some(c @ 1..=3) => c,
         _ => 1, // Unrestricted
     };
+    // SAFETY: `out` is non-null and caller guarantees it points to a valid, aligned, writable `XNetworkingConnectivityHint`.
     *out = XNetworkingConnectivityHint {
         connectivity_level: level,
         connectivity_cost: cost,
@@ -615,6 +793,8 @@ pub unsafe extern "system" fn XNetworkingGetConnectivityHint(out: *mut XNetworki
     S_OK
 }
 
+/// # Safety
+/// `token` must be null or a valid, aligned, writable pointer to a `u64`.
 pub unsafe extern "system" fn XNetworkingRegisterConnectivityHintChanged(
     _queue: *mut c_void,
     _ctx: *mut c_void,
@@ -624,16 +804,25 @@ pub unsafe extern "system" fn XNetworkingRegisterConnectivityHintChanged(
     if token.is_null() {
         return E_INVALIDARG;
     }
+    // SAFETY: `token` is non-null and caller guarantees it points to a valid, writable `u64`.
     *token = NEXT_TOKEN.fetch_add(1, Ordering::Relaxed);
     S_OK
 }
 
+/// # Safety
+/// No pointers are dereferenced; declared `unsafe` to match the GDK C ABI signature.
 pub unsafe extern "system" fn XNetworkingUnregisterConnectivityHintChanged(_token: u64, _wait: bool) -> bool {
     true
 }
 
 #[cfg(test)]
+#[path = "networking_tests.rs"]
+mod tests;
+
+#[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
+
     use super::*;
     use crate::hle::xgameruntime::xasync::XAsyncGetStatus;
 
@@ -881,6 +1070,46 @@ mod tests {
             };
             assert_eq!(check_thumbprints(&info_wrong_len, &chain), PinCheck::InvalidMetadata);
             assert!(!verify_thumbprints(&info_wrong_len, &chain));
+        }
+    }
+
+    #[test]
+    fn raii_guards_drop_chain_before_context() {
+        thread_local! {
+            static DROP_LOG: RefCell<Vec<&'static str>> = const { RefCell::new(Vec::new()) };
+        }
+
+        unsafe extern "system" fn fake_free_ctx(_ctx: *const CertContext) -> i32 {
+            DROP_LOG.with(|log| log.borrow_mut().push("context"));
+            1
+        }
+
+        unsafe extern "system" fn fake_free_chain(_chain: *const c_void) {
+            DROP_LOG.with(|log| log.borrow_mut().push("chain"));
+        }
+
+        DROP_LOG.with(|log| log.borrow_mut().clear());
+
+        unsafe {
+            assert!(CertContextGuard::new(fake_free_ctx, std::ptr::null()).is_none());
+            assert!(CertChainGuard::new(fake_free_chain, std::ptr::null()).is_none());
+            DROP_LOG.with(|log| assert!(log.borrow().is_empty()));
+
+            let dummy_ctx: CertContext = std::mem::zeroed();
+            let dummy_chain = 0u8;
+            {
+                let ctx = CertContextGuard::new(fake_free_ctx, &dummy_ctx).expect("non-null cert context");
+                let chain = CertChainGuard::new(fake_free_chain, &dummy_chain as *const u8 as *const c_void)
+                    .expect("non-null cert chain");
+                assert_eq!(ctx.as_ptr(), &dummy_ctx as *const CertContext);
+                assert!(ctx.cert_store().is_null());
+                assert_eq!(chain.as_ptr(), &dummy_chain as *const u8 as *const c_void);
+                DROP_LOG.with(|log| assert!(log.borrow().is_empty()));
+            }
+
+            DROP_LOG.with(|log| {
+                assert_eq!(*log.borrow(), vec!["chain", "context"]);
+            });
         }
     }
 }
