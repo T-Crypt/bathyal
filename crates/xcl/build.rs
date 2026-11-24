@@ -28,6 +28,7 @@ fn add(h: &mut u64, bytes: &[u8]) {
 }
 
 
+fn main() {
     // xcl.exe is linked without high-entropy ASLR. With it, Windows places a process's
     // bottom-up allocations around 1-2.5 TiB, above 2^40, and a retail title's BVH builder
     // refuses an acceleration structure there (ivall/xcl#631, #585).
@@ -36,7 +37,7 @@ fn add(h: &mut u64, bytes: &[u8]) {
         Ok("gnu") => println!("cargo:rustc-link-arg-bin=xcl=-Wl,--disable-high-entropy-va"),
         _ => {}
     }
-fn main() {
+
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let mut h = 0xcbf2_9ce4_8422_2325u64;
     add(&mut h, b"xcl-translator-source-v1\0");
