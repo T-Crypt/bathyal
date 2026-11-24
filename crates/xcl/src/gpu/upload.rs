@@ -503,10 +503,6 @@ pub fn ensure_window() -> Option<usize> {
     let h = create(&dev, len)?;
     let index = (h.cpu >> 32) & 3;
     let low = h.cpu & 0xFFFF_FFFF;
-    if index == 0 {
-        crate::xlog_warn!("GPU_UPLOAD window: off – the heap maps into window 0 ({:#x}), which holds 32-bit descriptor tables", h.cpu);
-        return None;
-    }
     if low + len > (1usize << 32) {
         len = ((1usize << 32) - low) / GRAIN * GRAIN;
         if len < (64 << 20) {

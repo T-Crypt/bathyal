@@ -214,7 +214,7 @@ impl Uma {
     /// the upload index. `up` = (index, mapping address, shader base, bytes).
     pub fn for_runtime_upload(size: usize, coherent: usize, up: (usize, usize, u64, usize)) -> Option<Uma> {
         let (w, cpu, va, len) = up;
-        if w == 0 || w >= MAX_WINDOWS {
+        if w >= MAX_WINDOWS {
             return None;
         }
         let c = if w == 3 { 1 } else { 3 };

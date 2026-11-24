@@ -1206,8 +1206,13 @@ fn upload_max() -> usize {
 /// no upload before the submit. None when the window is off, full, or the block is too big.
 pub unsafe fn alloc_upload(size: usize, align: usize) -> Option<usize> {
     let u = crate::gpu::uma::get()?;
-    let (_k, _cpu, _va, len) = u.upload_window()?;
+    let (k, _cpu, _va, len) = u.upload_window()?;
     if size == 0 || size > upload_max() || size > len {
+        return None;
+    }
+    // window 0 holds the console descriptor heaps too (32-bit addresses): keep a quarter of
+    // it free for them, or the heaps cannot be made
+    if k == 0 && u.upload_used() + size > len / 4 * 3 {
         return None;
     }
     u.alloc_upload(size, align).map(|p| p as usize)
