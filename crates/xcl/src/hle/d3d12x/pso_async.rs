@@ -486,12 +486,12 @@ pub fn is_pending(pso: usize) -> bool {
 /// How many `xcl-pso-N` workers build pipelines. A worker's cost is mostly the driver's
 /// compile (`Create*PipelineState`), so this is how many driver compiles run at once.
 ///
-/// On NVIDIA the driver compiler keeps one heap lock and its time grows faster than the
-/// program (#156): four creator threads did the work of 3.84, and eight on four cores
-/// finished the same queue no sooner than four, with each program taking longer. Retail
-/// frames also wait in `resolve_for_draw` behind whichever compile holds the lock. So NVIDIA
-/// gets a small fixed count and everything else keeps a worker per core minus one, as
-/// before. `XCL_PSO_THREADS` overrides both.
+/// On NVIDIA the driver compiler is what a worker spends its time in and its time grows
+/// faster than the program (#156): one big retail compute program takes minutes. #156's
+/// measurements disagree about how many creators help: 4.0 on a 4-core 7700K (8 finished the
+/// same queue later than 4), and 3.1 / 5.3 here at 4 / 8. So NVIDIA gets a small fixed count
+/// and everything else keeps a worker per core minus one, as before. `XCL_PSO_THREADS`
+/// overrides both.
 fn pipeline_threads() -> usize {
     static N: OnceLock<usize> = OnceLock::new();
     *N.get_or_init(|| {
@@ -511,11 +511,13 @@ fn workers_for(nvidia: bool, over: Option<usize>, dxc: usize) -> usize {
     }
 }
 
-/// Measured best on an RTX 4090 with the synthetic large programs of
-/// `nv_parallel_driver_compile` (the 5070 Ti and 3080 numbers in #156 agree in direction):
-/// two creators finish a queue of big programs about twice as fast as one, and four finish
-/// it no sooner while each program takes longer.
-const NVIDIA_WORKERS: usize = 2;
+/// Measured best on an RTX 4090 (driver 621.01, i9-14900K) with the large synthetic programs
+/// of `nv_parallel_driver_compile`: 1 / 2 / 4 / 8 creator threads finished the same queue in
+/// 50.0 / 29.7 / 16.5 / 10.1 s, with each program at 8.4 / 9.6 / 9.2 / 10.0 s. So the driver's
+/// compiler is not serialised here and more threads do speed the queue up, but each program
+/// gets slower. 4 is what the slowest machine in #156 (a 4-core 7700K / RTX 5080) measured
+/// best, and it keeps a frame's own pipeline from waiting behind seven other compiles.
+const NVIDIA_WORKERS: usize = 4;
 
 /// How many uncached driver compiles may run at once. Each one fans out across the GPU
 /// driver's own compiler, so a few of them already fill the machine; more of them fight
@@ -835,6 +837,6 @@ mod tests {
         assert_eq!(workers_for(false, Some(3), 15), 3);
         assert_eq!(workers_for(false, Some(0), 15), 1, "a pool needs a worker");
         assert_eq!(workers_for(false, Some(1000), 15), 64);
-        assert!(NVIDIA_WORKERS >= 1 && NVIDIA_WORKERS <= 2, "measured best on NVIDIA is 1-2");
+        assert!(NVIDIA_WORKERS >= 1 && NVIDIA_WORKERS <= 8, "measured best on NVIDIA is 4");
     }
 }
