@@ -10,9 +10,11 @@
 //!   is published for BC2,
 //! * the rebuild of BC1 blocks ([`bc1`]), which needs two tables of constants that are not in
 //!   the stream ([`bc1::Tables`]). XCL has the estimates bcpack-rs made of them
-//!   (`bc1_fitted.rs`), so its BC1 blocks are an approximation wherever an estimate is off, and
-//!   a block that reads an entry bcpack-rs never fitted is built from zeros (as bcpack-rs does)
-//!   instead of losing its whole chunk; the first such read of a process is logged,
+//!   (`bc1_fitted.rs`), so its BC1 blocks are an approximation wherever an estimate is off;
+//!   the one history entry real chunks read and bcpack-rs never fitted (slot 4) is ported from
+//!   ivall/xcl's dictionary, and a block that reads an entry the table still lacks is built
+//!   from zeros (as bcpack-rs does) instead of losing its whole chunk; the first such read of
+//!   a process is logged,
 //! * the rebuild of BC5 blocks ([`bc5`]), which also needs constants that are not in the
 //!   stream ([`bc5::Tables`]). XCL has the index-pair table and the estimates
 //!   leonida-asset-pipeline made of the history (`bc5_tables.rs`), so its BC5 blocks are an

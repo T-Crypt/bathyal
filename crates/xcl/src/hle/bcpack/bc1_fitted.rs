@@ -28,9 +28,12 @@
 // bcpack-rs from retail data (decoded blocks against the next smaller mip level, which is
 // stored unpacked); they are constants of the codec, not game content. Being estimates, they
 // make the BC1 output of XCL an approximation wherever one of them is wrong:
-// * history: 254 of the 255 entries that can be read; the `None` ones were never referred to
-//   in the data of the fit. Fits on two halves of that data differ, by a step or so, in
-//   17 entries (12, 14, 30, 47, 59, 67, 70, 83, 108, 125, 127, 130, 152, 159, 176, 231, 236).
+// * history: 255 of the 255 entries that can be read hold a value;
+//   the rest were never referred to in the data of the fit. Fits on two halves of that data
+//   differ, by a step or so, in 17 entries (12, 14, 30, 47, 59, 67, 70, 83, 108, 125, 127, 130, 152, 159, 176, 231, 236).
+//   Slot 4 is not an estimate: bcpack-rs never fitted it, and it is ported from ivall/xcl
+//   8cad517 (VIctory's BC1 dictionary; see THIRD_PARTY.md), the same six values Leonida's
+//   clean-room table has.
 // * quadrants: all 256. Fits on two halves of the data swap 8 entries
 //   (229, 230, 231, 235, 247, 248, 254, 255; rare mirror pairs).
 // A block rebuilt from a history entry carries its error, and so do the blocks that refer to it.
@@ -40,7 +43,7 @@ use super::bc1::Tables;
 pub static TABLES: Tables = Tables {
     history: [
         None, Some([7, 29, 6, 8, 30, 7]), Some([15, 29, 15, 16, 36, 17]), Some([20, 37, 14, 3, 6, 2]),
-        None, Some([10, 21, 11, 6, 15, 7]), Some([12, 23, 11, 7, 15, 6]), Some([12, 26, 12, 7, 15, 7]),
+        Some([12, 27, 13, 6, 12, 6]), Some([10, 21, 11, 6, 15, 7]), Some([12, 23, 11, 7, 15, 6]), Some([12, 26, 12, 7, 15, 7]),
         Some([22, 36, 15, 20, 32, 14]), Some([14, 23, 8, 1, 2, 1]), Some([23, 5, 30, 9, 5, 30]), Some([11, 22, 11, 7, 15, 7]),
         Some([17, 22, 7, 10, 11, 3]), Some([12, 25, 12, 7, 16, 7]), Some([13, 28, 8, 5, 12, 3]), Some([11, 20, 8, 16, 31, 14]),
         Some([23, 32, 30, 17, 12, 29]), Some([8, 44, 30, 6, 26, 30]), Some([10, 24, 30, 6, 45, 30]), Some([10, 12, 4, 8, 8, 2]),

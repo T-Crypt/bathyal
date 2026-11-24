@@ -383,20 +383,22 @@ fn fitted_bc1_tables_are_well_formed() {
     let row = |left: usize, right: usize| uniform(left) * 5 | uniform(right) * 5 << 4;
     assert_eq!(b[4..], [row(0, 1), row(0, 1), row(2, 3), row(2, 3)]);
 
-    // the one readable entry the estimate lacks (4) is read as zeros: real chunks do read it,
-    // and one such block must not cost the whole chunk
+    // every readable entry has a value: bcpack-rs never fitted slot 4, which real chunks do
+    // read, so it is ported from ivall/xcl 8cad517 (VIctory's dictionary)
     assert!(t.history[0].is_none());
-    assert_eq!(t.history.iter().flatten().count(), 254);
-    let slot = (1..256).find(|&k| t.history[k].is_none()).expect("slot 4 is still unfitted");
-    assert_eq!(slot, 4);
-    let d = 256 - slot;
-    s[0] = if d < 128 { 2 * d } else { 2 * (255 - d) + 1 } as u8;
-    assert_eq!(s[0], 7);
-    s[2] = 2; // R0 +1, so the block is not all zeros
+    assert_eq!(t.history.iter().flatten().count(), 255);
+    assert_eq!(t.history[4], Some([12, 27, 13, 6, 12, 6]));
+
+    // a first block that takes the endpoints of the block 252 before the stream (slot 4),
+    // plus its residuals
+    let mut s = [0u8; 12];
+    s[0] = 7;
+    s[2] = 2;
     s[8..].copy_from_slice(&[0, 1, 2, 3]);
-    let b = bc1::assemble(&s, t).unwrap();
-    assert_eq!(b[..2], (1u16 << 11).to_le_bytes());
-    assert_eq!(&b[2..4], &[0, 0]);
+    let (b, unfitted) = bc1::assemble_counted(&s, t).unwrap();
+    assert_eq!(unfitted, 0);
+    assert_eq!(b[..2], (13u16 << 11 | 27 << 5 | 13).to_le_bytes());
+    assert_eq!(&b[2..4], &(6u16 << 11 | 12 << 5 | 6).to_le_bytes());
     assert_eq!(b[4..], [row(0, 1), row(0, 1), row(2, 3), row(2, 3)]);
 
     // and through the entropy stage: a two-block stream whose block 0 refers 252 blocks back
@@ -404,10 +406,10 @@ fn fitted_bc1_tables_are_well_formed() {
     let symbols = [7u8, 0, 2, 4, 6, 0, 2, 2, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
     let stream = stream_from_symbols(lane_widths(1).unwrap(), &symbols);
     let (blocks, unfitted) = bc1::decode_counted(&stream, 16, t).expect("the format allows it");
-    assert_eq!(unfitted, 1);
-    // block 0 from zeros: (1, 2, 3) and (0, 1, 1); quadrant symbol 0 is a uniform quadrant
-    assert_eq!(blocks[..2], (1u16 << 11 | 2 << 5 | 3).to_le_bytes());
-    assert_eq!(blocks[2..4], (1u16 << 5 | 1).to_le_bytes());
+    assert_eq!(unfitted, 0);
+    // block 0 on slot 4 + (1, 2, 3), (0, 1, 1); quadrant symbol 0 is a uniform quadrant
+    assert_eq!(blocks[..2], (13u16 << 11 | 29 << 5 | 16).to_le_bytes());
+    assert_eq!(blocks[2..4], (6u16 << 11 | 13 << 5 | 7).to_le_bytes());
     assert_eq!(blocks[4..8], [uniform(0) * 0x55; 4]);
     // block 1 one block back, no change
     assert_eq!(blocks[8..10], blocks[..2]);
