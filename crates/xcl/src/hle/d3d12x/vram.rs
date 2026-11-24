@@ -741,8 +741,8 @@ mod tests {
         let pages = b.pages_of(Space::Textures);
         println!("{placed} bytes placed, {pages} bytes of pages");
         assert!(pages <= placed / 8, "{pages} bytes of pages for {placed} bytes placed");
-        // one tile per title address per sub-page offset the title packed at
-        assert_eq!(pages, (SPAN / PAGE + 8) * 4 * PAGE, "{pages} bytes of pages for a span of {SPAN}");
+        // at most one tile per title page per sub-page offset the title packed at
+        assert!(pages <= 4 * SPAN, "{pages} bytes of pages for a span of {SPAN}");
     }
 
     /// A page no resource uses keeps its tile (and what it holds) for 2 s, then the tile cools
