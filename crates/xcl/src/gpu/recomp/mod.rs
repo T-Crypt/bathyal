@@ -79,6 +79,7 @@ pub const HEAP_WINDOWS: u32 = 0x100;
 pub mod upper_lanes;
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::OnceLock;
 
 use super::dxbc::SigElement;
 use super::rdna2::{self, Decoded};
@@ -515,6 +516,10 @@ pub struct Options {
     pub structured: bool,
     /// compute groups that are not whole console waves
     pub pad_waves: PadWaves,
+    /// iterations one loop entry may run before it breaks (0 = no cap): `XCL_LOOP_CAP`,
+    /// default 2^20 – a translated loop that never exits hangs the GPU
+    /// (`DXGI_ERROR_DEVICE_HUNG`)
+    pub loop_cap: u32,
 }
 
 /// A compute group that is not a whole number of console waves (40 threads: one wave64 with
@@ -535,7 +540,7 @@ pub enum PadWaves {
 
 impl Default for Options {
     fn default() -> Self {
-        Options { mode: Mode::Kernel, wave64: true, hw_wave: 0, split_wave64: false, static_sampler_base: 0, mem_windows: 1, heap_windows: false, structured: true, pad_waves: PadWaves::WhereSeen }
+        Options { mode: Mode::Kernel, wave64: true, hw_wave: 0, split_wave64: false, static_sampler_base: 0, mem_windows: 1, heap_windows: false, structured: true, pad_waves: PadWaves::WhereSeen, loop_cap: loop_cap() }
     }
 }
 
@@ -619,16 +624,43 @@ fn why(_at: u64, msg: &str) {
 /// (lo, hi, exit, nest, loop head of `continue`, targets entering the range)
 type MemoKey = (u64, u64, Option<u64>, usize, Option<u64>, Vec<u64>);
 
-/// At the top of every emitted loop: a lane's loop iterations are capped (`xcl_budget`, in
-/// the prelude: 65 536) – console code that loops on what XCL passed it wrong (an address, a
-/// count) must not keep the PC GPU busy for minutes (a process with such work in flight cannot
-/// even be terminated). Once the budget is spent every loop
-/// leaves at its next iteration and the program runs to its end.
-const LOOP_GUARD: &str = "if (xcl_budget == 0u) break; xcl_budget--;";
+/// Iterations one loop entry may run before it leaves (`XCL_LOOP_CAP`, default 2^20; 0 =
+/// off). Console code that loops on a mask or count XCL passed it wrong – the split wave64
+/// form's lane masks are approximate – would never exit and the GPU hangs
+/// (`DXGI_ERROR_DEVICE_HUNG`). Past the cap a loop breaks and the program runs to its end.
+const LOOP_CAP_DEFAULT: u32 = 1 << 20;
+
+/// `XCL_LOOP_CAP` (0 = off), read once per process: `Options::default` takes it, and the
+/// translated-shader cache key includes it.
+pub fn loop_cap() -> u32 {
+    static CAP: OnceLock<u32> = OnceLock::new();
+    *CAP.get_or_init(|| match std::env::var("XCL_LOOP_CAP") {
+        Ok(v) => match v.trim().parse::<u64>() {
+            Ok(0) => 0,
+            Ok(n) => n.min(u32::MAX as u64) as u32,
+            Err(_) => LOOP_CAP_DEFAULT,
+        },
+        Err(_) => LOOP_CAP_DEFAULT,
+    })
+}
+
+/// At the top of a loop body: one iteration of the loop's cap, spent (`xcl_lc<n>` is the lane's
+/// own counter for the loop at nesting `n`, incremented once and checked with one compare;
+/// `xcl_loop_cap` is the prelude's constant). Empty when the cap is off. Each loop is emitted
+/// in a scope of its own, so sibling and nested loops reuse the same name.
+pub(super) fn loop_guard(cap: u32, n: usize) -> String {
+    if cap == 0 { String::new() } else { format!("if (++xcl_lc{n} >= xcl_loop_cap) break;\n") }
+}
+
+/// The counter declaration of a loop at nesting `n` (empty when the cap is off); the loop is
+/// emitted in a scope of its own that the caller closes.
+pub(super) fn loop_decl(cap: u32, pad: &str, n: usize) -> String {
+    if cap == 0 { String::new() } else { format!("{pad}uint xcl_lc{n} = 0u;\n") }
+}
 
 /// The loops the translator emits: ranges spanned by backward jumps (far jumps included),
 /// partly overlapping ones merged until they nest, sorted. `x64_masks` uses them for the
-/// exits through `LOOP_GUARD`.
+/// exits through the loop cap (`loop_guard`).
 pub(super) fn loop_ranges(insts: &[Decoded]) -> Vec<(u64, u64)> {
     let mut loops: Vec<(u64, u64)> = Vec::new();
     for d in insts {
@@ -978,7 +1010,17 @@ fn emit_structured(
         }
         let raised: BTreeSet<u64> = match it {
             Item::Loop { a, b, latch, entry } => {
-                body.push_str(&format!("{ipad}[loop] for (;;) {{\n{ipad}    {LOOP_GUARD}\n"));
+                // a per-entry iteration cap inside the loop's own scope (`loop_guard`)
+                let cap = em.loop_cap();
+                if cap != 0 {
+                    body.push_str(&format!("{ipad}{{\n"));
+                    body.push_str(&loop_decl(cap, &format!("{ipad}    "), d));
+                }
+                body.push_str(&format!("{ipad}[loop] for (;;) {{\n"));
+                if cap != 0 {
+                    body.push_str(&format!("{ipad}    {}", loop_guard(cap, d)));
+                    em.note_capped_loop();
+                }
                 let (lcont, lin) = if entry.is_none() { (Some(a), &inner) } else { (None, &none) };
                 let mut r = emit_structured(c, em, body, entry.unwrap_or(a), latch, None, nest + 1, lcont, lin, d + 1, blocks, flags);
                 for &t in &r {
@@ -1002,6 +1044,9 @@ fn emit_structured(
                     }
                 }
                 body.push_str(&format!("{ipad}}}\n"));
+                if cap != 0 {
+                    body.push_str(&format!("{ipad}}}\n"));
+                }
                 r
             }
             Item::If { start, end, t, u } => {
@@ -1083,9 +1128,23 @@ fn emit_range(c: &Ctx, em: &mut emit::Em, body: &mut String, lo: u64, hi: u64, d
         let start = c.leaders[i];
         let inner = c.loops.iter().filter(|&&(a, b)| a == start && b <= hi && (a, b) != (lo, hi)).max_by_key(|x| x.1).copied();
         if let Some((a, b)) = inner {
-            body.push_str(&format!("{pad}[loop] while (pc >= {a}u && pc < {b}u) {{\n{pad}    {LOOP_GUARD}\n"));
+            // a per-entry iteration cap in the loop's own scope; leaving it sets `pc` past
+            // every block, so no block of the range below runs again (`loop_guard`)
+            let cap = em.loop_cap();
+            if cap != 0 {
+                body.push_str(&format!("{pad}{{\n"));
+                body.push_str(&loop_decl(cap, &format!("{pad}    "), depth));
+            }
+            body.push_str(&format!("{pad}[loop] while (pc >= {a}u && pc < {b}u) {{\n"));
+            if cap != 0 {
+                body.push_str(&format!("{pad}    if (++xcl_lc{depth} >= xcl_loop_cap) {{ pc = 0xFFFFFFFFu; break; }}\n"));
+                em.note_capped_loop();
+            }
             emit_range(c, em, body, a, b, depth + 1, blocks, flags);
             body.push_str(&format!("{pad}}}\n"));
+            if cap != 0 {
+                body.push_str(&format!("{pad}}}\n"));
+            }
             i = c.leaders.partition_point(|&l| l < b);
             continue;
         }
@@ -1369,6 +1428,20 @@ fn constant_samplers(insts: &[Decoded], leaders: &BTreeSet<u64>) -> BTreeMap<u64
     out
 }
 
+/// Loops that got the iteration cap: one line per program at most, and only where the running
+/// total crosses a power of two (a run over a large pack gives a few dozen lines, not a flood).
+fn count_loop_caps(n: usize) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    if n == 0 {
+        return;
+    }
+    static N: AtomicUsize = AtomicUsize::new(0);
+    let prev = N.fetch_add(n, Ordering::Relaxed);
+    if prev == 0 || prev.next_power_of_two() <= prev + n {
+        crate::xlog_info!("recomp: loop caps emitted on {n} loops in this program ({} overall)", prev + n);
+    }
+}
+
 /// Split wave64 programs translated with an `s_barrier` inside a branch or loop (each such
 /// program counted once); logged at the first and every power of two, so a game run shows how
 /// many real programs depend on the combined branch conditions.
@@ -1537,6 +1610,7 @@ pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
         body.push_str(&code);
     }
     let hlsl = em.finish(&body);
+    count_loop_caps(em.capped_loops());
     let static_samplers = em.static_used.clone();
     Ok(Translation { hlsl, unsupported: em.unsupported, unsupported_why: em.unsupported_why, ignored: em.ignored, instructions: insts.len(), blocks, static_samplers })
 }

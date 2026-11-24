@@ -756,7 +756,7 @@ pub fn analyze(insts: &[Decoded]) -> UpperLanes {
         return out;
     }
     let pcs: BTreeMap<u64, usize> = insts.iter().enumerate().map(|(i, d)| (d.pc, i)).collect();
-    // (a loop that runs out of its iteration budget, `LOOP_GUARD`, leaves from wherever it is:
+    // (a loop that runs out of its iteration cap (`loop_guard`) leaves from wherever it is:
     // not followed – the program's results are wrong by then anyway)
     let succ = successors(insts, &pcs);
     let mut at: Vec<Option<State>> = vec![None; insts.len()];

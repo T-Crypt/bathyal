@@ -184,6 +184,58 @@ fn hlsl_is_generated_for_straight_line_and_branches() {
     let _ = Mode::Kernel;
 }
 
+/// Every emitted loop carries a per-lane iteration counter, checked once per iteration
+/// against the compile-time cap (`XCL_LOOP_CAP`, default 2^20): a console loop that never
+/// exits on what XCL gave it – an approximate split-wave64 mask in a waterfall loop – must
+/// not hang the GPU (`DXGI_ERROR_DEVICE_HUNG`). `loop_cap: 0` emits none of it.
+#[test]
+fn every_loop_gets_an_iteration_cap() {
+    // a counted loop: s0 = 5.0, s0 -= 1.0 until it is 0, the branch back to the subtract
+    let code = prog(&[
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 0), ("SSRC0", 133)], None),
+        ("S_SUB_U32", "ENC_SOP2", &[("SDST", 0), ("SSRC0", 0), ("SSRC1", 129)], None),
+        ("S_CMP_LG_U32", "ENC_SOPC", &[("SSRC0", 0), ("SSRC1", 128)], None),
+        ("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 0xFFFD)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 1), ("SRC0", 128)], None),
+    ]);
+    let cs = super::CsInterface { threads: [64, 1, 1], user_sgprs: 6, ..Default::default() };
+    for structured in [true, false] {
+        let t = translate(&code, &Options { mode: Mode::Compute(cs.clone()), structured, ..Default::default() }).unwrap();
+        assert!(t.complete(), "{:?}\n{}", t.unsupported_why, t.hlsl);
+        assert!(t.hlsl.contains("static const uint xcl_loop_cap = 1048576u;"), "structured {structured}\n{}", t.hlsl);
+        // one counter and one increment-and-compare per loop (the structured form's
+        // `[loop] for`, the block chain's `[loop] while (pc …)`)
+        assert_eq!(t.hlsl.matches("uint xcl_lc").count(), 1, "structured {structured}\n{}", t.hlsl);
+        assert_eq!(t.hlsl.matches("if (++xcl_lc").count(), 1, "structured {structured}\n{}", t.hlsl);
+        assert!(t.hlsl.contains("xcl_loop_cap) break;"), "structured {structured}\n{}", t.hlsl);
+        if super::dxc::location().is_ok() {
+            super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("structured {structured}: {e}\n{}", t.hlsl));
+        }
+        // the cap off: no counter, no constant, the loop as it was
+        let off = translate(&code, &Options { mode: Mode::Compute(cs.clone()), structured, loop_cap: 0, ..Default::default() }).unwrap();
+        assert!(!off.hlsl.contains("xcl_loop_cap") && !off.hlsl.contains("xcl_lc") && off.hlsl.contains("[loop]"), "structured {structured}\n{}", off.hlsl);
+        if super::dxc::location().is_ok() {
+            super::dxc::compile(&off.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("no cap, structured {structured}: {e}\n{}", off.hlsl));
+        }
+    }
+}
+
+/// A waterfall loop (v_readfirstlane / v_cmp / s_and_saveexec / s_cbranch_execnz, the pixel
+/// shader's lane-mask loop) gets the cap too, and the capped HLSL still compiles.
+#[test]
+fn a_waterfall_loop_gets_an_iteration_cap() {
+    for wave64 in [true, false] {
+        let pt = helper_lane_masks_ps(wave64);
+        assert!(pt.complete(), "{:?}\n{}", pt.unsupported_why, pt.hlsl);
+        assert!(pt.hlsl.contains("static const uint xcl_loop_cap = 1048576u;")
+            && pt.hlsl.contains("uint xcl_lc") && pt.hlsl.contains("xcl_loop_cap) break;"), "wave64 {wave64}\n{}", pt.hlsl);
+        assert_eq!(pt.hlsl.matches("if (++xcl_lc").count(), 1, "wave64 {wave64}\n{}", pt.hlsl);
+        if super::dxc::location().is_ok() {
+            super::dxc::compile(&pt.hlsl, "main", "ps_6_6", &[]).unwrap_or_else(|e| panic!("wave64 {wave64}: {e}\n{}", pt.hlsl));
+        }
+    }
+}
+
 #[test]
 fn scalar_bfe_64_handles_unsigned_signed_and_zero_width() {
     let code = prog(&[

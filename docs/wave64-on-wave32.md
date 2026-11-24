@@ -132,7 +132,7 @@ emitter does, not only the ISA's operand tables:
 - EXEC is always whole-live; an indirect jump (`s_setpc` / `s_swappc` other than a far jump,
   which is a branch) makes every SGPR whole-live, and so does the end of a kernel-mode program
   (the runner reads the SGPRs back – the halves still end with the same SGPRs);
-- every emitted loop can be left where its iteration budget (`LOOP_GUARD`) is checked – at
+- every emitted loop can be left where its iteration cap (`loop_guard`) is checked – at
   its top, and in the `pc` dispatcher form before each of its blocks, to the code after it or
   (dispatcher) the end of the program: what is live there is live before each instruction of
   the loop.

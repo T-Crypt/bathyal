@@ -22,8 +22,8 @@
 //!
 //! Conservative where it cannot see: an indirect jump makes every SGPR whole-live, EXEC is
 //! always whole-live, and so is every SGPR at the end of a kernel-mode program (the runner
-//! reads them back). Every emitted loop may also be left where its iteration budget
-//! (`LOOP_GUARD`) is checked: what is live after a loop, or at the end, is live before each of
+//! reads them back). Every emitted loop may also be left where its iteration cap
+//! (`loop_guard`) is checked: what is live after a loop, or at the end, is live before each of
 //! its instructions.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -211,7 +211,7 @@ pub fn whole_live_out(insts: &[Decoded], end_reads_all: bool) -> Vec<Regs> {
     let at_end = if end_reads_all { ALL } else { EXEC };
     // successors; None = unknown (indirect): everything is live
     let succ = successors(insts);
-    // `LOOP_GUARD`: a loop may be left where its guard runs – at its top, before the head
+    // the loop cap (`loop_guard`): a loop may be left where its guard runs – at its top, before the head
     // instruction, and in the `pc` dispatcher form before every block of it – to the code
     // after it (structured) or the end of the program (dispatcher: no later block matches
     // the `pc` it leaves with). Taken as: before any instruction of a loop, whatever is live

@@ -77,6 +77,8 @@ pub(super) struct Em {
     has_f64_round_op: bool,
     /// program writes a non-default `MODE[3:2]` and uses f16 ops (emits `xcl_fp16_rm`)
     dynamic_f16_rm: bool,
+    /// loops the iteration cap was emitted on
+    loops_capped: usize,
 }
 
 /// Instructions without an effect in this execution model.
@@ -586,7 +588,23 @@ impl Em {
             has_f16_round_op: false,
             has_f64_round_op: false,
             dynamic_f16_rm: false,
+            loops_capped: 0,
         }
+    }
+
+    /// Iterations one loop entry may run before it breaks (0 = no cap).
+    pub(super) fn loop_cap(&self) -> u32 {
+        self.opt.loop_cap
+    }
+
+    /// A loop got the iteration cap.
+    pub(super) fn note_capped_loop(&mut self) {
+        self.loops_capped += 1;
+    }
+
+    /// How many loops got it.
+    pub(super) fn capped_loops(&self) -> usize {
+        self.loops_capped
     }
 
     /// Pre-scan the program for f16/f64 rounding-sensitive ops and non-default `MODE[3:2]` writes.
@@ -4459,6 +4477,10 @@ impl Em {
             let _ = writeln!(h, "{ty} xcl_ss{k} : register(s{k}, space1);");
         }
         h.push_str(PRELUDE);
+        if self.opt.loop_cap != 0 {
+            // compile-time constant in the HLSL: every loop's guard counts against it
+            let _ = writeln!(h, "static const uint xcl_loop_cap = {}u;", self.opt.loop_cap);
+        }
         if matches!(self.opt.mode, Mode::Pixel(_)) {
             h.push_str(PRELUDE_PIXEL);
         }
@@ -5761,8 +5783,6 @@ uint2 ballot_px_local(bool b) {
 
 const PRELUDE: &str = r#"
 static uint lane_id;
-// loop iterations a lane may run (`LOOP_GUARD`): far above what a working program needs
-static uint xcl_budget = 1u << 16;
 // the high half of a 32 x 32-bit product, from 16-bit parts: DXC turns
 // `(uint)(((uint64_t)a * b) >> 32) != 0` (the console's integer division code) into
 // umul.with.overflow, which DXIL does not allow (validation fails)

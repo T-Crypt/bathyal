@@ -204,7 +204,9 @@ mod translated {
     use std::path::{Path, PathBuf};
     use std::sync::OnceLock;
 
-    const MAGIC: &[u8; 8] = b"XCLTRAN1";
+    /// The translation's format: bumped whenever the emitted HLSL changes shape without
+    /// other input changing (XCLTRAN3: the per-loop iteration cap, `XCL_LOOP_CAP`).
+    const MAGIC: &[u8; 8] = b"XCLTRAN3";
 
     /// the running XCL binary's hash (0: unknown – the disk is not used)
     fn identity() -> u64 {
@@ -231,6 +233,8 @@ mod translated {
         for v in [ident, blob.len() as u64, hash2(blob)] {
             h.extend_from_slice(&v.to_le_bytes());
         }
+        // the loop cap is baked into the HLSL: another cap is another translation
+        h.extend_from_slice(&(super::super::loop_cap() as u64).to_le_bytes());
         h
     }
 
