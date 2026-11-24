@@ -9474,7 +9474,7 @@ fn split_wave64_barriers_keep_both_halves_on_one_path() {
         ("S_CBRANCH_EXECZ", "ENC_SOPP", &[("SIMM16", 1)], None),
         ("S_BARRIER", "ENC_SOPP", &[], None),
     ]));
-    assert!(execz.hlsl.contains(" = xcl_x_wide(((exec_lo | exec_hi) == 0u));"), "{}", execz.hlsl);
+    assert!(execz.hlsl.contains(" = xcl_x_wide((exec_lo | exec_hi) == 0u);"), "{}", execz.hlsl);
     assert!(execz.hlsl.contains("if (!(") && execz.hlsl.contains("GroupMemoryBarrierWithGroupSync();"), "{}", execz.hlsl);
     // the same skip with no barrier behind it: no exchange
     let skip = split(&prog(&[
@@ -9492,7 +9492,7 @@ fn split_wave64_barriers_keep_both_halves_on_one_path() {
         ("S_CMP_LG_U32", "ENC_SOPC", &[("SSRC0", 0), ("SSRC1", 128)], None),
         ("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 0xFFFC)], None),
     ]));
-    assert!(loopy.hlsl.contains(" = xcl_x_wide((scc != 0u));"), "{}", loopy.hlsl);
+    assert!(loopy.hlsl.contains(" = xcl_x_wide(scc != 0u);"), "{}", loopy.hlsl);
     assert!(loopy.hlsl.contains("[loop] for (;;)"), "{}", loopy.hlsl);
     // the result compiles
     if super::dxc::location().is_ok() {
