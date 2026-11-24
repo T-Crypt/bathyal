@@ -418,9 +418,15 @@ pub(super) unsafe fn gate_wait(queue: usize, fence: usize, value: u64) -> i32 {
 /// sparse writes, the bottom-of-pipe work, the textures' states, the present fallback.
 pub(super) unsafe fn submit_now(queue: usize, lists: &[*mut c_void]) -> i32 {
     let q_raw = queue as *mut c_void;
+    // objects whose submissions are done are freed, and their descriptor slots nulled, before
+    // the GPU can read a heap this submission binds
+    super::lifetime::poll();
     super::title_textures::refresh(q_raw);
     type ExecFn = unsafe extern "system" fn(*mut c_void, u32, *const *mut c_void);
     let exec: ExecFn = std::mem::transmute_copy(&super::real::orig_fn(q_raw, PC_QUEUE_EXECUTE_COMMAND_LISTS));
+    // the lists leave the recording here, where the gate really submits them, not where the
+    // title queued them: what they name stays alive until this queue's Signal (`lifetime::signal`)
+    super::lifetime::submit(queue, lists);
     exec(q_raw, lists.len() as u32, lists.as_ptr());
     super::list_x::readback_sparse_writes(q_raw, lists);
     super::list_x::cpu_writes_after(q_raw, lists);
@@ -469,7 +475,9 @@ unsafe fn run(queue: usize, op: &Op, immediates: &[u64]) -> i32 {
                 std::mem::transmute_copy(&super::real::orig_fn(q_raw, PC_SIGNAL));
             let hr = f(q_raw, *fence as *mut c_void, *value);
             if hr >= 0 {
-                super::fence_x::note_queue_signal(*fence, *value);
+                // the signal reaches the PC queue here: the submissions before it are done at
+                // this value (`lifetime::signal` runs inside)
+                super::fence_x::note_queue_signal(queue, *fence, *value);
             }
             hr
         }

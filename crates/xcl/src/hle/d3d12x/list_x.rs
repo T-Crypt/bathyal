@@ -718,6 +718,7 @@ pub unsafe fn on_create(list: *mut c_void, alloc: usize, pso: usize, ty: D3D12_C
     if list.is_null() {
         return;
     }
+    super::lifetime::forget_list(list as usize);
     let key = list as usize;
     let old = {
         let mut g = LISTS.lock().unwrap();
@@ -751,6 +752,7 @@ pub unsafe fn on_create(list: *mut c_void, alloc: usize, pso: usize, ty: D3D12_C
 
 /// Clean up all tracked state when a command list is released for good.
 pub(super) fn on_release(list: usize) {
+    super::lifetime::forget_list(list);
     super::title_textures::list_reset(list);
     let old = LISTS.lock().unwrap().as_mut().and_then(|m| m.remove(&list));
     if let Some(old) = old {
@@ -783,6 +785,7 @@ pub(super) fn on_allocator_release(alloc: usize) {
 /// syncing `ID3D12GraphicsCommandList9::RSSetDepthBias` when the bound PSO uses native dynamic
 /// depth bias.
 pub(super) unsafe fn on_set_pipeline_state(list: *mut c_void, pso: usize) {
+    super::lifetime::note(list as usize, pso);
     let key = list as usize;
     let sync_target = {
         let mut g = LISTS.lock().unwrap();
@@ -2378,6 +2381,8 @@ fn note_gpu_write(what: &str, va: usize, n: u64) {
 }
 
 pub(super) unsafe extern "system" fn copy_buffer_region_x(this: *mut c_void, dst: usize, dst_off: u64, src: usize, src_off: u64, n: u64) {
+    super::lifetime::note(this as usize, dst);
+    super::lifetime::note(this as usize, src);
     if super::present::trace_frame() {
         if let Some(a) = real::title_address(dst) {
             note_gpu_write("CopyBufferRegion", a + dst_off as usize, n);
@@ -2564,6 +2569,8 @@ pub(super) unsafe extern "system" fn resolve_subresource_region_x(this: *mut c_v
 /// CopyResource(dst, src) (PC #17; DMA list #13): buffers placed below their console address
 /// are copied as their own bytes (the PC resources also hold what lies before them)
 pub(super) unsafe extern "system" fn copy_resource_x(this: *mut c_void, dst: usize, src: usize) {
+    super::lifetime::note(this as usize, dst);
+    super::lifetime::note(this as usize, src);
     super::present::note_use(dst, super::present::USE_COPY);
     super::title_textures::note_gpu_write(dst);
     if super::present::trace_frame() {

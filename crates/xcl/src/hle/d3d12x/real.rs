@@ -714,6 +714,32 @@ fn kind_of(ext: usize) -> Option<Kind> {
     CLASSES.lock().unwrap().iter().find(|c| c.ext == ext).map(|c| c.kind)
 }
 
+/// How to give back an object a recorded command list can reference (`lifetime::note`). None:
+/// not such an object.
+pub(super) unsafe fn free_fn(handle: usize) -> Option<super::lifetime::FreeFn> {
+    // a console CPU handle or a title address may be named where a resource is expected
+    if handle == 0 || !handle.is_multiple_of(8) || !crate::gpu::shader::readable(handle, 8) {
+        return None;
+    }
+    let ext = vt(handle as *mut c_void) as usize;
+    if !is_ext(ext) {
+        return None;
+    }
+    match kind_of(ext)? {
+        Kind::Resource => Some(free_resource),
+        Kind::PipelineState => Some(free_pipeline),
+        Kind::DescriptorHeap => Some(free_descriptor_heap),
+        Kind::Heap => Some(free_memory_heap),
+        Kind::RootSignature => Some(free_root_signature),
+        _ => None,
+    }
+}
+
+unsafe fn free_root_signature(handle: usize) {
+    let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(orig_fn(handle as *mut c_void, 2));
+    f(handle as *mut c_void);
+}
+
 /// If a native D3D12 method (such as `Close` or `Reset` on Agility SDK 1.620+, or copy-list
 /// `Reset`) replaced `this`'s vtable pointer with another native runtime table, adopt the
 /// new table under the same `Kind` so XCL's hooks stay installed while forwarding to the
@@ -1672,6 +1698,10 @@ unsafe extern "system" fn res_unmap(this: *mut c_void, sub: u32, range: *const c
 unsafe extern "system" fn res_release(this: *mut c_void) -> u32 {
     let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(orig_fn(this, 2));
     let n = f(this);
+    // an object a recorded list names: the PC release waits until its submissions are done
+    if super::lifetime::released(this as usize, n) {
+        return n;
+    }
     if n == 0 {
         if let Some(s) = UNMAPPABLE.lock().unwrap().as_mut() {
             s.remove(&(this as usize));
@@ -1700,15 +1730,61 @@ unsafe extern "system" fn res_release(this: *mut c_void) -> u32 {
     n
 }
 
+/// Forget everything XCL keeps for a resource whose PC object is being released (the release a
+/// submission's completion allows: `lifetime`).
+unsafe fn free_resource_body(handle: usize) {
+    if let Some(s) = UNMAPPABLE.lock().unwrap().as_mut() {
+        s.remove(&handle);
+    }
+    if let Some(s) = SPARSE_READBACK.lock().unwrap().as_mut() {
+        s.remove(&handle);
+    }
+    if let Some(m) = BUFFER_DELTA.lock().unwrap().as_mut() {
+        m.remove(&handle);
+    }
+    if let Some(m) = TITLE_ADDRESS.lock().unwrap().as_mut() {
+        m.remove(&handle);
+    }
+    super::sparse::forget_buffer(handle);
+    super::vram::forget(handle);
+    super::title_textures::forget(handle);
+    let gone = UMA_BUFFERS.lock().unwrap().as_mut().and_then(|m| m.remove(&handle));
+    if let (Some((p, _, true)), Some(u)) = (gone, crate::gpu::uma::get()) {
+        if u.is_sparse(p) {
+            super::sparse::free(p);
+        } else {
+            u.free(p);
+        }
+    }
+}
+
+/// Give back a resource XCL still holds after its submissions completed.
+unsafe fn free_resource(handle: usize) {
+    free_resource_body(handle);
+    let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(orig_fn(handle as *mut c_void, 2));
+    f(handle as *mut c_void);
+}
+
 /// A stand-in pipeline released for good takes its background-built real pipeline with it.
 unsafe extern "system" fn pso_release(this: *mut c_void) -> u32 {
     let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(orig_fn(this, 2));
     let n = f(this);
+    if super::lifetime::released(this as usize, n) {
+        return n;
+    }
     if n == 0 {
         forget_pso(this as usize);
         super::pso_async::release(super::pso_async::released(this as usize));
     }
     n
+}
+
+/// Give back a pipeline state XCL still holds after its submissions completed.
+unsafe fn free_pipeline(handle: usize) {
+    forget_pso(handle);
+    super::pso_async::release(super::pso_async::released(handle));
+    let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(orig_fn(handle as *mut c_void, 2));
+    f(handle as *mut c_void);
 }
 
 /// A pipeline state is gone: drop what XCL keeps by its address (a later pipeline may get the
@@ -1991,10 +2067,20 @@ unsafe extern "system" fn dev_copy_descriptors_x(this: *mut c_void, nd: u32, dst
 unsafe extern "system" fn heap_release(this: *mut c_void) -> u32 {
     let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(orig_fn(this, 2));
     let n = f(this);
+    if super::lifetime::released(this as usize, n) {
+        return n;
+    }
     if n == 0 {
         super::console_heap::unregister(this as usize);
     }
     n
+}
+
+/// Give back a descriptor heap XCL still holds after its submissions completed.
+unsafe fn free_descriptor_heap(handle: usize) {
+    super::console_heap::unregister(handle);
+    let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(orig_fn(handle as *mut c_void, 2));
+    f(handle as *mut c_void);
 }
 
 /// #21 CreateDepthStencilView: the console's view formats as the PC's (`pc_view_format`).
@@ -3224,6 +3310,9 @@ fn heap_block(heap: usize) -> Option<(usize, bool)> {
 unsafe extern "system" fn mem_heap_release(this: *mut c_void) -> u32 {
     let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(orig_fn(this, 2));
     let n = f(this);
+    if super::lifetime::released(this as usize, n) {
+        return n;
+    }
     if n == 0 {
         let gone = HEAP_UMA.lock().unwrap().as_mut().and_then(|m| m.remove(&(this as usize))).and_then(|e| e.block);
         if let (Some(p), Some(u)) = (gone, crate::gpu::uma::get()) {
@@ -3235,6 +3324,20 @@ unsafe extern "system" fn mem_heap_release(this: *mut c_void) -> u32 {
         }
     }
     n
+}
+
+/// Give back a memory heap XCL still holds after its submissions completed.
+unsafe fn free_memory_heap(handle: usize) {
+    let gone = HEAP_UMA.lock().unwrap().as_mut().and_then(|m| m.remove(&handle)).and_then(|e| e.block);
+    if let (Some(p), Some(u)) = (gone, crate::gpu::uma::get()) {
+        if u.is_sparse(p) {
+            super::sparse::free(p);
+        } else {
+            u.free(p);
+        }
+    }
+    let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(orig_fn(handle as *mut c_void, 2));
+    f(handle as *mut c_void);
 }
 creator!(dev_create_fence_pc, "CreateFence", Kind::Fence, [a1, a2]);
 
@@ -5623,6 +5726,7 @@ unsafe extern "system" fn fence_signal(this: *mut c_void, value: u64) -> HRESULT
     let f: unsafe extern "system" fn(*mut c_void, u64) -> HRESULT = std::mem::transmute(orig_fn(this, slot_of(this, "Signal")));
     let hr = f(this, value);
     super::fence_x::note_cpu_signal(this as usize);
+    super::lifetime::poll();
     hr
 }
 
