@@ -4657,7 +4657,7 @@ unsafe fn queue_dispatch(slot: usize, this: *mut c_void, a1: usize, a2: usize, a
             } else {
                 super::queue_gate::gate_wait(this as usize, a1, a2 as u64)
             };
-            hr.0 as u32 as usize
+            hr as u32 as usize
         }
         16 => {
             let f: unsafe extern "system" fn(*mut c_void, usize) -> i32 = std::mem::transmute(pc(PC_TIMESTAMP_FREQUENCY));

@@ -31,7 +31,6 @@ use std::sync::{Condvar, Mutex, Once, OnceLock};
 use std::time::{Duration, Instant};
 
 use windows::core::Interface;
-use windows::Win32::Foundation::HRESULT;
 use windows::Win32::Graphics::Direct3D12::*;
 
 use super::list_x::PendingWait;
@@ -354,7 +353,7 @@ pub(super) unsafe fn gate_lists(queue: usize, lists: &[*mut c_void], waits: Vec<
 }
 
 /// `Signal(fence, value)` on `queue`: at once unless the queue holds work, then in its order.
-pub(super) unsafe fn gate_signal(queue: usize, fence: usize, value: u64) -> HRESULT {
+pub(super) unsafe fn gate_signal(queue: usize, fence: usize, value: u64) -> i32 {
     start_thread();
     let run_now = {
         let mut g = GATES.lock().unwrap_or_else(|e| e.into_inner());
@@ -369,7 +368,7 @@ pub(super) unsafe fn gate_signal(queue: usize, fence: usize, value: u64) -> HRES
     };
     WAKE.notify_all();
     if !run_now {
-        return HRESULT(0);
+        return 0;
     }
     let hr = run(queue, &Op::Signal(fence, value), &[]);
     {
@@ -379,11 +378,11 @@ pub(super) unsafe fn gate_signal(queue: usize, fence: usize, value: u64) -> HRES
         }
     }
     WAKE.notify_all();
-    HRESULT(hr)
+    hr
 }
 
 /// `Wait(fence, value)` on `queue`: at once unless the queue holds work, then in its order.
-pub(super) unsafe fn gate_wait(queue: usize, fence: usize, value: u64) -> HRESULT {
+pub(super) unsafe fn gate_wait(queue: usize, fence: usize, value: u64) -> i32 {
     start_thread();
     let run_now = {
         let mut g = GATES.lock().unwrap_or_else(|e| e.into_inner());
@@ -398,7 +397,7 @@ pub(super) unsafe fn gate_wait(queue: usize, fence: usize, value: u64) -> HRESUL
     };
     WAKE.notify_all();
     if !run_now {
-        return HRESULT(0);
+        return 0;
     }
     let hr = run(queue, &Op::Wait(fence, value), &[]);
     {
@@ -408,7 +407,7 @@ pub(super) unsafe fn gate_wait(queue: usize, fence: usize, value: u64) -> HRESUL
         }
     }
     WAKE.notify_all();
-    HRESULT(hr)
+    hr
 }
 
 /// Submit `lists` now, in order, with what follows a submission: the CPU-visible readback of
