@@ -280,6 +280,10 @@ fn is_writable(va: usize, bytes: usize) -> bool {
     if bytes > 0 && crate::gpu::uma::get().is_some_and(|u| u.in_committed_window(va, bytes)) {
         return true;
     }
+    // nor a sparse window's pages the windows hold as committed (a walk there is gigabytes)
+    if crate::hle::d3d12x::sparse::known_writable(va, bytes) {
+        return true;
+    }
     // walk every VirtualQuery region covering `[va, end)` – a ClzeroLoop can span adjacent
     // committed runs, and a single query only sees the first. Reject PAGE_GUARD so a write
     // through the VEH does not trip the guard (same shape as `dstorage::writable`)
