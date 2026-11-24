@@ -81,13 +81,13 @@ fn a_resource_released_after_submit_outlives_its_submission() {
         let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() }).expect("queue");
         let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).expect("fence");
         queue.ExecuteCommandLists(&[Some(list.cast().unwrap())]);
-        queue.Signal(&fence, 1).expect("Signal");
-        fence_x::note_queue_signal(queue.as_raw() as usize, fence.as_raw() as usize, 1);
 
-        // the title's references go now, on a GPU that is still running the copy
+        // the title's references go now, on a GPU that may still be running the copy
         release(src.as_raw() as usize);
         release(dst.as_raw() as usize);
         assert!(lifetime::held(src.as_raw() as usize), "a buffer a submitted list names must still be held");
+        queue.Signal(&fence, 1).expect("Signal");
+        fence_x::note_queue_signal(queue.as_raw() as usize, fence.as_raw() as usize, 1);
 
         let t0 = std::time::Instant::now();
         while fence.GetCompletedValue() < 1 {
