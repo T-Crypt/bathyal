@@ -225,25 +225,14 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
     let pso = super::pso_async::resolve_wait(with(this, |s| s.pso));
     let (gfx, compute) = (super::real::is_translated_graphics(pso), super::real::is_translated_compute(pso));
     let (args_off_pc, count_off_pc) = (args_off + super::real::buffer_delta(args), count_off + super::real::buffer_delta(count_buf));
-    if let Some(tp) = super::real::two_pass_of(pso) {
-        // each record runs the console program (compute) and then its second pass
-        match two_pass_indirect(this, pso, &tp, sig, max, args, args_off, count_buf, count_off) {
-            Ok(n) => {
-                for _ in 0..n {
-                    count(DRAWS);
-                }
-                if n == 0 {
-                    count(DRAWS_SKIPPED);
-                }
-            }
-            Err(e) => {
-                count(DRAWS_SKIPPED);
-                note_skipped(format_args!("ExecuteIndirect with a console {} pipeline (two passes) skipped: {e}", tp.kind));
-            }
-        }
+    if super::real::two_pass_of(pso).is_some() {
+        // this tree builds a console MS / NGG / GS pipeline in two passes but has no draw
+        // path that runs them (its own Draw* calls never do); an indirect record cannot run
+        // either – the group / vertex counts are in GPU memory
+        count(DRAWS_SKIPPED);
+        note_skipped(format_args!("ExecuteIndirect with a console pipeline in two passes skipped: this tree runs no two-pass draws"));
         return;
     }
->>>>>>> b73e109 (D3D12.X: indirect draws run two-pass pipelines and every record is bounded)
     if !gfx && !compute {
         return pc(this, sig, max, args, args_off_pc, count_buf, count_off_pc);
     }
@@ -346,69 +335,6 @@ unsafe fn clamp_for_gpu(this: *mut c_void, sig: usize, max: u32, args: usize, ar
     }
     let (res, off) = super::real::uma_window_buffer(p as usize, len)?;
     Some((res, off))
-}
-
-/// Replay the root-argument changes a command signature describes for one record.
-unsafe fn replay_root_args(this: *mut c_void, sig: &super::indirect::Signature, bytes: &[u8]) {
-    for a in sig.root_args() {
-        let at = a.offset as usize;
-        match a.kind {
-            super::indirect::ARG_CONSTANT => {
-                let n = a.count as usize * 4;
-                if let Some(v) = bytes.get(at..at + n) {
-                    put_in(this, true, a.root, a.dest * 4, v);
-                }
-            }
-            super::indirect::ARG_CBV | super::indirect::ARG_SRV | super::indirect::ARG_UAV => {
-                if let Some(v) = bytes.get(at..at + 8) {
-                    let va = u64::from_le_bytes(v.try_into().unwrap());
-                    put_in(this, true, a.root, 0, &va.to_le_bytes());
-                }
-            }
-            _ => {}
-        }
-    }
-}
-
-/// ExecuteIndirect of a pipeline in two passes: each record is read from title memory (with
-/// the count buffer and the caller's maximum honoured), clamped, and run through its two
-/// passes, with the record's root-argument changes replayed first. Returns how many records
-/// ran.
-unsafe fn two_pass_indirect(this: *mut c_void, pso: usize, tp: &super::real::TwoPassPso, sig: usize, max: u32, args: usize, args_off: u64, count_buf: usize, count_off: u64) -> Result<u32, String> {
-    let sig = super::indirect::signature_of(sig).ok_or("command signature layout unknown")?;
-    let (records, base) = clamped_records(this, &sig, max, args, args_off, count_buf, count_off).ok_or("argument records not readable on the CPU")?;
-    let Some(list) = ID3D12GraphicsCommandList::from_raw_borrowed(&this) else { return Err("no command list".into()) };
-    let bytes = std::slice::from_raw_parts(base as *const u8, records.len() * sig.stride as usize);
-    let mut ran = 0u32;
-    for (i, r) in records.iter().enumerate() {
-        let rec = &bytes[i * sig.stride as usize..];
-        replay_root_args(this, &sig, rec);
-        if r.counts.iter().all(|&c| c == 0) {
-            continue;
-        }
-        if tp.kind == "GS" {
-            let (count_, instances, first, indexed, first_instance) = match r.kind {
-                super::indirect::Kind::Draw => (r.counts[0], r.counts[1].max(1), r.counts[2], None, r.counts[3]),
-                super::indirect::Kind::DrawIndexed => (r.counts[0], r.counts[1].max(1), r.counts[2], Some(r.counts[3] as i32), r.counts[4]),
-                _ => return Err("a dispatch record against a geometry pipeline".into()),
-            };
-            gs_fetch_and_draw(this, &list, pso, tp, count_, instances, first, indexed, first_instance).map_err(|e| format!("record {i}: {e}"))?;
-            ran += 1;
-            continue;
-        }
-        let groups = r.groups(tp.record.max_vertices);
-        let cap = (MAX_GROUPS / tp.mesh_groups_per_record.max(1)).max(1);
-        let groups = groups.min(cap);
-        if groups == 0 {
-            continue;
-        }
-        if matches!(r.kind, super::indirect::Kind::Draw | super::indirect::Kind::DrawIndexed) && r.counts[1] > 1 {
-            note_skipped(format_args!("an indirect draw of {} instances with a console {} pipeline – the first only", r.counts[1], tp.kind));
-        }
-        two_pass(this, &list, pso, tp, groups, &[]).map_err(|e| format!("record {i}: {e}"))?;
-        ran += 1;
-    }
-    Ok(ran)
 }
 
 /// A DrawInstanced of the console's rect list (three corners of each rectangle, the fourth
