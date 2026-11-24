@@ -6,14 +6,15 @@
 //! waits on them (a retail game: plain `VirtualAlloc` memory, outside XCL's unified memory).
 //! The PC GPU cannot write there; dropped, the title waited for ever after its second frame.
 //! It also copies through its memory the GPU has no address for (command list #60 with a side
-//! outside the windows). Here each queue gets a fence of XCL's: after a submission whose lists
-//! carry such work the queue signals it, and a worker thread does the work, in submission
-//! order, when the GPU is there – what bottom of pipe means.
+//! outside the windows). Here each queue gets a fence and completion worker of XCL's: after a
+//! submission whose lists carry such work the queue signals its fence, and its worker thread
+//! does the work in submission order when the GPU is there – what bottom of pipe means, without
+//! one stalled queue blocking another queue's work.
 
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::sync::{mpsc, Mutex, OnceLock};
+use std::sync::{mpsc, Mutex};
 
 use windows::core::Interface;
 use windows::Win32::Foundation::HANDLE;
@@ -51,47 +52,58 @@ struct Job {
 // SAFETY: the fence is a free-threaded COM object; the writes are plain data
 unsafe impl Send for Job {}
 
-/// queue → its fence and the last value signalled
+/// queue → its fence, the last value signalled, and its dedicated completion worker
 struct QueueFence {
     fence: ID3D12Fence,
     value: u64,
+    tx: mpsc::Sender<Job>,
 }
 
 unsafe impl Send for QueueFence {}
 
 static FENCES: Mutex<Option<HashMap<usize, QueueFence>>> = Mutex::new(None);
+static NEXT_WORKER_ID: AtomicU32 = AtomicU32::new(0);
 
-/// how long the worker waits for one submission before writing anyway (a removed device, a
-/// queue that never gets there)
+/// how long a queue's worker waits for one submission before writing anyway (a removed device,
+/// a queue that never gets there)
 const WAIT_MS: u32 = 10_000;
 
-fn worker() -> &'static Mutex<mpsc::Sender<Job>> {
-    static W: OnceLock<Mutex<mpsc::Sender<Job>>> = OnceLock::new();
-    W.get_or_init(|| {
-        let (tx, rx) = mpsc::channel::<Job>();
-        let spawned = std::thread::Builder::new().name("xcl-cpu-writes".into()).spawn(move || unsafe {
-            let event = th::CreateEventW(std::ptr::null(), 0, 0, std::ptr::null());
-            for job in rx {
-                if job.fence.GetCompletedValue() < job.value && job.fence.SetEventOnCompletion(job.value, HANDLE(event as *mut c_void)).is_ok() {
-                    th::WaitForSingleObject(event, WAIT_MS);
-                }
-                for w in &job.work {
-                    match w {
-                        Work::Words(Write::Immediate(va, words)) => write_now(*va, words),
-                        Work::Words(Write::ReadbackU64 { va, src, .. }) => {
-                            let value = (*(*src as *const AtomicU64)).load(Ordering::Acquire);
-                            write_u64_now(*va, value);
-                        }
-                        Work::Copy((dst, src, bytes)) => copy_now(*dst, *src, *bytes),
+fn spawn_queue_worker() -> mpsc::Sender<Job> {
+    let (tx, rx) = mpsc::channel::<Job>();
+    let id = NEXT_WORKER_ID.fetch_add(1, Ordering::Relaxed);
+    let spawned = std::thread::Builder::new().name(format!("xcl-cpu-writes-{id}")).spawn(move || unsafe {
+        let event = th::CreateEventW(std::ptr::null(), 0, 0, std::ptr::null());
+        for job in rx {
+            if job.fence.GetCompletedValue() < job.value && job.fence.SetEventOnCompletion(job.value, HANDLE(event as *mut c_void)).is_ok() {
+                th::WaitForSingleObject(event, WAIT_MS);
+            }
+            for w in &job.work {
+                match w {
+                    Work::Words(Write::Immediate(va, words)) => write_now(*va, words),
+                    Work::Words(Write::ReadbackU64 { va, src, .. }) => {
+                        let value = (*(*src as *const AtomicU64)).load(Ordering::Acquire);
+                        write_u64_now(*va, value);
                     }
+                    Work::Copy((dst, src, bytes)) => copy_now(*dst, *src, *bytes),
                 }
             }
-        });
-        if let Err(e) = spawned {
-            crate::xlog_error!("D3D12.X: no thread for the writes after the GPU: {e}");
         }
-        Mutex::new(tx)
-    })
+        if !event.is_null() {
+            windows_sys::Win32::Foundation::CloseHandle(event);
+        }
+    });
+    if let Err(e) = spawned {
+        crate::xlog_error!("D3D12.X: no thread for the writes after the GPU: {e}");
+    }
+    tx
+}
+
+/// Drop the fence and worker channel for a released command queue so its worker exits once
+/// any queued work drains, and a reused pointer starts fresh.
+pub(super) fn forget_queue(queue: usize) {
+    if let Some(m) = FENCES.lock().unwrap().as_mut() {
+        m.remove(&queue);
+    }
 }
 
 /// The dwords at `va`, if the memory is still there and writable.
@@ -170,7 +182,7 @@ pub(super) unsafe fn after(queue: *mut c_void, work: Vec<Work>) {
         return;
     }
     let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&queue) else { return };
-    let job = {
+    let (tx, job) = {
         let mut g = FENCES.lock().unwrap();
         let m = g.get_or_insert_with(HashMap::new);
         let entry = match m.entry(queue as usize) {
@@ -182,18 +194,18 @@ pub(super) unsafe fn after(queue: *mut c_void, work: Vec<Work>) {
                 }
                 let Some(dev) = dev else { return };
                 let Ok(fence) = dev.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE) else { return };
-                v.insert(QueueFence { fence, value: 0 })
+                v.insert(QueueFence { fence, value: 0, tx: spawn_queue_worker() })
             }
         };
         entry.value += 1;
         if q.Signal(&entry.fence, entry.value).is_err() {
             return;
         }
-        Job { fence: entry.fence.clone(), value: entry.value, work }
+        (entry.tx.clone(), Job { fence: entry.fence.clone(), value: entry.value, work })
     };
     static FIRST: std::sync::Once = std::sync::Once::new();
     FIRST.call_once(|| crate::xlog_info!("D3D12.X: bottom-of-pipe writes outside unified memory are done by the CPU after the GPU ({} in the first submission)", job.work.len()));
-    let _ = worker().lock().unwrap().send(job);
+    let _ = tx.send(job);
 }
 
 #[cfg(test)]
