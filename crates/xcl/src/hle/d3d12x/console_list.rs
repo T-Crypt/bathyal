@@ -61,7 +61,7 @@ pub enum Param {
     /// root CBV / SRV / UAV: 64-bit GPU address at `at`
     Descriptor { at: u32 },
     /// descriptor table: 32-bit GPU address of its first descriptor (console shaders load
-    /// it with the high half 0; amd_fidelityfx_upscaler_xbox.dll writes 1 word)
+    /// it with the high half 0; the console FSR 4 upscaler writes 1 word)
     Table { at: u32 },
 }
 
@@ -493,7 +493,7 @@ unsafe extern "system" fn cl_copy_buffer_region(this: *mut c_void, dst: usize, d
     push(this as usize, &w);
 }
 /// #53 / #54 ClearUnorderedAccessViewUint / Float(gpu handle, cpu handle, resource, values[4],
-/// rect count, rects) – amd_fidelityfx_upscaler_xbox.dll picks #54 for float targets
+/// rect count, rects) – the console FSR 4 upscaler picks #54 for float targets
 unsafe fn clear_uav(this: *mut c_void, float: bool, gpu: u64, cpu: u64, res: usize, values: *const u32, rects: u32) {
     if rects != 0 {
         crate::xlog_warn!("console list: ClearUnorderedAccessView with {rects} rectangles – clearing the whole view");

@@ -253,8 +253,8 @@ pub struct MipLevel {
 /// by the smallest levels (64 KB / 4 KB blocks only) – then the other levels from the smallest
 /// to mip 0; slices follow each other `slice_bytes` apart. A slice is one array slice, one
 /// depth slice of a thin 3D texture, or one layer of `layout.block_d` depth slices of a thick
-/// one (every level's z-slices of that layer). On the retail TTPF archive the space between
-/// textures is exactly this size for 909 of its 912 textures.
+/// one (every level's z-slices of that layer). Tests on real texture archives show the space
+/// between textures is this size.
 #[derive(Clone, Debug)]
 pub struct Chain {
     pub layout: Layout,

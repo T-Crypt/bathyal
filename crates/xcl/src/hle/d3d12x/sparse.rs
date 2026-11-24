@@ -188,7 +188,7 @@ fn decommit_tiles(
 /// Drop the runs of `to_zero` whose tile is no longer mapped – once, where the runs are taken.
 /// (Pruning at every decommit that unmapped a tile walked the whole list each time: it grows
 /// until the next ExecuteCommandLists, and a title mapping gigabytes of physical pages while it
-/// loads – a newer retail title – spent seconds there, its watchdog ended the game.)
+/// loads spent seconds there, and the title's watchdog ended the game.)
 fn prune_zero_runs(mapped: &FxHashMap<usize, TileEntry>, runs: &mut Vec<(usize, usize)>) {
     runs.retain(|&(za, _)| mapped.contains_key(&(za & !(TILE - 1))));
 }

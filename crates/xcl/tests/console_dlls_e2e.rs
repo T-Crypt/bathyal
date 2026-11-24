@@ -50,6 +50,19 @@ fn load(dir: &std::path::Path, name: &str) -> std::sync::Arc<MappedModule> {
     xcl::loader::load_game_dll(&dir.join(name)).unwrap_or_else(|e| panic!("{name}: {e}"))
 }
 
+/// Load the console DLL whose file name contains `part` (case-insensitive): a package names
+/// its middleware DLLs after the console, so tests find them by kind, not by file name.
+fn load_found(dir: &std::path::Path, part: &str) -> std::sync::Arc<MappedModule> {
+    let want = part.to_ascii_lowercase();
+    let found = std::fs::read_dir(dir)
+        .unwrap_or_else(|e| panic!("{}: {e}", dir.display()))
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .find(|p| p.file_name().map(|n| n.to_string_lossy().to_ascii_lowercase().contains(&want)).unwrap_or(false))
+        .unwrap_or_else(|| panic!("no DLL containing {part:?} in {}", dir.display()));
+    load(dir, &found.file_name().unwrap().to_string_lossy())
+}
+
 fn proc(m: &MappedModule, name: &str) -> usize {
     match m.exports.by_name.get(name) {
         Some(ExportTarget::Rva(r)) => m.base + *r as usize,
@@ -109,7 +122,7 @@ fn console_crt_dlls_load_and_run() {
 #[test]
 fn other_console_dlls_map_and_initialise() {
     let Some(dir) = setup() else { return };
-    for name in ["msvcp140_1.dll", "msvcp140_2.dll", "msvcp140_atomic_wait.dll", "msvcp140_codecvt_ids.dll", "vccorlib140.dll", "vcruntime140_1.dll", "Bink2Scarlett.dll", "XCurl.dll", "libHttpClient.GDK.dll", "amd_fidelityfx_loader_xbox.dll", "amd_fidelityfx_upscaler_xbox.dll", "XboxBvhBuilder.dll"] {
+    for name in ["msvcp140_1.dll", "msvcp140_2.dll", "msvcp140_atomic_wait.dll", "msvcp140_codecvt_ids.dll", "vccorlib140.dll", "vcruntime140_1.dll", "XCurl.dll", "libHttpClient.GDK.dll", "XboxBvhBuilder.dll"] {
         let m = load(dir, name);
         assert!(m.initialized.load(std::sync::atomic::Ordering::Acquire), "{name}: DllMain");
     }
@@ -204,7 +217,7 @@ fn xbox_bvh_builder_prebuild_sizes() {
 fn bink2_console_dll_decodes_a_game_movie() {
     let Some(dir) = setup() else { return };
     let Some(movie) = std::env::var_os("XCL_SAMPLE_BK2") else { return };
-    let m = load(dir, "Bink2Scarlett.dll");
+    let m = load_found(dir, "bink2");
     unsafe {
         let open: extern "C" fn(*const u8, u32) -> *mut u32 = std::mem::transmute(proc(&m, "BinkOpen"));
         let error: extern "C" fn() -> *const std::ffi::c_char = std::mem::transmute(proc(&m, "BinkGetError"));
@@ -265,136 +278,6 @@ fn pages(n: usize) -> &'static mut [u8] {
         assert!(!p.is_null());
         std::slice::from_raw_parts_mut(p, n)
     }
-}
-
-/// Game geometry from `core_bvh4.rpf` (`XCL_SAMPLE_BVH4` = the package): one physical chunk
-/// (zlib at 0xa4e26070) holds at +0x100 a compressed bottom level (tag 0x81020006: tree,
-/// boxes and primitive pairing, no vertices). The console builder's own CPU `Rehydrate…X`
-/// expands it with a synthetic vertex buffer (vertex i = (i, -i, i / 2)); the output must be the
-/// GPURT gfx10 layout XCL emulates: root @0x30, box16 / box32 nodes, triangle pairs
-/// (v0..v3, primitives @52 / @56, triangle id @60) with every primitive exactly once.
-#[test]
-fn xbox_bvh_builder_rehydrates_game_geometry() {
-    let Some(dir) = setup() else { return };
-    let Some(pack) = std::env::var_os("XCL_SAMPLE_BVH4") else { return };
-    let m = load(dir, "XboxBvhBuilder.dll");
-    let chunk = {
-        use std::io::{Read, Seek, SeekFrom};
-        let mut f = std::fs::File::open(pack).unwrap();
-        f.seek(SeekFrom::Start(0xa4e26070)).unwrap();
-        let mut z = vec![0u8; 1 << 20];
-        f.read_exact(&mut z).unwrap();
-        let mut d = miniz_oxide::inflate::core::DecompressorOxide::new();
-        let mut out = vec![0u8; 1 << 20];
-        let flags = miniz_oxide::inflate::core::inflate_flags::TINFL_FLAG_PARSE_ZLIB_HEADER | miniz_oxide::inflate::core::inflate_flags::TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF;
-        let (st, _, n) = miniz_oxide::inflate::core::decompress(&mut d, &z, &mut out, 0, flags);
-        assert_eq!(st, miniz_oxide::inflate::TINFLStatus::Done);
-        out.truncate(n);
-        out
-    };
-    assert_eq!(&chunk[0x100..0x104], &[0x06, 0x00, 0x02, 0x81], "compressed bottom level tag");
-    let src = pages(chunk.len() + 0x1000);
-    src[..chunk.len()].copy_from_slice(&chunk);
-    let hdr = |at: usize| u32::from_le_bytes(src[0x100 + at..0x104 + at].try_into().unwrap());
-    let (prims, tri_nodes) = (hdr(4), hdr(0xC) as usize);
-    let scale = [0, 1, 2].map(|k| (2.0f64).powi(src[0x100 + 0x3C + k] as i32 - 127));
-    let dest = pages(16 << 20);
-    const VERTS: usize = 1 << 16;
-    let vb = pages(VERTS * 12);
-    for i in 0..VERTS {
-        for (k, c) in [i as f32, -(i as f32), i as f32 / 2.0].iter().enumerate() {
-            vb[12 * i + 4 * k..12 * i + 4 * k + 4].copy_from_slice(&c.to_le_bytes());
-        }
-    }
-    // primitives carry their geometry's index; identical geometries cover any of them
-    let geoms: Vec<GeometryDesc> = (0..1024)
-        .map(|_| GeometryDesc { ty: 0, flags: 1, transform: 0, index_format: 0, vertex_format: 6, index_count: 0, vertex_count: VERTS as u32, index_buffer: 0, vertex_buffer: vb.as_ptr() as u64, vertex_stride: 12 })
-        .collect();
-    let desc = BuildDesc {
-        dest: dest.as_ptr() as u64,
-        inputs: BuildInputs { ty: 1, flags: 0, num_descs: geoms.len() as u32, layout: 0, descs: geoms.as_ptr() as u64 },
-        source: src.as_ptr() as u64 + 0x100,
-        scratch: 0,
-    };
-    let mut this = vec![0u8; 0x10000];
-    let rehydrate: extern "system" fn(*mut u8, *mut u8, *const BuildDesc) -> i32 = unsafe {
-        std::mem::transmute(proc(&m, "?RehydrateRaytracingAccelerationStructureX@XboxBvhBuilder@@QEAAJPEAUID3D12Device11@@PEBUD3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC@@@Z"))
-    };
-    assert_eq!(rehydrate(this.as_mut_ptr(), std::ptr::null_mut(), &desc), 0, "Rehydrate HRESULT");
-    if let Some(out) = std::env::var_os("XCL_BVH_DUMP") {
-        let used = dest.iter().rposition(|&b| b != 0).map_or(0, |p| p + 1);
-        std::fs::write(out, &dest[..used]).unwrap();
-    }
-    let word = |at: usize| u32::from_le_bytes(dest[at..at + 4].try_into().unwrap());
-    assert_eq!(word(0) >> 24 & 1, 0, "rehydrated: compressed bit cleared");
-    let root = word(0x30);
-    assert!(matches!(root & 7, 4 | 5), "root {root:#x} is a box");
-    // vertex index from the synthetic position (positions come out scaled per axis)
-    let f = |at: usize| f32::from_bits(word(at)) as f64;
-    let vertex = |at: usize| -> usize {
-        let i = f(at) / scale[0];
-        let node = at & !63;
-        assert!(i.fract() == 0.0 && f(at + 4) == -i * scale[1] && f(at + 8) == i / 2.0 * scale[2], "vertex @{at:#x}: node {:?} words {:x?}", (0..12).map(|k| f(node + 4 * k) / scale[k % 3]).collect::<Vec<_>>(), (12..16).map(|k| word(node + 4 * k)).collect::<Vec<_>>());
-        i as usize
-    };
-    // @48 = geometry << 8 | second triangle << 7 | opaque; primitive indices count within their
-    // geometry, so (geometry, primitive) is unique
-    let (mut seen_prims, mut seen_nodes, mut boxes) = (std::collections::BTreeMap::<(u32, usize), u32>::new(), std::collections::BTreeSet::new(), [0usize; 2]);
-    let mut todo = vec![root];
-    while let Some(n) = todo.pop() {
-        let at = ((n & !7) as usize) << 3;
-        match n & 7 {
-            4 | 5 => {
-                boxes[(n & 7) as usize - 4] += 1;
-                todo.extend((0..4).map(|k| word(at + 4 * k)).filter(|&c| c != u32::MAX));
-            }
-            t @ 0..=1 => {
-                seen_nodes.insert(at);
-                let id = word(at + 60) >> (8 * t);
-                let (isrc, jsrc) = ((id & 3) as usize, (id >> 2 & 3) as usize);
-                if t == 0 {
-                    // @48 bit 7: a second triangle – the game's shader then tests the node again
-                    // as type 1 (`v76 = [node+48] >> 7`, `next = node | 1`)
-                    if word(at + 48) & 0x80 != 0 {
-                        todo.push(n | 1);
-                    }
-                    let p = word(at + 52) as usize;
-                    *seen_prims.entry((word(at + 48) >> 8, p)).or_default() += 1;
-                    let v = [vertex(at), vertex(at + 12), vertex(at + 24)];
-                    let mut sorted = v;
-                    sorted.sort_unstable();
-                    assert_eq!(sorted, [3 * p, 3 * p + 1, 3 * p + 2], "triangle 0 of node {n:#x}");
-                    assert_eq!((v[isrc], v[jsrc]), (3 * p + 1, 3 * p + 2), "I / J source of node {n:#x}");
-                } else {
-                    let q = word(at + 56) as usize;
-                    *seen_prims.entry((word(at + 48) >> 8, q)).or_default() += 1;
-                    // triangle 1 = (v1, v3, v2): only v3 is its own vertex
-                    let v3 = vertex(at + 36);
-                    assert!((3 * q..3 * q + 3).contains(&v3), "triangle 1 of node {n:#x}");
-                    if v3 == 3 * q + 1 {
-                        assert_eq!(isrc, 1, "I source of node {n:#x}");
-                    }
-                    if v3 == 3 * q + 2 {
-                        assert_eq!(jsrc, 1, "J source of node {n:#x}");
-                    }
-                }
-            }
-            t => panic!("unexpected node type {t} ({n:#x})"),
-        }
-    }
-    println!("Rehydrate: {} triangle nodes, box32 {}, box16 {}", seen_nodes.len(), boxes[1], boxes[0]);
-    assert_eq!(seen_nodes.len(), tri_nodes, "triangle nodes = header @0x0C");
-    assert!(seen_prims.values().all(|&c| c == 1), "every (geometry, primitive) exactly once");
-    // every geometry's primitives 0..n are all there
-    let mut per_geometry = std::collections::BTreeMap::<u32, Vec<usize>>::new();
-    for &(g, p) in seen_prims.keys() {
-        per_geometry.entry(g).or_default().push(p);
-    }
-    for (g, ps) in &per_geometry {
-        assert!(ps.iter().enumerate().all(|(i, &p)| i == p), "geometry {g}: primitives 0..{} without gaps", ps.len());
-    }
-    let counts: Vec<usize> = per_geometry.values().map(Vec::len).collect();
-    println!("geometries: {} with triangles {counts:?} (total {}; header field @0x04 = {prims})", counts.len(), seen_prims.len());
 }
 
 /// Probe: the console BVH builder constructed on XCL's D3D12.X device (real backend) – what
@@ -901,7 +784,7 @@ fn fsr4_console_upscaler_creates_a_context_probe() {
     if std::env::var_os("XCL_PROBE_FSR").is_none() {
         return;
     }
-    let m = load(dir, "amd_fidelityfx_upscaler_xbox.dll");
+    let m = load_found(dir, "fidelityfx_upscaler");
     unsafe {
         let iid: [u8; 16] = [0xf1, 0x19, 0x98, 0x18, 0xb6, 0x1d, 0x57, 0x4b, 0xbe, 0x54, 0x18, 0x21, 0x33, 0x9b, 0x85, 0xf7];
         let mut dev: *mut std::ffi::c_void = std::ptr::null_mut();

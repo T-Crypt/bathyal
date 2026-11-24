@@ -182,7 +182,7 @@ pub fn resolve_wait(pso: usize) -> usize {
 }
 
 /// A title's thread held this long in one pipeline wait is logged: a retail game's hang
-/// watchdog ends the process (`mov dword [0], 0` at title+0x2215c35, #156 / #232) when its
+/// watchdog ends the process (`mov dword [0], 0`, #156 / #232) when its
 /// threads stop for long, and an NVIDIA driver takes 10 - 17 s for one big translated pixel
 /// shader, minutes for a big compute program (#156).
 const LONG_WAIT: Duration = Duration::from_secs(2);

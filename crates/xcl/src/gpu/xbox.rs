@@ -1,7 +1,6 @@
 //! Xbox Series shader containers: precompiled console GPU code (RDNA2), no DXIL.
 //!
-//! Layout reverse-engineered from a retail title's shader pack (26 503 shaders, all
-//! stages, 2026-11-20). The outer DXBC container looks normal (SFI0, ISG1, OSG1, PSV0,
+//! Layout reverse-engineered from console shader containers (all stages, 2026-11-20). The outer DXBC container looks normal (SFI0, ISG1, OSG1, PSV0,
 //! HASH, DXIL, PRIV), but the DXIL part carries no LLVM bitcode:
 //!
 //! ```text

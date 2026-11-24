@@ -75,8 +75,8 @@ pub fn prebuild_size(leaf_count: u64, top_level: bool) -> u64 {
     (HEADER_BYTES as u64 + nodes + nodes / 64 * 4).div_ceil(1024) * 1024
 }
 
-/// Whether a console BVH header has bit 24 ("compressed / dehydrated", as stored in
-/// `*_bvh4.rpf` before `XboxBvhBuilder::Rehydrate*`) set in dword 0.
+/// Whether a console BVH header has bit 24 ("compressed / dehydrated", as a console package
+/// stores it before `XboxBvhBuilder::Rehydrate*`) set in dword 0.
 pub fn is_compressed_header(data: &[u8]) -> bool {
     data.len() >= 4 && ((word(data, 0) >> 24) & 1) != 0
 }

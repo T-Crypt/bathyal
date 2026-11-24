@@ -11,10 +11,8 @@ PC does not have (`kernelx`, XGameRuntime, D3D12.X, XAudio2 with XMA2, GameInput
 much like Wine/Proton do for Windows on Linux, and WinDurango does for
 Xbox One.
 
-**First success (in the user's words):** "getting the game running properly, i.e.
-handling the files (rpf etc.) and firing up the game on the PC". In practice:
-the game exe loads, all of its imports are bound, the game gets through
-initialization and reads its data files (archives such as RPF are read by the
+**First success:** the game exe loads, all of its imports are bound, the game
+gets through initialization and reads its data files (archives are read by the
 game's own code — the layer only has to provide working file operations).
 
 The layer is meant to be **general** — for any Series title, not tailored to one game.
@@ -288,9 +286,9 @@ Stages:
 7. Shader inputs (user SGPRs, initial VGPRs) — these require data from real
    console containers (unknown parts) — hence stage 1 comes first.
 
-**Console container format (done 2026-11-20, `gpu/xbox.rs`)** — determined on
-a real game's shader archive (26 503 shaders: PS 12 101, MS 9 282, VS 2 236, GS 195, CS 2 689;
-until 2026-11-22 the record scan missed the 2 634 compute shaders with effect-qualified names):
+**Console container format (done 2026-11-20, `gpu/xbox.rs`)** — determined on real
+console shader containers (all stages; a record scan can miss compute shaders whose names
+carry an effect qualifier):
 
 - DXBC: SFI0, ISG1, OSG1, PSV0, HASH, DXIL, PRIV. The DXIL part has an ordinary
   `DxilProgramHeader` (SM 6.6), bitcode = a 4-byte `NOBC`; between the header and the bitcode sits
@@ -383,12 +381,11 @@ estimated from SamplesEncoded/BlockCount·BytesPerBlock or nAvgBytesPerSec; cont
 loops preserved → callbacks on the title's timeline), #18 DestroyVoice. The remaining exports → the system
 `xaudio2_9.dll` (the HLE module's `fallback` list). Statistics: `report.json → audio`.
 
-**Data from a real game (`audio.rpf`, 28.5 GB, AWC "ADAT" containers)**: no XMA2 — AWC codec
-0x0B = **Opus** 48 kHz (2048 B blocks: `u16 LE length + Opus packet`, 20 ms frames, TOC
-CELT/Hybrid fullband; music streams: 512 KB blocks). Conclusion: for this title an XMA2 decoder
-is not needed; the game either decodes Opus itself (PCM → XAudio2, works), or uses
-the console's hardware Opus decoding — to be checked in the exe's imports (`xcl inspect`).
-Windows has an Opus decoder in Media Foundation (`MSOpusDecoder.dll`) — a candidate for the backend.
+**Data from a real game (AWC "ADAT" containers)**: no XMA2 — AWC codec 0x0B = **Opus**
+48 kHz (2048 B blocks: `u16 LE length + Opus packet`, 20 ms frames, TOC CELT/Hybrid
+fullband; music streams: 512 KB blocks). A title either decodes Opus itself (PCM → XAudio2,
+works) or uses the console's hardware Opus decoding. Windows has an Opus decoder in Media
+Foundation (`MSOpusDecoder.dll`) — a candidate for the backend.
 
 ### 5.9 Input and the rest (M4 — direction)
 

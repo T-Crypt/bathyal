@@ -24,7 +24,7 @@ Things worth reporting:
 - a write that gets past the overlay and changes the game folder or anything outside the title's
   data folder
 - a console path (`GAME:`, `G:`, `S:\`, `T:\` …) that resolves to somewhere it shouldn't
-- a crafted game file (shader pack, RPF archive, texture, PE image) that makes XCL itself crash or
+- a crafted game file (archive, texture, PE image) that makes XCL itself crash or
   run code it shouldn't
 - `report.json` or the logs leaking something they shouldn't, like paths or names outside the game
 
