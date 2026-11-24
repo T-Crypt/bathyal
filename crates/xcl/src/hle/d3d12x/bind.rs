@@ -152,6 +152,7 @@ fn put(list: *mut c_void, i: u32, offset: u32, bytes: &[u8]) {
 
 /// #34 SetGraphicsRootSignature (PC #30)
 pub(super) unsafe extern "system" fn set_graphics_root_signature(this: *mut c_void, rs: *mut c_void) {
+    super::lifetime::note(this as usize, rs as usize);
     let layout = console_list::layout_of(rs as usize);
     with(this, |s| {
         s.args_gfx = vec![0u8; layout.as_ref().map_or(0, |l| l.size as usize)];
@@ -212,6 +213,9 @@ pub(super) fn note_root_changing_signature(sig: usize) {
 /// translated pipeline, on XCL's ABI with the kept root arguments (signatures that change root
 /// arguments themselves cannot be – skipped, logged)
 pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: usize, max: u32, args: usize, args_off: u64, count_buf: usize, count_off: u64) {
+    super::lifetime::note(this as usize, sig);
+    super::lifetime::note(this as usize, args);
+    super::lifetime::note(this as usize, count_buf);
     type F = unsafe extern "system" fn(*mut c_void, usize, u32, usize, u64, usize, u64);
     let pc: F = std::mem::transmute(super::real::orig_fn(this, 59));
     let pso = super::pso_async::resolve_for_draw(with(this, |s| s.pso));
@@ -708,6 +712,7 @@ unsafe fn root_args_summary(this: *mut c_void, buffer_words: usize) -> String {
 
 /// #33 SetComputeRootSignature (PC #29)
 pub(super) unsafe extern "system" fn set_compute_root_signature(this: *mut c_void, rs: *mut c_void) {
+    super::lifetime::note(this as usize, rs as usize);
     let layout = console_list::layout_of(rs as usize);
     with(this, |s| {
         s.args = vec![0u8; layout.as_ref().map_or(0, |l| l.size as usize)];
