@@ -764,7 +764,7 @@ fn bc3_block_rebuild() {
 
 // ---- the ported decoder (`victory`): stream tests ----
 
-use super::{can_decode, decode, Error};
+use super::{can_decode, decode};
 
 #[test]
 fn truncated_and_empty_streams_fail() {
