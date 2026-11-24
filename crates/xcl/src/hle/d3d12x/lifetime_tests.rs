@@ -96,7 +96,7 @@ fn a_resource_released_after_submit_outlives_its_submission() {
         let mut raw_list: *mut c_void = std::ptr::null_mut();
         let iid = windows_sys::core::GUID::from_u128(0x5b160d0f_ac1b_4185_8ba8_b3ae42a5a455);
         let (hr, backing) = if pure {
-            type F = unsafe extern "system" fn(*mut c_void, u32, i32, *mut c_void, *mut c_void, *const windows::core::GUID, *mut *mut c_void) -> i32;
+            type F = unsafe extern "system" fn(*mut c_void, u32, i32, *mut c_void, *mut c_void, *const windows_sys::core::GUID, *mut *mut c_void) -> i32;
             let f: F = std::mem::transmute(real::orig_fn(dev.as_raw() as *mut c_void, 12));
             let hr = f(dev.as_raw() as *mut c_void, 0, D3D12_COMMAND_LIST_TYPE_DIRECT.0, alloc.as_raw() as *mut c_void, std::ptr::null_mut(), &iid, &mut raw_list);
             (hr, raw_list)
