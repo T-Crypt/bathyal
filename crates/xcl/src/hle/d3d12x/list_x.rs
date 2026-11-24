@@ -56,8 +56,6 @@ const TOP_TIMESTAMPS: u32 = 0xC;
 const MAX_FILL: u64 = 256 << 20;
 /// Bounded wait timeout for Wait32BitValueX / Wait64BitValueX so an unsatisfied wait never hangs.
 const WAIT_TIMEOUT: Duration = Duration::from_secs(2);
-/// Cap on tracked per-list written UMA ranges (for same-list write-then-wait detection).
-const MAX_WRITTEN_RANGES: usize = 256;
 
 fn once(counter: &AtomicU64, n: u64) -> bool {
     counter.fetch_add(1, Ordering::Relaxed) < n
@@ -550,7 +548,7 @@ struct ListState {
     /// Last `OMSetDepthBounds` values, restored after `KickoffX`
     depth_bounds: Option<(f32, f32)>,
     occlusion: Occlusion,
-    /// UMA address ranges written by this list since last Reset/KickoffX
+    /// Sorted, disjoint UMA ranges written by this list since last Reset/KickoffX
     written_ranges: Vec<(u64, u64)>,
     /// Sparse-window `(va, bytes)` ranges written by memory ops (`Write32/64`, `Fill*`,
     /// `CopyMemoryToMemoryX`, timestamps) to copy back to the CPU view after execution.
@@ -578,11 +576,14 @@ impl ListState {
             return;
         }
         let end = va.saturating_add(size);
-        if self.written_ranges.len() < MAX_WRITTEN_RANGES {
-            self.written_ranges.push((va, end));
-        } else if let Some(last) = self.written_ranges.last_mut() {
-            last.0 = last.0.min(va);
-            last.1 = last.1.max(end);
+        let ranges = &mut self.written_ranges;
+        let first = ranges.partition_point(|&(_, stop)| stop < va);
+        let count = ranges[first..].partition_point(|&(start, _)| start <= end);
+        if count == 0 {
+            ranges.insert(first, (va, end));
+        } else {
+            ranges[first] = (va.min(ranges[first].0), end.max(ranges[first + count - 1].1));
+            ranges.drain(first + 1..first + count);
         }
         if crate::gpu::uma::get().is_some_and(|u| u.is_sparse(va as usize)) {
             self.note_sparse(va as usize, size as usize);
@@ -611,7 +612,8 @@ impl ListState {
 
     fn has_prior_write(&self, va: u64, size: u64) -> bool {
         let end = va.saturating_add(size);
-        self.written_ranges.iter().any(|&(s, e)| va < e && s < end)
+        let first = self.written_ranges.partition_point(|&(_, stop)| stop <= va);
+        self.written_ranges.get(first).is_some_and(|&(start, _)| start < end)
     }
 
     fn clear_waits(&mut self) {
@@ -2869,6 +2871,19 @@ mod tests {
         unsafe { super::super::cpu_writes::copy_now(copies[0].0, copies[0].1, copies[0].2) };
         assert!(*dst == [0x5Au8; 0x100]);
         LISTS.lock().unwrap().as_mut().unwrap().remove(&(l as usize));
+    }
+
+    #[test]
+    fn scattered_writes_preserve_unwritten_gaps() {
+        let mut s = ListState::default();
+        for i in 0..300 {
+            s.note_write(0x1000 + i * 16, 8);
+        }
+        let a = 0x1000 + 260 * 16;
+        assert!(!s.has_prior_write(a + 8, 8));
+        s.note_write(a + 8, 8);
+        assert!(s.has_prior_write(a + 8, 8));
+        assert!(!s.has_prior_write(a - 8, 8));
     }
 
     #[test]
