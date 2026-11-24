@@ -1993,3 +1993,24 @@ Little is left to do without the exe – the rest needs an actual run of the gam
 5. Smaller: whole-wave reductions of compute / mesh programs in partial waves (VS / PS done), `image_sample_o` with an offset from a VGPR,
    smaller HLSL, further XGameRuntime APIs (XGameUI, XNetworking…), GameInput → system GameInput.dll,
    mapping physical pages at the game's address.
+
+## GPU_UPLOAD: CPU-written video memory (2026-11-23)
+
+`D3D12_HEAP_TYPE_GPU_UPLOAD` (Agility 1.613+, `D3D12_FEATURE_D3D12_OPTIONS16::GPUUploadHeapSupported`,
+ReBAR) is VRAM the CPU maps write-combined. A block there costs no write-watch page, no
+GetWriteWatch walk and no upload copy: what the CPU writes, the GPU reads where it is.
+`gpu::upload` makes one heap (64 MB, `XCL_GPU_UPLOAD_MB`) when `XCL_GPU_UPLOAD=1`; feature query
+is logged, the heap creation is the real gate, and everything falls back to unified memory when
+it fails. `XCL_GPU_UPLOAD` is off by default.
+
+What it backs now: the per-draw `io` (user-SGPR) block and the 256-byte `res` block that
+translated shaders read through root UAVs `u0` / `u1` (`bind::abi_views`). Their CPU addresses
+map to the heap's GPU VAs through `real::uma_va_of` -> `upload::va_of`; blocks go back to the
+heap when the recording's allocator resets (`console_list::free_uma`).
+
+It cannot back title memory at its own addresses yet: the recompiler turns a console address into
+`4 GiB window buffer VA + low 32 bits`, and a GPU_UPLOAD heap has a driver-chosen GPU VA and a
+driver-chosen CPU mapping, neither of which is a window address. A title allocation would then
+have two addresses (its pointer and its GPU VA). Also `CreateCommandListX` constant buffers are
+read by translated shaders through `mem` at the console address, so blocking that needs the
+decided GPU page table (placeholders + relocation), not a heap type change.

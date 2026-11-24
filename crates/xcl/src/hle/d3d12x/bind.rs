@@ -59,8 +59,9 @@ fn count(k: usize) {
         let (coherent_used, coherent_total, sparse_used) = crate::gpu::uma::get()
             .map_or((0, 0, 0), |u| (u.used() >> 20, u.size() >> 20, u.sparse_used() >> 20));
         crate::xlog_info!(
-            "D3D12.X: console code so far: {} draws with translated pipelines ({} skipped, {} with PC pipelines), {} dispatches ({} skipped); coherent {coherent_used}/{coherent_total} MB, sparse {sparse_used} MB, {blocks} blocks held for {allocators} allocators",
+            "D3D12.X: console code so far: {} draws with translated pipelines ({} skipped, {} with PC pipelines), {} dispatches ({} skipped); coherent {coherent_used}/{coherent_total} MB, sparse {sparse_used} MB, {blocks} blocks held for {allocators} allocators{}",
             c[DRAWS], c[DRAWS_SKIPPED], c[DRAWS_PC], c[DISPATCHES], c[DISPATCHES_SKIPPED],
+            crate::gpu::upload::stats().map_or(String::new(), |s| format!(", {s}")),
         );
     }
 }
@@ -921,6 +922,15 @@ unsafe fn set_abi(list: &ID3D12GraphicsCommandList, rs: &ID3D12RootSignature, vi
 /// The GPU addresses of the ABI's root UAVs for the kept arguments (compute or graphics):
 /// u0 io (the user SGPRs, `io_patch` written over them), u1 res (`res`, or 256 bytes of its
 /// own), u2… the memory windows.
+/// `bytes` in the GPU_UPLOAD heap (None: the path is off or full – the caller uses unified
+/// memory). The block lives until the recording's allocator resets, like the arena's blocks.
+unsafe fn upload_block(this: *mut c_void, bytes: &[u8]) -> Option<usize> {
+    let p = crate::gpu::upload::alloc(bytes.len().max(16), 256)?;
+    std::ptr::copy_nonoverlapping(bytes.as_ptr(), p as *mut u8, bytes.len());
+    with(this, |s| s.uma.push(p));
+    Some(p)
+}
+
 unsafe fn abi_views(this: *mut c_void, real: usize, gfx: bool, res: Option<u64>, io_patch: &[(usize, u32)]) -> Result<Vec<u64>, String> {
     super::list_x::ensure_view_heap(this);
     let u = crate::gpu::uma::get().ok_or("no unified memory")?;
@@ -948,11 +958,24 @@ unsafe fn abi_views(this: *mut c_void, real: usize, gfx: bool, res: Option<u64>,
             *w = v;
         }
     }
-    let io_at = copy(&io.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<u8>>())?;
+    // XCL's own GPU-read, CPU-written blocks: in the GPU_UPLOAD heap when it exists (the CPU
+    // writes video memory directly: no write-watch page, no upload before the submit). The
+    // argument table above stays in console memory – shaders dereference it by address.
+    let io_bytes: Vec<u8> = io.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let io_at = match upload_block(this, &io_bytes) {
+        Some(p) => p,
+        None => copy(&io_bytes)?,
+    };
     let va = |p: usize| super::real::uma_va_of(p).unwrap_or(first);
     let res = match res {
         Some(r) => r,
-        None => va(copy(&[0u8; 256])?),
+        None => {
+            let zero = [0u8; 256];
+            match upload_block(this, &zero) {
+                Some(p) => va(p),
+                None => va(copy(&zero)?),
+            }
+        }
     };
     Ok([va(io_at), res].into_iter().chain((0..4).map(|k| windows.get(k).copied().unwrap_or(first))).collect())
 }

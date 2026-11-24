@@ -1832,6 +1832,10 @@ unsafe fn gpu_va(list: *mut c_void, va: u64, bytes: usize, what: &str, mirror: b
     if t != va || va == 0 || bytes == 0 {
         return t;
     }
+    // a GPU address of XCL's GPU_UPLOAD heap: a PC resource's address, no copy needed
+    if crate::gpu::upload::owns_gpu(va) {
+        return t;
+    }
     // in a window by number: a PC resource's GPU address
     if crate::gpu::uma::get().is_none_or(|u| u.contains(va as usize)) || !crate::gpu::shader::readable(va as usize, bytes) {
         return t;
