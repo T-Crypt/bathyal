@@ -24,11 +24,13 @@
 //!   cannot hand over does nothing either.
 //!
 //! The lane is a port of the `decoder` module of Microsoft's silicon-rans sample
-//! (`mdu_minirans.v`, Copyright (c) Microsoft Corporation, MIT), made for XCL on 2026-11-23:
-//! same registers, same two phases, same control states. The sample leaves the feeder and the
-//! symbol vector out; the two rules above are from the public format notes of bcpack-decoder
-//! (Tim0219800) and bcpack-rs (Ahmet Dedeler), both MIT, which report them as checked against
-//! retail streams.
+//! (https://github.com/microsoft/silicon-rans, `mdu_minirans.v` at commit 2f6827d, Copyright (c)
+//! Microsoft Corporation, MIT), made for XCL on 2026-11-23: same registers, same two phases,
+//! same control states. The sample leaves the feeder and the symbol vector out; the two rules
+//! above are from the public format notes of bcpack-decoder
+//! (https://github.com/Tim0219800/bcpack-decoder, `docs/SPEC.md`) and bcpack-rs
+//! (https://github.com/Ahmet-Dedeler/bcpack-rs, `docs/BCPACK_SPEC.md`), both MIT, which report
+//! them as checked against retail streams; no code was taken from either.
 
 use super::rans_tables::FREQ;
 use super::Error;

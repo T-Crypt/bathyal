@@ -14,9 +14,12 @@
 //! * the rebuild of BC5 blocks ([`bc5`]), which also needs constants that are not in the
 //!   stream ([`bc5::Tables`]). XCL has the index-pair table and the estimates
 //!   leonida-asset-pipeline made of the history (`bc5_tables.rs`), so its BC5 blocks are an
-//!   approximation wherever an estimate is off.
+//!   approximation wherever an estimate is off,
+//! * the rebuild of BC3 and BC4 blocks ([`bc3`], [`bc4`]), which need the same kind of
+//!   tables. XCL has no source for them it can take, so nothing calls it and those requests
+//!   are still refused.
 //!
-//! What is not: the rebuild of BC3, BC4, BC6H and BC7. Their lanes decode, but the block
+//! What is not: the rebuild of BC6H and BC7. Their lanes decode, but the block
 //! rebuild needs tables of constants that no stream carries. For BC7 those are the 256-slot
 //! endpoint history, the 256-slot index history and 10 of the 285 lane-15 mode signatures;
 //! the only sources that fitted them are GPL-3.0, which this GPL-2.0-only crate cannot take,
@@ -32,6 +35,8 @@
 
 pub mod bc1;
 mod bc1_fitted;
+pub mod bc3;
+pub mod bc4;
 pub mod bc5;
 mod bc5_tables;
 mod lanes;

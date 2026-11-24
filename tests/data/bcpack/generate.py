@@ -117,13 +117,13 @@ def encode(symbols, widths, reductions, model=0, carry=False, trim=False):
     return bytes(out)
 
 
-def generate(mode, units, seed, reduced, **options):
+def generate(mode, units, seed, reduced, quiet_lane1=False, **options):
     widths = WIDTHS[mode]
     rng = random.Random(seed)
     reductions = [rng.randrange(4) if reduced else 0 for width in widths]
     symbols = [[rng.randrange(1 << (width - reduction)) for _ in range(units)]
                for width, reduction in zip(widths, reductions)]
-    if mode == 1:
+    if mode == 1 or quiet_lane1:
         symbols[1] = [0] * units
     path = ROOT / f'bc{mode}-{units}-{seed}'
     path.with_suffix('.bin').write_bytes(encode(symbols, widths, reductions, **options))
@@ -159,6 +159,89 @@ def assemble(symbols):
     return bytes(raw)
 
 
+# Made-up constants for the BC3/BC4/BC5 fixtures (the real ones are not public under a licence
+# XCL can take): pair symbol s means the selectors (5s + 3) mod 64, left texel in bits 0-2.
+def made_up_pair(s):
+    return (5 * s + 3) % 64
+
+
+def made_up_history(slot, count):
+    return [(7 * slot + 13 * k) % 256 for k in range(count)]
+
+
+def pair_selectors(halves):
+    """48 selector bits of a 4x4 block from its pair symbols, two a row, left half first."""
+    bits = 0
+    for y in range(4):
+        for x in range(4):
+            sel = made_up_pair(halves[2*y + x//2]) >> (3 * (x % 2)) & 7
+            bits |= sel << (3 * (4*y + x))
+    return bits.to_bytes(6, 'little')
+
+
+def assemble_bc4(symbols):
+    blocks = []
+    raw = bytearray()
+    for i, (ref, _, d0, d1, *halves) in enumerate(zip(*symbols)):
+        d = 255 - ref // 2 if ref & 1 else ref // 2
+        predictor = ([128, 128] if d == 0 else
+                     blocks[i-d] if i >= d else made_up_history((i-d) % 256, 2))
+        ends = [(p + (~(v >> 1) if v & 1 else v >> 1)) % 256 for p, v in zip(predictor, (d0, d1))]
+        blocks.append(ends)
+        raw.extend(bytes(ends) + pair_selectors(halves))
+    return bytes(raw)
+
+
+def assemble_bc5(symbols):
+    blocks = []
+    raw = bytearray()
+    units = list(zip(*symbols))
+    for i in range(len(units) // 2):
+        a, b = units[2*i], units[2*i + 1]
+        ref = sum((a[0] >> k & 1) << (2*k) | (b[0] >> k & 1) << (2*k + 1) for k in range(4))
+        d = 255 - ref // 2 if ref & 1 else ref // 2
+        predictor = ([128] * 4 if d == 0 else
+                     blocks[i-d] if i >= d else made_up_history((i-d) % 256, 4))
+        diffs = (a[2], b[2], a[3], b[3])
+        ends = [(p + (~(v >> 1) if v & 1 else v >> 1)) % 256 for p, v in zip(predictor, diffs)]
+        blocks.append(ends)
+        for c in range(2):
+            halves = [u[4 + 4*c + y] for y in range(4) for u in (a, b)]
+            raw.extend(bytes(ends[2*c:2*c + 2]) + pair_selectors(halves))
+    return bytes(raw)
+
+
+def made_up_quadrant(q):
+    return (37 * q + 11) % 256
+
+
+def assemble_bc3(symbols):
+    blocks = []
+    raw = bytearray()
+    units = list(zip(*symbols))
+    ranges = (256, 256, 32, 64, 32, 32, 64, 32)
+    for i in range(len(units) // 2):
+        a, b = units[2*i], units[2*i + 1]
+        ref = sum((a[0] >> k & 1) << (2*k) | (b[0] >> k & 1) << (2*k + 1) for k in range(4))
+        d = 255 - ref // 2 if ref & 1 else ref // 2
+        predictor = ([128, 128, 0, 0, 0, 0, 0, 0] if d == 0 else
+                     blocks[i-d] if i >= d else made_up_history((i-d) % 256, 8))
+        diffs = (a[2], b[2], a[7], a[8], a[9], b[7], b[8], b[9])
+        ends = [(p + (~(v >> 1) if v & 1 else v >> 1)) % m for p, v, m in zip(predictor, diffs, ranges)]
+        blocks.append(ends)
+        raw.extend(bytes(ends[:2]) + pair_selectors([u[3 + y] for y in range(4) for u in (a, b)]))
+        for r, g, bl in (ends[2:5], ends[5:]):
+            raw.extend(struct.pack('<H', r << 11 | g << 5 | bl))
+        quads = (a[10], b[10], a[11], b[11])
+        indices = 0
+        for y in range(4):
+            for x in range(4):
+                code = made_up_quadrant(quads[2*(y//2) + x//2])
+                indices |= (code >> (2 * (2*(y%2) + x%2)) & 3) << (2 * (4*y + x))
+        raw.extend(struct.pack('<I', indices))
+    return bytes(raw)
+
+
 if __name__ == '__main__':
     for mode in WIDTHS:
         cases = [(2, 0, False), (16, 1, True), (700, 2, False)]
@@ -172,6 +255,14 @@ if __name__ == '__main__':
     for units, seed, extra in [(1, 8, dict(trim=True)), (16, 9, dict(carry=True))]:
         syms, path = generate(1, units, seed, False, **extra)
         path.with_suffix('.bc1').write_bytes(assemble(syms))
+
+    # 300 blocks: the first ones predict from the history, the later ones from the stream
+    syms, path = generate(4, 300, 4, False, quiet_lane1=True)
+    path.with_suffix('.bc4').write_bytes(assemble_bc4(syms))
+    syms, path = generate(5, 600, 5, False, quiet_lane1=True)
+    path.with_suffix('.bc5').write_bytes(assemble_bc5(syms))
+    syms, path = generate(3, 600, 6, False, quiet_lane1=True)
+    path.with_suffix('.bc3').write_bytes(assemble_bc3(syms))
 
     for mode, widths in [(1, BC1), (7, BC7)]:
         units = 8192

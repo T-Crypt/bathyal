@@ -15,8 +15,9 @@
 //! The blocks are in the order of the surface's memory, tiled as the console stores it.
 //!
 //! After the BC1 sections of the public format notes of bcpack-decoder (Tim0219800,
-//! `docs/SPEC.md`) and bcpack-rs (Ahmet Dedeler, `docs/BCPACK_SPEC.md`), both MIT; written for
-//! XCL on 2026-11-23.
+//! https://github.com/Tim0219800/bcpack-decoder, `docs/SPEC.md`) and bcpack-rs (Ahmet Dedeler,
+//! https://github.com/Ahmet-Dedeler/bcpack-rs, `docs/BCPACK_SPEC.md`), both MIT; no code was
+//! taken from either. Written for XCL on 2026-11-23.
 
 use super::{lanes, lane_widths, Error};
 
