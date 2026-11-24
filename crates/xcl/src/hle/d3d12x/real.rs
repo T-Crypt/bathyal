@@ -4240,7 +4240,7 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
     }
     TRANSLATED_PSO.fetch_add(1, Ordering::Relaxed);
     note_pso_rs(*ppv, rs);
-    super::pso_disk::note_pso_shader(*ppv as usize, super::pso_disk::shaders_sig(&[cs]));
+    super::pso_disk::note_pso_shader_kind(*ppv as usize, super::pso_disk::shaders_sig(&[cs]), true);
     if let Some(n) = crate::gpu::recomp::pso::compute_user_sgprs(cs) {
         PSO_USER_SGPRS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, n);
     }
@@ -4581,25 +4581,34 @@ unsafe fn go_background(
         return None;
     }
     let dev = Dev(this as usize, f as usize);
+    // the stand-in is what every bind sees: register the shader identity under its address too,
+    // so a bind can record this pipeline (compute included) before the real one exists
+    let sig = owned.shader_sig();
+    super::pso_disk::note_pso_shader_kind(*ppv as usize, sig, compute);
     // a pipeline drawn with in an earlier run is built now, while the title loads: its driver
     // blob is in the library, so the build is quick and its first draw does not wait
-    let eager = super::pso_async::build_during_load(super::pso_async::lazy(), super::pso_disk::wanted_shader(owned.shader_sig()));
+    let flags = super::pso_disk::wanted_flags(sig);
+    let eager = super::pso_async::build_during_load(super::pso_async::lazy(), flags.is_some());
     if eager && super::pso_async::lazy() {
         super::pso_async::note_prewarmed();
     }
-    let submit = if eager { super::pso_async::submit } else { super::pso_async::submit_lazy };
-    submit(
-        *ppv as usize,
-        compute,
-        Box::new(move || {
-            let mut out: *mut c_void = std::ptr::null_mut();
-            if unsafe { build(dev, &owned, &mut out) } && !out.is_null() {
-                out as usize
-            } else {
-                0
-            }
-        }),
-    );
+    let job = Box::new(move || {
+        let mut out: *mut c_void = std::ptr::null_mut();
+        if unsafe { build(dev, &owned, &mut out) } && !out.is_null() {
+            out as usize
+        } else {
+            0
+        }
+    });
+    if let Some(flags) = flags {
+        // recorded: compute first, then ones seen still building in an earlier run
+        super::pso_async::submit_recorded(*ppv as usize, compute, flags, job);
+    } else if eager {
+        // lazy creation is off (`XCL_LAZY_PSO=0`): every pipeline is built while it loads
+        super::pso_async::submit(*ppv as usize, compute, job);
+    } else {
+        super::pso_async::submit_lazy(*ppv as usize, compute, job);
+    }
     Some(hr)
 }
 
