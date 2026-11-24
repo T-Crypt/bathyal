@@ -2806,6 +2806,7 @@ fn overrides(kind: Kind) -> Vec<(&'static str, usize)> {
             ("CreateStateObject", dev_create_state_object as usize),
             ("CreateCommittedResource2", dev_create_committed_resource2 as usize),
             ("CreatePlacedResource1", dev_create_placed_resource1 as usize),
+            ("CreateShaderCacheSession", dev_create_shader_cache_session as usize),
             ("CreateCommandQueue1", dev_create_command_queue1 as usize),
         ]),
         Kind::CommandList => v.extend_from_slice(&[
@@ -3530,6 +3531,30 @@ creator!(dev_create_query_heap, "CreateQueryHeap", Kind::QueryHeap, [a1]);
 creator!(dev_create_command_signature, "CreateCommandSignature", Kind::CommandSignature, [a1, a2]);
 creator!(dev_create_pipeline_library, "CreatePipelineLibrary", Kind::PipelineLibrary, [a1, a2]);
 creator!(dev_create_state_object, "CreateStateObject", Kind::StateObject, [a1]);
+
+unsafe extern "system" fn dev_create_shader_cache_session(
+    this: *mut c_void,
+    desc: *const D3D12_SHADER_CACHE_SESSION_DESC,
+    riid: *const GUID,
+    ppv: *mut *mut c_void,
+) -> HRESULT {
+    type F = unsafe extern "system" fn(*mut c_void, *const D3D12_SHADER_CACHE_SESSION_DESC, *const GUID, *mut *mut c_void) -> HRESULT;
+    let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "CreateShaderCacheSession")));
+    let hr = f(this, desc, riid, ppv);
+    if hr >= 0 {
+        return hr;
+    }
+    let fb = super::shader_cache_session::create_fallback(this, desc, riid as *const windows::core::GUID, ppv);
+    if fb >= 0 {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            crate::xlog_info!("D3D12.X: CreateShaderCacheSession failed on the PC runtime ({hr:#x}) – using an in-memory session");
+        });
+        fb
+    } else {
+        hr
+    }
+}
 
 // ---------------------------------------------------------------------------------------
 // pipeline states: capture + fallback

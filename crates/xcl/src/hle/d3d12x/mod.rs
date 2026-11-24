@@ -29,6 +29,7 @@ pub mod pso_async;
 mod pso_disk;
 mod queue_gate;
 pub mod real;
+mod shader_cache_session;
 pub mod sparse;
 pub mod tile_check;
 pub mod title_list;
