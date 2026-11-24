@@ -104,7 +104,7 @@ class ReportTest(unittest.TestCase):
     def test_frames_and_story_start(self):
         report = self.analyse(FRAG_HEAD + FRAG_TAIL)
         self.assertEqual(report["frames_presented"], 600)
-        self.assertEqual(report["story_start"]["line"], 2)
+        self.assertEqual(report["story_start"]["record"], 2)
         self.assertEqual(report["story_start"]["frame"], 0)
 
     def test_pipeline_mentions_grouped_with_count_and_frames(self):
@@ -174,6 +174,19 @@ class ReportTest(unittest.TestCase):
         # (900, 0), (1200, 300), (1500, 600): one skip per frame
         self.assertAlmostEqual(slope["per_1000_frames"], 1000.0, places=1)
         self.assertEqual((slope["first"], slope["last"]), (0, 600))
+
+    def test_last_step_runs_to_the_final_sample_not_the_first_of_its_frame(self):
+        lines = FRAG_HEAD + [
+            "xcl: D3D12.X: 900 frames presented, 20.0 fps over the last 300",
+            activity(100, 0, 0, 10, 64),
+            "xcl: D3D12.X: 1200 frames presented, 20.0 fps over the last 300",
+            activity(200, 0, 0, 20, 128),
+            activity(300, 0, 0, 30, 512),
+        ] + FRAG_TAIL
+        report = self.analyse(lines)
+        step = report["slope"]["dispatches_skipped"]["last_step"]
+        self.assertEqual(step, {"from_frame": 900, "from_value": 64,
+                                "to_frame": 1200, "to_value": 512})
 
     def test_slope_is_absent_when_every_sample_shares_a_frame(self):
         lines = FRAG_HEAD + [

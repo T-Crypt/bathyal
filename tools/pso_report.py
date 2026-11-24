@@ -115,7 +115,7 @@ def analyse(text: str, path: str = "<log>") -> dict:
             frame = frames_reported
 
         if story_start is None and RE_STORY.search(line):
-            story_start = {"line": index, "frame": frame}
+            story_start = {"record": index, "frame": frame}
 
         m = RE_CACHE.search(line)
         if m:
@@ -249,15 +249,21 @@ def slope(samples, end_frame):
         mx, my = sum(xs) / n, sum(ys) / n
         var = sum((x - mx) ** 2 for x in xs)
         per_frame = sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / var
-        steps = [(x, y) for i, (x, y) in enumerate(zip(xs, ys))
-                 if i == 0 or x != xs[i - 1]]
+        # The last movement between two distinct frame numbers, to the last sample overall:
+        # several samples share the final frame, and their run is where the work piled up.
+        frames_seen = sorted(set(xs))
+        last_frame = frames_seen[-1]
+        earlier = [i for i, x in enumerate(xs) if x < last_frame]
+        last_step = None
+        if earlier:
+            i = earlier[-1]
+            last_step = {"from_frame": xs[i], "from_value": ys[i],
+                         "to_frame": last_frame, "to_value": ys[-1]}
         out[field] = {"per_1000_frames": round(per_frame * 1000, 1),
                       "first": ys[0], "last": ys[-1],
                       "frames_covered": max(xs) - min(xs),
-                      "distinct_frames": len(set(xs)),
-                      "last_step": {"from_frame": steps[-2][0], "from_value": steps[-2][1],
-                                    "to_frame": steps[-1][0], "to_value": steps[-1][1]}
-                      if len(steps) > 1 else None}
+                      "distinct_frames": len(frames_seen),
+                      "last_step": last_step}
     return out
 
 
@@ -276,7 +282,7 @@ def render(report) -> str:
     out.append(f"log: {report['log']}")
     out.append(f"frames presented: {report['frames_presented']}")
     story = report["story_start"]
-    out.append("story start: " + (f"line {story['line']}, frame {story['frame']}"
+    out.append("story start: " + (f"record {story['record']}, frame {story['frame']}"
                                   if story else "not found (no QueryApiImpl 8836fe87 line)"))
 
     end = report["end_status"]
