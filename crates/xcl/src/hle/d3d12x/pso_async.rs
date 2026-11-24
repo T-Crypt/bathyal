@@ -220,6 +220,7 @@ fn submit_as(standin: usize, compute: bool, job: Job, send: bool) {
         timed_out: Default::default(),
         orphan: Default::default(),
         noted: Default::default(),
+        demand: Default::default(),
     });
     PENDING.lock().unwrap().get_or_insert_with(HashMap::new).insert(standin, p.clone());
     static ONCE: std::sync::Once = std::sync::Once::new();
