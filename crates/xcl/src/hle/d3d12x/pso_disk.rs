@@ -8,9 +8,12 @@
 //!
 //! The console shaders a pipeline was drawn with are written to `drawn.txt` beside the blobs.
 //! The next run builds those pipelines while the title loads instead of at their first use
-//! (`pso_async::build_during_load`).
+//! (`pso_async::build_during_load`). A line may carry flags after the shader identity: `1` a
+//! compute pipeline (built before graphics ones) and `2` one seen still building in an earlier
+//! run (built before the rest). A bare hex line is the old format: a graphics pipeline that was
+//! not seen building. Old files stay readable; new files with no flags look the same.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
@@ -169,17 +172,32 @@ pub fn shaders_sig(blobs: &[&[u8]]) -> u64 {
     h
 }
 
-/// Console shader identity of pipelines built this run, by pipeline state.
-static PSO_SHADERS: Mutex<Option<HashMap<usize, u64>>> = Mutex::new(None);
+/// A recorded pipeline is a compute one (built before graphics ones).
+pub const FLAG_COMPUTE: u8 = 1;
+/// A recorded pipeline was seen still building (or was skipped) in an earlier run: it goes
+/// before the other recorded pipelines.
+pub const FLAG_STALLED: u8 = 2;
+const FLAG_ALL: u8 = FLAG_COMPUTE | FLAG_STALLED;
+
+/// Console shader identity of pipelines built this run, and whether the pipeline is compute.
+static PSO_SHADERS: Mutex<Option<HashMap<usize, (u64, bool)>>> = Mutex::new(None);
 /// how many pipelines are in `PSO_SHADERS` (a bind skips the lock while none are)
 static SHADERS_KNOWN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-/// Pipeline state `pso` was built from the shaders of `sig`.
+/// Pipeline state `pso` was built from the shaders of `sig` (graphics).
 pub fn note_pso_shader(pso: usize, sig: u64) {
+    note_pso_shader_kind(pso, sig, false);
+}
+
+/// Pipeline state `pso` was built from the shaders of `sig`; `compute` says which kind of
+/// pipeline it is, so the record knows to build it before graphics ones next run. A stand-in is
+/// registered too (its address is what a bind sees), so a bind can record the pipeline before
+/// its real one exists.
+pub fn note_pso_shader_kind(pso: usize, sig: u64, compute: bool) {
     if pso == 0 {
         return;
     }
-    PSO_SHADERS.lock().unwrap().get_or_insert_with(HashMap::new).insert(pso, sig);
+    PSO_SHADERS.lock().unwrap().get_or_insert_with(HashMap::new).insert(pso, (sig, compute));
     SHADERS_KNOWN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
@@ -194,21 +212,34 @@ pub fn forget_pso(pso: usize) {
 }
 
 /// `pso` is bound: what it was built from is drawn with, and the next run builds it during
-/// load.
+/// load. A stand-in is recorded with the kind it was created as, so compute pipelines count.
 pub fn note_drawn(pso: usize) {
     if SHADERS_KNOWN.load(std::sync::atomic::Ordering::Relaxed) == 0 {
         return;
     }
-    let sig = PSO_SHADERS.lock().unwrap().as_ref().and_then(|m| m.get(&pso).copied());
-    if let Some(sig) = sig {
-        mark_drawn(&dir(), sig);
+    let entry = PSO_SHADERS.lock().unwrap().as_ref().and_then(|m| m.get(&pso).copied());
+    if let Some((sig, compute)) = entry {
+        mark_drawn(&dir(), sig, compute);
     }
 }
 
-/// The shaders drawn with in an earlier run, and the ones this run has added not yet written.
+/// `pso` was used while its real pipeline was still building (a skipped dispatch or a draw with
+/// the stand-in): the next run builds it before the other recorded pipelines.
+pub fn note_stalled(pso: usize) {
+    if SHADERS_KNOWN.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+        return;
+    }
+    let sig = PSO_SHADERS.lock().unwrap().as_ref().and_then(|m| m.get(&pso).map(|e| e.0));
+    if let Some(sig) = sig {
+        mark_stalled(&dir(), sig);
+    }
+}
+
+/// The shaders drawn with in an earlier run and their flags, and the ones this run has added
+/// not yet written.
 struct Drawn {
     dir: PathBuf,
-    keys: HashSet<u64>,
+    entries: HashMap<u64, u8>,
     unsaved: usize,
 }
 
@@ -216,19 +247,35 @@ static DRAWN: Mutex<Option<Drawn>> = Mutex::new(None);
 /// how many entries are written at once by the side thread
 const DRAWN_BATCH: usize = 64;
 
-fn read_drawn(dir: &Path) -> HashSet<u64> {
+/// Read the record. A line is `identity` (the old format: a graphics pipeline, not seen
+/// building) or `identity flags` in hex.
+fn read_drawn(dir: &Path) -> HashMap<u64, u8> {
     std::fs::read_to_string(drawn_path(dir))
-        .map(|text| text.lines().filter_map(|l| u64::from_str_radix(l.trim(), 16).ok()).collect())
+        .map(|text| {
+            text.lines()
+                .filter_map(|l| {
+                    let mut words = l.split_whitespace();
+                    let sig = u64::from_str_radix(words.next()?, 16).ok()?;
+                    let flags = words.next().and_then(|f| u8::from_str_radix(f, 16).ok()).unwrap_or(0) & FLAG_ALL;
+                    Some((sig, flags))
+                })
+                .collect()
+        })
         .unwrap_or_default()
 }
 
-fn write_drawn(dir: &Path, keys: &HashSet<u64>) {
+fn write_drawn(dir: &Path, entries: &HashMap<u64, u8>) {
     if std::fs::create_dir_all(dir).is_err() {
         return;
     }
-    let mut text = String::with_capacity(17 * keys.len());
-    for k in keys {
-        text.push_str(&format!("{k:016x}\n"));
+    let mut text = String::with_capacity(18 * entries.len());
+    for (k, flags) in entries {
+        if *flags == 0 {
+            // the old format, for a pipeline with nothing to order
+            text.push_str(&format!("{k:016x}\n"));
+        } else {
+            text.push_str(&format!("{k:016x} {:x}\n", flags & FLAG_ALL));
+        }
     }
     let path = drawn_path(dir);
     let tmp = path.with_extension(format!("tmp{}", std::process::id()));
@@ -237,7 +284,7 @@ fn write_drawn(dir: &Path, keys: &HashSet<u64>) {
     }
 }
 
-fn flush_async(dir: PathBuf, keys: HashSet<u64>) {
+fn flush_async(dir: PathBuf, keys: HashMap<u64, u8>) {
     let _ = std::thread::Builder::new().name("xcl-pso-drawn".into()).spawn(move || write_drawn(&dir, &keys));
 }
 
@@ -248,37 +295,76 @@ fn with_drawn<R>(dir: &Path, f: impl FnOnce(&mut Drawn) -> R) -> R {
     if stale {
         // the marks not written yet belong to the old dir
         if let Some(d) = g.take().filter(|d| d.unsaved > 0) {
-            write_drawn(&d.dir, &d.keys);
+            write_drawn(&d.dir, &d.entries);
         }
-        *g = Some(Drawn { dir: dir.to_path_buf(), keys: read_drawn(dir), unsaved: 0 });
+        *g = Some(Drawn { dir: dir.to_path_buf(), entries: read_drawn(dir), unsaved: 0 });
+        log_library(dir, g.as_ref().unwrap());
     }
     f(g.as_mut().unwrap())
 }
 
-/// A shader identity drawn with in an earlier run (its pipeline is built during load).
-pub fn wanted_shader(sig: u64) -> bool {
-    wanted_in(&dir(), sig)
+/// Blobs in the driver library, which is what a recorded pipeline can skip the compile for.
+fn blob_count(dir: &Path) -> usize {
+    std::fs::read_dir(dir)
+        .map(|rd| rd.filter_map(Result::ok).filter(|e| e.path().extension().is_some_and(|x| x == "blob")).count())
+        .unwrap_or(0)
 }
 
-fn wanted_in(dir: &Path, sig: u64) -> bool {
-    let wanted = with_drawn(dir, |d| d.keys.contains(&sig));
+/// What the run starts with: the record, the pipelines that will be queued ahead of the rest
+/// (compute first, then ones seen building), and the driver blobs already there. Logged once.
+fn log_library(dir: &Path, d: &Drawn) {
     static ONCE: std::sync::Once = std::sync::Once::new();
-    if wanted {
+    ONCE.call_once(|| {
+        let recorded = d.entries.len();
+        let queued = d.entries.values().filter(|f| **f & FLAG_ALL != 0).count();
+        let cached = blob_count(dir);
+        crate::xlog_info!(
+            "D3D12.X: pipeline library: {recorded} recorded pipelines, {queued} queued early, {cached} already in the driver cache"
+        );
+    });
+}
+
+/// The flags of a recorded pipeline, if it is recorded (compute for the early queue order).
+pub fn wanted_flags(sig: u64) -> Option<u8> {
+    flags_in(&dir(), sig)
+}
+
+fn flags_in(dir: &Path, sig: u64) -> Option<u8> {
+    let flags = with_drawn(dir, |d| d.entries.get(&sig).copied());
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    if flags.is_some() {
         ONCE.call_once(|| {
-            let n = with_drawn(dir, |d| d.keys.len());
+            let n = with_drawn(dir, |d| d.entries.len());
             crate::xlog_info!("D3D12.X: pipeline library: {n} pipeline(s) drawn with in an earlier run are built while the title loads");
         });
     }
-    wanted
+    flags
 }
 
-fn mark_drawn(dir: &Path, sig: u64) {
+fn mark_drawn(dir: &Path, sig: u64, compute: bool) {
     with_drawn(dir, |d| {
-        if d.keys.insert(sig) {
+        let before = d.entries.get(&sig).copied();
+        let flags = before.unwrap_or(0) | if compute { FLAG_COMPUTE } else { 0 };
+        if before != Some(flags) {
+            d.entries.insert(sig, flags);
             d.unsaved += 1;
             if d.unsaved >= DRAWN_BATCH {
                 d.unsaved = 0;
-                flush_async(dir.to_path_buf(), d.keys.clone());
+                flush_async(dir.to_path_buf(), d.entries.clone());
+            }
+        }
+    });
+}
+
+fn mark_stalled(dir: &Path, sig: u64) {
+    with_drawn(dir, |d| {
+        let before = d.entries.get(&sig).copied().unwrap_or(0);
+        if before & FLAG_STALLED == 0 {
+            d.entries.insert(sig, before | FLAG_STALLED);
+            d.unsaved += 1;
+            if d.unsaved >= DRAWN_BATCH {
+                d.unsaved = 0;
+                flush_async(dir.to_path_buf(), d.entries.clone());
             }
         }
     });
@@ -290,7 +376,7 @@ pub fn flush_drawn() {
     with_drawn(&dir(), |d| {
         if d.unsaved > 0 {
             d.unsaved = 0;
-            let (dir, keys) = (d.dir.clone(), d.keys.clone());
+            let (dir, keys) = (d.dir.clone(), d.entries.clone());
             flush_async(dir, keys);
         }
     });
@@ -303,7 +389,7 @@ pub(crate) fn forget_drawn_memory() {
     if let Some(mut d) = g.take() {
         if d.unsaved > 0 {
             d.unsaved = 0;
-            write_drawn(&d.dir, &d.keys);
+            write_drawn(&d.dir, &d.entries);
         }
     }
 }
@@ -504,6 +590,45 @@ pub fn stream_key(buf: &[u8], samplers: &[([u32; 4], bool)]) -> u64 {
 mod tests {
     use super::*;
 
+    /// The record line format: a bare identity is the old format (graphics, not stalled) and
+    /// still reads; flagged lines round-trip compute and stalled.
+    #[test]
+    fn the_record_round_trips_flags_and_reads_the_old_bare_format() {
+        let dir = std::env::temp_dir().join(format!("xcl-pso-flags-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let entries = HashMap::from([
+            (0x11u64, 0u8),
+            (0x22, FLAG_COMPUTE),
+            (0x33, FLAG_COMPUTE | FLAG_STALLED),
+            (0x44, FLAG_STALLED),
+        ]);
+        write_drawn(&dir, &entries);
+        assert_eq!(read_drawn(&dir), entries, "flags round-trip");
+
+        // a record from before the flags: one hex word a line, no flags word
+        std::fs::write(drawn_path(&dir), b"0000000000000055\naaaaaaaaaaaaaaaa 1\nb 3\nzz\n").unwrap();
+        let old = read_drawn(&dir);
+        assert_eq!(old.get(&0x55), Some(&0), "a bare old line is a graphics pipeline not seen stalled");
+        assert_eq!(old.get(&0xaaaa_aaaa_aaaa_aaaa), Some(&FLAG_COMPUTE), "a flags word still reads");
+        assert_eq!(old.get(&0xb), Some(&(FLAG_COMPUTE | FLAG_STALLED)));
+        assert_eq!(old.len(), 3, "a line that is not an identity is skipped");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A pipeline seen stalled in an earlier run keeps the compute flag it was recorded with,
+    /// and the file survives a restart.
+    #[test]
+    fn a_pipeline_seen_stalled_keeps_its_compute_flag_across_a_restart() {
+        let dir = std::env::temp_dir().join(format!("xcl-pso-stalled-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let sig = 0x7410_0000_0000_00c6u64;
+        mark_drawn(&dir, sig, true);
+        mark_stalled(&dir, sig);
+        forget_drawn_memory();
+        assert_eq!(read_drawn(&dir).get(&sig), Some(&(FLAG_COMPUTE | FLAG_STALLED)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A drawn pipeline's shaders are written beside the blobs, and a restart (the set in
     /// memory gone) finds them: the next run builds that pipeline during load. A blob
     /// corrupted on disk leaves the library with nothing for its key.
@@ -513,13 +638,13 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let (key, sig) = (0x7410_0000_0000_00a1u64, 0x7410_0000_0000_00b2u64);
-        assert!(!wanted_in(&dir, sig));
-        mark_drawn(&dir, sig);
+        assert_eq!(flags_in(&dir, sig), None);
+        mark_drawn(&dir, sig, false);
         let blob = b"driver blob";
         save_in(&dir, key, blob);
         // a restart: only the files remain
         forget_drawn_memory();
-        assert!(wanted_in(&dir, sig), "the drawn shaders are read back from disk");
+        assert!(flags_in(&dir, sig).is_some(), "the drawn shaders are read back from disk");
         assert_eq!(load_in(&dir, key).as_deref(), Some(&blob[..]), "and so is the blob");
         // a blob from another version, or one cut short, is not used
         std::fs::write(path_for(&dir, key), b"XPSO\x02\x00\x00\x00driver blob").unwrap();

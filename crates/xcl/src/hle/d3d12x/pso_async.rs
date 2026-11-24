@@ -8,9 +8,9 @@
 //! for at its first bind (a skipped dispatch would corrupt what it computes).
 //! `XCL_ASYNC_PSO=0` builds every pipeline in the call, as before.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 struct Pending {
@@ -33,6 +33,8 @@ struct Pending {
     orphan: std::sync::atomic::AtomicBool,
     /// its shaders are in the prewarm record (marked once)
     noted: std::sync::atomic::AtomicBool,
+    /// where it goes in the worker queue: 0 before 1 before 2 before 3
+    rank: u8,
 }
 
 impl Pending {
@@ -92,46 +94,93 @@ pub fn enabled() -> bool {
 /// Builds the real pipeline: its raw pointer, 0 = failed.
 pub type Job = Box<dyn FnOnce() -> usize + Send>;
 
-fn spawn_pool(prefix: &str, threads: usize) -> Mutex<mpsc::Sender<Arc<Pending>>> {
-    let (tx, rx) = mpsc::channel::<Arc<Pending>>();
-    let rx = Arc::new(Mutex::new(rx));
-    // translation recurses deeply on big programs; DXC itself runs on its own pool
-    for k in 0..threads {
-        let rx = rx.clone();
-        let _ = std::thread::Builder::new().name(format!("{prefix}-{k}")).stack_size(64 << 20).spawn(move || loop {
-            let next = rx.lock().unwrap().recv();
-            let Ok(p) = next else { return };
-            // (None: a bind took it and builds it itself)
-            let job = p.job.lock().unwrap().take();
-            if let Some(job) = job {
-                complete(&p, job());
-            }
-        });
-    }
-    Mutex::new(tx)
+/// A worker queue that pops the lowest rank first and keeps arrival order within a rank. The
+/// ranks put compute and pipelines that were seen still building ahead of the rest, so a warm
+/// run does not reach the world with the builds that hung it still waiting.
+struct WorkQueue {
+    items: Mutex<VecDeque<(u8, u64, Arc<Pending>)>>,
+    next: std::sync::atomic::AtomicU64,
+    cv: Condvar,
 }
 
-fn queue() -> &'static Mutex<mpsc::Sender<Arc<Pending>>> {
-    static Q: OnceLock<Mutex<mpsc::Sender<Arc<Pending>>>> = OnceLock::new();
-    Q.get_or_init(|| spawn_pool("xcl-pso", pipeline_threads()))
+impl WorkQueue {
+    fn new() -> Self {
+        Self { items: Mutex::new(VecDeque::new()), next: std::sync::atomic::AtomicU64::new(0), cv: Condvar::new() }
+    }
+
+    fn push(&self, rank: u8, p: Arc<Pending>) {
+        let seq = self.next.fetch_add(1, Ordering::Relaxed);
+        let mut q = self.items.lock().unwrap();
+        // after every entry of a lower or equal rank: stable within a rank
+        let at = q.iter().position(|(r, s, _)| (*r, *s) > (rank, seq)).unwrap_or(q.len());
+        q.insert(at, (rank, seq, p));
+        self.cv.notify_one();
+    }
+
+    fn pop(&self) -> Arc<Pending> {
+        let mut q = self.items.lock().unwrap();
+        while q.is_empty() {
+            q = self.cv.wait(q).unwrap();
+        }
+        q.pop_front().unwrap().2
+    }
+
+    fn spawn(self: &'static Self, prefix: &str, threads: usize) {
+        for k in 0..threads {
+            let _ = std::thread::Builder::new().name(format!("{prefix}-{k}")).stack_size(64 << 20).spawn(move || loop {
+                let p = self.pop();
+                // (None: a bind took it and builds it itself)
+                let job = p.job.lock().unwrap().take();
+                if let Some(job) = job {
+                    complete(&p, job());
+                }
+            });
+        }
+    }
+}
+
+fn queue() -> &'static WorkQueue {
+    static Q: OnceLock<&'static WorkQueue> = OnceLock::new();
+    *Q.get_or_init(|| {
+        let q: &'static WorkQueue = Box::leak(Box::new(WorkQueue::new()));
+        q.spawn("xcl-pso", pipeline_threads());
+        q
+    })
 }
 
 /// Dedicated worker pool for compute pipelines so a backlog (or driver stall, #156) of graphics
 /// builds cannot starve compute dispatches indefinitely.
-fn compute_queue() -> &'static Mutex<mpsc::Sender<Arc<Pending>>> {
-    static Q: OnceLock<Mutex<mpsc::Sender<Arc<Pending>>>> = OnceLock::new();
-    Q.get_or_init(|| spawn_pool("xcl-pso-compute", (crate::gpu::recomp::dxc::compile_threads() / 2).clamp(1, 4)))
+fn compute_queue() -> &'static WorkQueue {
+    static Q: OnceLock<&'static WorkQueue> = OnceLock::new();
+    *Q.get_or_init(|| {
+        let q: &'static WorkQueue = Box::leak(Box::new(WorkQueue::new()));
+        q.spawn("xcl-pso-compute", (crate::gpu::recomp::dxc::compile_threads() / 2).clamp(1, 4));
+        q
+    })
 }
+
+/// Where a pipeline goes in its worker queue. Compute pipelines go first: the hang evidence is
+/// compute (a skipped dispatch leaves a GPU-side wait unsatisfied). Among them, and among
+/// graphics ones, a pipeline seen still building in an earlier run goes first.
+fn early_rank(compute: bool, stalled: bool) -> u8 {
+    match (compute, stalled) {
+        (true, true) => 0,
+        (true, false) => 1,
+        (false, true) => 2,
+        (false, false) => 3,
+    }
+}
+
+/// A pipeline built at its first use, not during load (nothing says it was used before).
+const RANK_NORMAL: u8 = 3;
 
 /// Send `p` to its worker pool if not already sent; clears `sent` on failure so a later bind
 /// can retry instead of stalling forever.
 fn enqueue(p: &Arc<Pending>) -> bool {
     if !p.sent.swap(true, Ordering::AcqRel) {
         let q = if p.compute { compute_queue() } else { queue() };
-        if q.lock().unwrap().send(p.clone()).is_err() {
-            p.sent.store(false, Ordering::Release);
-            return false;
-        }
+        q.push(p.rank, p.clone());
+        return true;
     }
     true
 }
@@ -144,9 +193,17 @@ pub fn release(p: usize) {
     }
 }
 
-/// `standin` went to the title; `job` builds the real pipeline on a worker.
+/// `standin` went to the title; `job` builds the real pipeline on a worker. `stalled`: the
+/// record says an earlier run saw it still building, so it goes before the other builds.
 pub fn submit(standin: usize, compute: bool, job: Job) {
-    submit_as(standin, compute, job, true);
+    submit_as(standin, compute, job, true, RANK_NORMAL);
+}
+
+/// `submit` for a pipeline the record knows (`flags` from `pso_disk::wanted_flags`): it goes
+/// ahead of the recorded pipelines that were fine before, compute ones first.
+pub fn submit_recorded(standin: usize, compute: bool, flags: u8, job: Job) {
+    let stalled = flags & super::pso_disk::FLAG_STALLED != 0;
+    submit_as(standin, compute, job, true, early_rank(compute, stalled));
 }
 
 /// Lazy pipeline creation (`XCL_LAZY_PSO=0`: off): a title's pipelines with console shaders get
@@ -161,10 +218,10 @@ pub fn lazy() -> bool {
 
 /// `submit`, sent to the workers only on its first `resolve` (`lazy`).
 pub fn submit_lazy(standin: usize, compute: bool, job: Job) {
-    submit_as(standin, compute, job, false);
+    submit_as(standin, compute, job, false, RANK_NORMAL);
 }
 
-fn submit_as(standin: usize, compute: bool, job: Job, send: bool) {
+fn submit_as(standin: usize, compute: bool, job: Job, send: bool, rank: u8) {
     let p = Arc::new(Pending {
         standin,
         ticket: Mutex::new(None),
@@ -177,6 +234,7 @@ fn submit_as(standin: usize, compute: bool, job: Job, send: bool) {
         timed_out: Default::default(),
         orphan: Default::default(),
         noted: Default::default(),
+        rank,
     });
     PENDING.lock().unwrap().get_or_insert_with(HashMap::new).insert(standin, p.clone());
     static ONCE: std::sync::Once = std::sync::Once::new();
@@ -335,6 +393,8 @@ fn resolve_within(pso: usize, limit: Option<Duration>, epoch: u64, budget: &Mute
         }
     }
     if !finished {
+        // drawn with its stand-in: the next run builds it before the other recorded pipelines
+        super::pso_disk::note_stalled(pso);
         static N: AtomicUsize = AtomicUsize::new(0);
         let n = N.fetch_add(1, Ordering::Relaxed);
         if n < 16 || n.is_power_of_two() {
@@ -410,6 +470,11 @@ fn resolve_compute_within(pso: usize, limit: Option<std::time::Duration>, budget
         return resolve_wait(pso);
     };
     let Some(p) = entry(pso) else { return pso };
+    // bound: drawn with this run, so the next one builds it while the title loads (a compute
+    // pipeline's stand-in carries the shader identity it was created with)
+    if !p.noted.swap(true, Ordering::Relaxed) {
+        super::pso_disk::note_drawn(pso);
+    }
     if let r @ 1.. = p.real.load(Ordering::Acquire) {
         return r;
     }
@@ -447,6 +512,8 @@ fn resolve_compute_within(pso: usize, limit: Option<std::time::Duration>, budget
     if !*done {
         budget.consume(elapsed.max(rem_budget));
         if rem_budget >= limit / 2 && !p.timed_out.swap(true, Ordering::AcqRel) {
+            // skipped this run: the next one builds it before the other recorded pipelines
+            super::pso_disk::note_stalled(pso);
             static LOGGED: AtomicUsize = AtomicUsize::new(0);
             if LOGGED.fetch_add(1, Ordering::Relaxed) < 16 {
                 crate::xlog_warn!(
@@ -497,6 +564,8 @@ pub fn resolve_for_indirect(pso: usize) -> usize {
 /// the worker's result is then released when it arrives).
 pub fn released(pso: usize) -> usize {
     let Some(p) = PENDING.lock().unwrap().as_mut().and_then(|m| m.remove(&pso)) else { return 0 };
+    // the stand-in address is not the pipeline: forget what it was registered as
+    super::pso_disk::forget_pso(pso);
     let done = p.done.lock().unwrap();
     if *done {
         p.real.swap(0, Ordering::AcqRel)
@@ -661,9 +730,45 @@ pub fn activity() -> (usize, usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::mpsc;
 
     fn budget() -> Mutex<DrawWait> {
         Mutex::new(DrawWait { epoch: 0, spent: Duration::ZERO })
+    }
+
+    fn test_pending(standin: usize, rank: u8) -> Arc<Pending> {
+        Arc::new(Pending {
+            standin,
+            ticket: Mutex::new(None),
+            job: Mutex::new(None),
+            sent: std::sync::atomic::AtomicBool::new(true),
+            real: AtomicUsize::new(0),
+            done: Mutex::new(true),
+            cv: Condvar::new(),
+            compute: false,
+            timed_out: Default::default(),
+            orphan: Default::default(),
+            noted: Default::default(),
+            rank,
+        })
+    }
+
+    /// The early queue builds compute before graphics, and among each a pipeline seen still
+    /// building in an earlier run before the rest; arrival order holds within a rank.
+    #[test]
+    fn the_early_queue_builds_compute_first_then_ones_seen_stalled() {
+        assert_eq!(early_rank(true, true), 0);
+        assert_eq!(early_rank(true, false), 1);
+        assert_eq!(early_rank(false, true), 2);
+        assert_eq!(early_rank(false, false), 3);
+        assert!(early_rank(true, false) < early_rank(false, true), "compute goes before a stalled graphics one");
+
+        let q = WorkQueue::new();
+        for (i, rank) in [3u8, 2, 1, 0, 3, 1].into_iter().enumerate() {
+            q.push(rank, test_pending(0x100 + i, rank));
+        }
+        let order: Vec<(u8, usize)> = q.items.lock().unwrap().iter().map(|(r, _, p)| (*r, p.standin)).collect();
+        assert_eq!(order, vec![(0, 0x103), (1, 0x102), (1, 0x105), (2, 0x101), (3, 0x100), (3, 0x104)]);
     }
 
     /// A graphics build that does not finish (an NVIDIA driver compile of minutes, #156) holds a
