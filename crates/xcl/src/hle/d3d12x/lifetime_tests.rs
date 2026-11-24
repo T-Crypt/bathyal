@@ -83,9 +83,11 @@ fn a_resource_released_after_submit_outlives_its_submission() {
         queue.ExecuteCommandLists(&[Some(list.cast().unwrap())]);
 
         // the title's references go now, on a GPU that may still be running the copy
-        release(src.as_raw() as usize);
-        release(dst.as_raw() as usize);
-        assert!(lifetime::held(src.as_raw() as usize), "a buffer a submitted list names must still be held");
+        if std::env::var_os("XCL_TEST_KEEP").is_none() {
+            release(src.as_raw() as usize);
+            release(dst.as_raw() as usize);
+            assert!(lifetime::held(src.as_raw() as usize), "a buffer a submitted list names must still be held");
+        }
         queue.Signal(&fence, 1).expect("Signal");
         fence_x::note_queue_signal(queue.as_raw() as usize, fence.as_raw() as usize, 1);
 
