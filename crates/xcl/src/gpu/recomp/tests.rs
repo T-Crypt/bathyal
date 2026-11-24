@@ -7994,6 +7994,9 @@ fn gather_explicit_level_reads_that_level() {
     let line = t.hlsl.lines().find(|l| l.contains("_g = float4(")).expect("the four reads");
     let pos: Vec<usize> = ["_g01", "_g11", "_g10", "_g00"].iter().map(|s| line.find(s).unwrap_or_else(|| panic!("{s} not in {line}"))).collect();
     assert!(pos.windows(2).all(|w| w[0] < w[1]), "{line}");
+    if super::dxc::location().is_ok() {
+        super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).expect("DXC compiles the level-aware gather");
+    }
 }
 
 /// `image_gather4_l_o`: the offset moves the base texel in texels of the named level, and the
@@ -8008,6 +8011,9 @@ fn gather_explicit_level_applies_offset_and_channel() {
     assert!(t.hlsl.contains("int2(((int)(v0 << 26)) >> 26, ((int)(v0 << 18)) >> 26)"), "{}", t.hlsl);
     assert_eq!(t.hlsl.matches(".Load(int3(").count(), 4, "{}", t.hlsl);
     assert_eq!(t.hlsl.matches(".Green").count(), 4, "{}", t.hlsl);
+    if super::dxc::location().is_ok() {
+        super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).expect("DXC compiles the level-aware gather with the offset");
+    }
 }
 
 /// `_lz` and an implicit level are level 0, which `Gather` already returns: keep it.
