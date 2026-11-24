@@ -610,19 +610,12 @@ static CLASSES: Mutex<Vec<Class>> = Mutex::new(Vec::new());
 static EXTS: Mutex<Option<HashSet<usize>>> = Mutex::new(None);
 
 unsafe fn vt(obj: *mut c_void) -> *const usize {
-    if !(obj as usize).is_multiple_of(8) {
-        eprintln!("vt: misaligned this {obj:p}\n{}", std::backtrace::Backtrace::force_capture());
-        return std::ptr::null();
-    }
     *(obj as *const *const usize)
 }
 
 /// Original function of `slot` for an adopted object.
 pub unsafe fn orig_fn(this: *mut c_void, slot: usize) -> usize {
     let ext = vt(this);
-    if !ext.is_null() && !is_ext(ext as usize) {
-        eprintln!("orig_fn: non-adopted this {this:p} vtable {ext:p} slot {slot}");
-    }
     let orig = *ext.sub(1) as *const usize;
     *orig.add(slot)
 }
