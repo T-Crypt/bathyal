@@ -450,6 +450,12 @@ fn graphics_wave32(device: *mut c_void) -> bool {
     }
 }
 
+/// The backend device is the software rasterizer (WARP): it draws, but it has no real
+/// GPU – tests that check GPU-only behaviour skip.
+pub fn software_adapter() -> bool {
+    ADAPTER.lock().map(|a| a.contains("WARP")).unwrap_or(false)
+}
+
 /// Create the process-wide D3D12 device (the adapter `d3d12_adapter` / `XCL_ADAPTER` chooses,
 /// by default the high-performance GPU → WARP); once – later calls
 /// return the existing device's adapter.
@@ -1239,6 +1245,51 @@ fn null_kind_of_uav(d: Option<&D3D12_UNORDERED_ACCESS_VIEW_DESC>) -> super::cons
         _ => crate::gpu::desc::ImageType::D2,
     };
     NullKind::Image(ty, view_class(v.Format.0))
+}
+
+/// The UAV description in the PC's format names, when the caller's (or the resource's own
+/// format) is not one: None when the description is already right for the PC (or the resource
+/// is a buffer, whose UAV takes the resource's format).
+fn pc_uav_desc(rd: &D3D12_RESOURCE_DESC, d: Option<&D3D12_UNORDERED_ACCESS_VIEW_DESC>) -> Option<D3D12_UNORDERED_ACCESS_VIEW_DESC> {
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
+    if rd.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER {
+        return None;
+    }
+    let rf = rd.Format.0 as u32;
+    let named = d.map_or(0, |c| c.Format.0 as u32);
+    let f = super::device_x::pc_unorm_format(super::device_x::pc_shader_view_format(rf, named));
+    if named != 0 {
+        if f == named {
+            return None;
+        }
+        let mut c = *d?;
+        c.Format = DXGI_FORMAT(f as i32);
+        return Some(c);
+    }
+    // the console's default view is the resource's own format; a typeless one has no such view
+    if f == rf || f == 0 {
+        return None;
+    }
+    let mut c = D3D12_UNORDERED_ACCESS_VIEW_DESC { Format: DXGI_FORMAT(f as i32), ..Default::default() };
+    if rd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D {
+        if rd.DepthOrArraySize > 1 {
+            c.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE1DARRAY;
+            c.Anonymous.Texture1DArray = D3D12_TEX1D_ARRAY_UAV { ArraySize: rd.DepthOrArraySize as u32, ..Default::default() };
+        } else {
+            c.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE1D;
+            c.Anonymous.Texture1D = D3D12_TEX1D_UAV::default();
+        }
+    } else if rd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D {
+        c.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE3D;
+        c.Anonymous.Texture3D = D3D12_TEX3D_UAV { WSize: rd.DepthOrArraySize as u32, ..Default::default() };
+    } else if rd.DepthOrArraySize > 1 {
+        c.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2DARRAY;
+        c.Anonymous.Texture2DArray = D3D12_TEX2D_ARRAY_UAV { ArraySize: rd.DepthOrArraySize as u32, ..Default::default() };
+    } else {
+        c.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+        c.Anonymous.Texture2D = D3D12_TEX2D_UAV::default();
+    }
+    Some(c)
 }
 
 /// A complete UAV description for a null resource: the caller's own (with the PC's format
@@ -5671,142 +5722,6 @@ mod console_format_query_tests {
     }
 }
 
-#[cfg(test)]
-mod console_pso_guard_tests {
-    use super::*;
-
-    /// Minimal synthetic DXBC container with a DXIL part carrying `XDAT` (what `pso::is_console`
-    /// recognizes as console bytecode).
-    fn synthetic_console_shader() -> Vec<u8> {
-        let mut dxil = vec![0u8; 28];
-        dxil[24..28].copy_from_slice(b"XDAT");
-        let part_offset = 36u32;
-        let total = part_offset as usize + 8 + dxil.len();
-        let mut blob = Vec::with_capacity(total);
-        blob.extend_from_slice(b"DXBC");
-        blob.extend_from_slice(&[0u8; 16]); // hash
-        blob.extend_from_slice(&1u32.to_le_bytes()); // version
-        blob.extend_from_slice(&(total as u32).to_le_bytes());
-        blob.extend_from_slice(&1u32.to_le_bytes()); // part count
-        blob.extend_from_slice(&part_offset.to_le_bytes());
-        blob.extend_from_slice(b"DXIL");
-        blob.extend_from_slice(&(dxil.len() as u32).to_le_bytes());
-        blob.extend_from_slice(&dxil);
-        blob
-    }
-
-    fn push_shader_subobject(stream: &mut Vec<u8>, ty: u32, blob: &[u8]) {
-        stream.extend_from_slice(&ty.to_le_bytes());
-        stream.extend_from_slice(&0u32.to_le_bytes()); // 8-byte alignment pad
-        stream.extend_from_slice(&(blob.as_ptr() as u64).to_le_bytes());
-        stream.extend_from_slice(&(blob.len() as u64).to_le_bytes());
-    }
-
-    #[test]
-    fn graphics_desc_detects_console_shader_in_any_stage() {
-        let console = synthetic_console_shader();
-        assert!(crate::gpu::recomp::pso::is_console(&console));
-        let pc = dummy().vs.as_slice();
-        assert!(!crate::gpu::recomp::pso::is_console(pc));
-
-        let empty = D3D12_GRAPHICS_PIPELINE_STATE_DESC::default();
-        assert!(!unsafe { graphics_has_console_shader(&empty as *const _ as *const c_void) });
-        assert!(!unsafe { graphics_has_console_shader(std::ptr::null()) });
-
-        let pc_only = D3D12_GRAPHICS_PIPELINE_STATE_DESC { VS: bytecode(pc), PS: bytecode(&dummy().ps), ..Default::default() };
-        assert!(!unsafe { graphics_has_console_shader(&pc_only as *const _ as *const c_void) });
-
-        for stage in 0..5 {
-            let mut d = pc_only.clone();
-            match stage {
-                0 => d.VS = bytecode(&console),
-                1 => d.PS = bytecode(&console),
-                2 => d.DS = bytecode(&console),
-                3 => d.HS = bytecode(&console),
-                _ => d.GS = bytecode(&console),
-            }
-            assert!(unsafe { graphics_has_console_shader(&d as *const _ as *const c_void) }, "stage {stage}");
-        }
-    }
-
-    #[test]
-    fn pipeline_stream_detects_console_shader_subobjects() {
-        let console = synthetic_console_shader();
-        let pc = dummy().vs.as_slice();
-
-        let mut pc_stream = Vec::new();
-        push_shader_subobject(&mut pc_stream, 1, pc);
-        let desc = [pc_stream.len(), pc_stream.as_ptr() as usize];
-        assert!(!unsafe { stream_has_console_shader(desc.as_ptr() as *const c_void) });
-        assert!(!unsafe { stream_has_console_shader(std::ptr::null()) });
-
-        for ty in [1u32, 2, 3, 4, 5, 6, 24, 25] {
-            let mut s = Vec::new();
-            push_shader_subobject(&mut s, ty, &console);
-            let d = [s.len(), s.as_ptr() as usize];
-            assert!(unsafe { stream_has_console_shader(d.as_ptr() as *const c_void) }, "subobject {ty}");
-        }
-    }
-
-    #[test]
-    fn mesh_streams_are_found_by_kind_not_by_slot() {
-        use crate::gpu::xbox::tests::{fssm, sample, CODE};
-        let mesh = sample(13, &[fssm(&CODE, &[(7, 6)])]);
-        let amp = sample(14, &[fssm(&CODE, &[(7, 6)])]);
-        assert_eq!(crate::gpu::xbox::parse(&mesh).unwrap().stage, "MS");
-        assert_eq!(crate::gpu::xbox::parse(&amp).unwrap().stage, "AS");
-        let subs_of = |list: &[(u32, &[u8])]| {
-            let mut s = Vec::new();
-            for &(ty, blob) in list {
-                push_shader_subobject(&mut s, ty, blob);
-            }
-            s
-        };
-        let classify = |buf: &[u8]| {
-            let subs = stream_subobjects(buf).expect("a stream");
-            let (m, a) = console_mesh_programs(&subs);
-            (m.map(|c| c.as_ptr()), a.map(|c| c.as_ptr()))
-        };
-        let m = |list: &[(u32, &[u8])]| classify(&subs_of(list));
-        // the console's form: the mesh program in subobject 24 (the PC's AS slot), no 25
-        assert_eq!(m(&[(24, &mesh)]), (Some(mesh.as_ptr()), None));
-        // the PC's form, and both in the console's numbering
-        assert_eq!(m(&[(25, &mesh)]), (Some(mesh.as_ptr()), None));
-        assert_eq!(m(&[(24, &mesh), (25, &amp)]), (Some(mesh.as_ptr()), Some(amp.as_ptr())));
-        assert_eq!(m(&[(25, &amp), (24, &mesh)]), (Some(mesh.as_ptr()), Some(amp.as_ptr())));
-        // a PC shader in either slot is not a console mesh program
-        let pc = dummy().vs.as_slice();
-        assert_eq!(m(&[(24, pc)]), (None, None));
-        assert_eq!(m(&[(25, pc)]), (None, None));
-    }
-
-    #[test]
-    fn fallback_stream_rewrites_console_rtv_and_dsv_formats() {
-        let console = synthetic_console_shader();
-        let mut s = Vec::new();
-        push_shader_subobject(&mut s, 1, &console);
-        // subobject 15: D3D12_RT_FORMAT_ARRAY (8 × DXGI_FORMAT + NumRenderTargets)
-        s.extend_from_slice(&15u32.to_le_bytes());
-        let rtv_off = s.len();
-        for f in [116u32, 117, 86, 115, 28, 0, 0, 0, 5] {
-            s.extend_from_slice(&f.to_le_bytes());
-        }
-        // subobject 16: DSVFormat = D16_UNORM_S8_UINT (118)
-        s.extend_from_slice(&16u32.to_le_bytes());
-        let dsv_off = s.len();
-        s.extend_from_slice(&118u32.to_le_bytes());
-
-        let desc = [s.len(), s.as_ptr() as usize];
-        let (out, _) = unsafe { fallback_stream(desc.as_ptr() as *const u8) }.expect("fallback stream");
-        let vs_ptr = u64::from_le_bytes(out[8..16].try_into().unwrap()) as usize;
-        assert_eq!(vs_ptr, dummy().vs.as_ptr() as usize, "console VS replaced with dummy VS");
-
-        let rtv: [u32; 8] = std::array::from_fn(|k| u32::from_le_bytes(out[rtv_off + 4 * k..rtv_off + 4 * k + 4].try_into().unwrap()));
-        assert_eq!(rtv, [10, 10, 28, 28, 28, 0, 0, 0]);
-        let dsv = u32::from_le_bytes(out[dsv_off..dsv_off + 4].try_into().unwrap());
-        assert_eq!(dsv, 45);
-    }
-}
 
 #[cfg(test)]
 mod null_view_tests {

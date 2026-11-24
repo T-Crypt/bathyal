@@ -699,6 +699,21 @@ pub fn pc_view_format(f: u32) -> u32 {
     }
 }
 
+/// An sRGB format as its UNORM form: a UAV cannot be sRGB, and the console names the same
+/// bits either way.
+pub fn pc_unorm_format(f: u32) -> u32 {
+    match f {
+        29 => 28,
+        72 => 71,
+        75 => 74,
+        78 => 77,
+        91 => 87,
+        93 => 88,
+        99 => 98,
+        f => f,
+    }
+}
+
 /// The typeless format of a depth format's family (None: not a depth format).
 fn depth_typeless(f: u32) -> Option<u32> {
     match f {

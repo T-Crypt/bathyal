@@ -508,7 +508,7 @@ pub fn note_resource(s: &Slot, res: usize) {
     }
 }
 
-=
+
 /// `res` was released for good: every console slot that named it becomes a null slot, and the
 /// shared shader-visible PC heap gets null descriptors in the places those slots name. No
 /// later submission can read a descriptor of memory that is gone.
