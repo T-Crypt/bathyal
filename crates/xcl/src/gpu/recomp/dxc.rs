@@ -1404,7 +1404,7 @@ mod cache_tests {
             let t0 = std::time::Instant::now();
             let (r, missed) = cached_only(|| compile_cached_in_with(&dir, "slow", "main", "cs_6_6", &[], || Ok(synthetic_dxil(5))));
             assert!(r.is_err() && missed, "cached-only: a miss");
-            assert!(t0.elapsed() < Duration::from_millis(200), "cached-only waited {:?} for the compile", t0.elapsed());
+            assert!(t0.elapsed() < Duration::from_millis(50), "cached-only waited {:?} for the compile of a key in flight", t0.elapsed());
             worker.join().unwrap().unwrap();
         });
 

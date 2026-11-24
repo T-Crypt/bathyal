@@ -4513,7 +4513,7 @@ unsafe fn translated_graphics_pso_once(this: *mut c_void, f: PsoFn, desc: *const
 enum OwnedDesc {
     Compute(Box<D3D12_COMPUTE_PIPELINE_STATE_DESC>, Vec<Vec<u8>>),
     Graphics(Box<D3D12_GRAPHICS_PIPELINE_STATE_DESC>, Vec<Vec<u8>>, Vec<D3D12_INPUT_ELEMENT_DESC>, Vec<std::ffi::CString>),
-    Stream(Box<[usize; 2]>, Vec<u8>, Vec<Vec<u8>>),
+    Stream(Box<[usize; 2]>, Vec<u8>, Vec<Vec<u8>>, Vec<D3D12_INPUT_ELEMENT_DESC>, Vec<std::ffi::CString>),
 }
 
 unsafe impl Send for OwnedDesc {}
@@ -4532,7 +4532,7 @@ impl OwnedDesc {
     /// records the same at creation).
     fn shader_sig(&self) -> u64 {
         let blobs = match self {
-            OwnedDesc::Compute(_, b) | OwnedDesc::Graphics(_, b, ..) | OwnedDesc::Stream(_, _, b) => b,
+            OwnedDesc::Compute(_, b) | OwnedDesc::Graphics(_, b, ..) | OwnedDesc::Stream(_, _, b, ..) => b,
         };
         super::pso_disk::shaders_sig(&blobs.iter().map(Vec::as_slice).collect::<Vec<_>>())
     }
@@ -4591,6 +4591,8 @@ unsafe fn own_stream(desc: *const c_void) -> Option<OwnedDesc> {
     }
     let mut buf = std::slice::from_raw_parts(base as *const u8, size).to_vec();
     let mut blobs: Vec<Vec<u8>> = Vec::new();
+    let mut elements: Vec<D3D12_INPUT_ELEMENT_DESC> = Vec::new();
+    let mut names: Vec<std::ffi::CString> = Vec::new();
     let mut off = 0usize;
     while off + 8 <= size {
         let ty = u32::from_le_bytes(buf[off..off + 4].try_into().ok()?);
@@ -4605,14 +4607,30 @@ unsafe fn own_stream(desc: *const c_void) -> Option<OwnedDesc> {
                     buf[at..at + 8].copy_from_slice(&(blobs.last().unwrap().as_ptr() as u64).to_le_bytes());
                 }
             }
-            7 | 12 | 22 if buf[at..at + psize].iter().any(|&b| b != 0) => return None,
+            // the input elements and their semantic names point into the title's memory too
+            12 if buf[at..at + psize].iter().any(|&b| b != 0) => {
+                let (n, p) = (u32::from_le_bytes(buf[at..at + 4].try_into().ok()?) as usize, word(&buf, 1) as usize);
+                if n == 0 || p == 0 || !crate::gpu::shader::readable(p, n * std::mem::size_of::<D3D12_INPUT_ELEMENT_DESC>()) {
+                    return None;
+                }
+                let mut elems = std::slice::from_raw_parts(p as *const D3D12_INPUT_ELEMENT_DESC, n).to_vec();
+                for e in &mut elems {
+                    if !e.SemanticName.is_null() {
+                        names.push(std::ffi::CStr::from_ptr(e.SemanticName.0 as *const std::ffi::c_char).to_owned());
+                        e.SemanticName = PCSTR(names.last().unwrap().as_ptr() as *const u8);
+                    }
+                }
+                buf[at + 8..at + 16].copy_from_slice(&(elems.as_ptr() as u64).to_le_bytes());
+                elements = elems;
+            }
+            7 | 22 if buf[at..at + psize].iter().any(|&b| b != 0) => return None,
             19 => buf[at..at + 16].fill(0),
             _ => {}
         }
         off += ((at - off) + psize + 7) & !7;
     }
     let d = Box::new([buf.len(), buf.as_ptr() as usize]);
-    Some(OwnedDesc::Stream(d, buf, blobs))
+    Some(OwnedDesc::Stream(d, buf, blobs, elements, names))
 }
 
 /// Raw pointers a worker needs (the device lives for the process).
@@ -4649,6 +4667,139 @@ unsafe fn standin_stream(this: *mut c_void, f: PsoFn, desc: *const c_void, riid:
     finish_pso(this, f, new_desc.as_ptr() as *const c_void, riid, ppv)
 }
 
+/// Copy what a worker needs from a description: the whole of a creation call that defers.
+/// No translation, no cache key and no driver call happen here, only memory copies (shader
+/// blobs, the input layout and its names); the worker translates and compiles later.
+#[cfg(test)]
+pub(super) unsafe fn deferred_stream_copy_for_test(desc: *const c_void) -> Option<OwnedDesc> {
+    own_stream(desc)
+}
+
+/// Whether `translated_mesh_stream` would build this stream: a console MS (or a console MS
+/// container in the AS slot) with no AS, read from the subobject headers alone. No
+/// translation and no hash, so a creation call can ask it on the title's thread.
+unsafe fn stream_is_console_mesh(desc: *const c_void) -> bool {
+    use crate::gpu::recomp::pso::is_console;
+    if !crate::gpu::shader::readable(desc as usize, 16) {
+        return false;
+    }
+    let (size, base) = (*(desc as *const usize), *((desc as usize + 8) as *const usize));
+    if !crate::gpu::shader::readable(base, size) {
+        return false;
+    }
+    let Some(subs) = stream_subobjects(std::slice::from_raw_parts(base as *const u8, size)) else { return false };
+    let as_slot = subs.iter().find(|s| s.0 == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS.0 as u32).and_then(|s| payload_shader(s.1));
+    let ms_slot = subs.iter().find(|s| s.0 == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS.0 as u32).and_then(|s| payload_shader(s.1));
+    let (ms, as_slot) = mesh_shader_slots(ms_slot, as_slot);
+    matches!(ms, Some(m) if is_console(m)) && as_slot.is_none()
+}
+
+/// Whether a compute description carries a console program.
+unsafe fn compute_is_console(desc: *const c_void) -> bool {
+    crate::gpu::shader::readable(desc as usize, std::mem::size_of::<D3D12_COMPUTE_PIPELINE_STATE_DESC>()) && {
+        let d = &*(desc as *const D3D12_COMPUTE_PIPELINE_STATE_DESC);
+        shader_bytes(&d.CS).is_some_and(crate::gpu::recomp::pso::is_console)
+    }
+}
+
+/// A description with console shaders that XCL cannot copy (stream output, view instancing, an
+/// unreadable desc): it is not translated on the title's thread any more. The title gets the
+/// stand-in (draws and dispatches skip) and this says why, a few times per kind.
+fn note_not_copied(what: &str) {
+    static STREAM: AtomicU64 = AtomicU64::new(0);
+    static GRAPHICS: AtomicU64 = AtomicU64::new(0);
+    static COMPUTE: AtomicU64 = AtomicU64::new(0);
+    let n = match what {
+        "pipeline stream" => &STREAM,
+        "graphics PSO" => &GRAPHICS,
+        _ => &COMPUTE,
+    };
+    let n = n.fetch_add(1, Ordering::Relaxed);
+    if n < 4 || n % 1000 == 0 {
+        crate::xlog_warn!(
+            "D3D12.X: a console {what} points at title memory XCL does not copy – its stand-in is used and the pipeline is not built ({} so far)",
+            n + 1
+        );
+    }
+}
+
+/// Give `owned` to the workers: a pipeline drawn with in an earlier run now (its driver blob is
+/// in the library), every other one on its first use. The title's thread does no more work here.
+unsafe fn hand_to_worker(this: *mut c_void, f: PsoFn, ppv: *mut *mut c_void, compute: bool, owned: OwnedDesc, build: unsafe fn(Dev, &OwnedDesc, *mut *mut c_void) -> bool) {
+    let sig = owned.shader_sig();
+    // bound before its build: what it is drawn with is recorded off the stand-in too
+    super::pso_disk::note_pso_shader(*ppv as usize, sig);
+    let dev = Dev(this as usize, f as usize);
+    // a pipeline drawn with in an earlier run is built now, while the title loads: its driver
+    // blob is in the library, so the build is quick and its first draw does not wait
+    let eager = super::pso_async::build_during_load(super::pso_async::lazy(), super::pso_disk::wanted_shader(sig));
+    if eager && super::pso_async::lazy() {
+        super::pso_async::note_prewarmed();
+    }
+    let submit = if eager { super::pso_async::submit } else { super::pso_async::submit_lazy };
+    submit(
+        *ppv as usize,
+        compute,
+        Box::new(move || {
+            let mut out: *mut c_void = std::ptr::null_mut();
+            if unsafe { build(dev, &owned, &mut out) } && !out.is_null() {
+                out as usize
+            } else {
+                0
+            }
+        }),
+    );
+}
+
+/// A creation call with lazy pipelines on: copy the description, hand the title the stand-in.
+/// Nothing is translated, hashed or compiled on the title's thread, not even to work out a
+/// cache key; the worker does all of it at the pipeline's first use (`XCL_LAZY_PSO`).
+unsafe fn defer_stream(this: *mut c_void, f: PsoFn, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+    let hr = standin_stream(this, f, desc, riid, ppv);
+    if hr >= 0 && !ppv.is_null() && !(*ppv).is_null() {
+        match own_stream(desc) {
+            Some(owned) => hand_to_worker(this, f, ppv, false, owned, build_stream),
+            None => note_not_copied("pipeline stream"),
+        }
+        return hr;
+    }
+    static N: AtomicU64 = AtomicU64::new(0);
+    if N.fetch_add(1, Ordering::Relaxed) < 3 {
+        crate::xlog_warn!("D3D12.X: no stand-in pipeline ({hr:#x}) – this one is not built (a console shader must not reach the driver)");
+    }
+    hr
+}
+
+/// `defer_stream` for a direct graphics description.
+unsafe fn defer_graphics(this: *mut c_void, f: PsoFn, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+    let hr = standin_graphics(this, f, desc, riid, ppv);
+    if hr >= 0 && !ppv.is_null() && !(*ppv).is_null() {
+        match own_graphics(desc) {
+            Some(owned) => hand_to_worker(this, f, ppv, false, owned, build_graphics),
+            None => note_not_copied("graphics PSO"),
+        }
+        return hr;
+    }
+    hr
+}
+
+/// `defer_stream` for a direct compute description.
+unsafe fn defer_compute(this: *mut c_void, f: PsoFn, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+    let hr = standin_compute(this, f, desc, riid, ppv);
+    if hr >= 0 && !ppv.is_null() && !(*ppv).is_null() {
+        match own_compute(desc) {
+            Some(owned) => hand_to_worker(this, f, ppv, true, owned, build_compute),
+            None => note_not_copied("compute PSO"),
+        }
+        // a console program the worker is translating: Dispatch / ExecuteIndirect must not bind
+        // XCL's ABI root signature on the stand-in (the real PSO registers itself when built)
+        LAST_COMPUTE_TRANSLATED.with(|c| c.set(true));
+        LAST_COMPUTE_RS.with(|c| c.set(0));
+        return hr;
+    }
+    hr
+}
+
 /// Hand the title `standin`'s result now and build the real pipeline with `build` on a worker.
 unsafe fn go_background(
     this: *mut c_void,
@@ -4669,26 +4820,7 @@ unsafe fn go_background(
         }
         return None;
     }
-    let dev = Dev(this as usize, f as usize);
-    // a pipeline drawn with in an earlier run is built now, while the title loads: its driver
-    // blob is in the library, so the build is quick and its first draw does not wait
-    let eager = super::pso_async::build_during_load(super::pso_async::lazy(), super::pso_disk::wanted_shader(owned.shader_sig()));
-    if eager && super::pso_async::lazy() {
-        super::pso_async::note_prewarmed();
-    }
-    let submit = if eager { super::pso_async::submit } else { super::pso_async::submit_lazy };
-    submit(
-        *ppv as usize,
-        compute,
-        Box::new(move || {
-            let mut out: *mut c_void = std::ptr::null_mut();
-            if unsafe { build(dev, &owned, &mut out) } && !out.is_null() {
-                out as usize
-            } else {
-                0
-            }
-        }),
-    );
+    hand_to_worker(this, f, ppv, compute, owned, build);
     Some(hr)
 }
 
@@ -4723,6 +4855,11 @@ unsafe fn graphics_has_console_shader(desc: *const c_void) -> bool {
 unsafe fn graphics_pso(this: *mut c_void, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void, stream: bool) -> HRESULT {
     super::null::capture_graphics_desc(desc as *const u8);
     let f: PsoFn = std::mem::transmute(orig_fn(this, slot_of(this, "CreateGraphicsPipelineState")));
+    // lazy pipelines (the first use builds): a console shader is copied here and built on a
+    // worker; the title's thread translates nothing, not even for a cache key
+    if super::pso_async::lazy() && graphics_has_console_shader(desc) {
+        return defer_graphics(this, f, desc, riid, ppv);
+    }
     let (translated, missed) = if super::pso_async::enabled() { attempt(|| translated_graphics_pso(this, f, desc, riid, ppv)) } else { (translated_graphics_pso(this, f, desc, riid, ppv), false) };
     if missed {
         if let Some(hr) = own_graphics(desc).and_then(|o| go_background(this, f, desc, riid, ppv, false, o, standin_graphics, build_graphics)) {
@@ -4778,6 +4915,9 @@ unsafe fn note_translated_compute(hr: HRESULT, ppv: *mut *mut c_void) {
 unsafe extern "system" fn dev_create_compute_pso(this: *mut c_void, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
     super::null::capture_compute_desc(desc as *const u8);
     let f: PsoFn = std::mem::transmute(orig_fn(this, slot_of(this, "CreateComputePipelineState")));
+    if super::pso_async::lazy() && compute_is_console(desc) {
+        return defer_compute(this, f, desc, riid, ppv);
+    }
     let (mut console, missed) = if super::pso_async::enabled() { attempt(|| translated_compute_pso(this, f, desc, riid, ppv)) } else { (translated_compute_pso(this, f, desc, riid, ppv), false) };
     if missed {
         if let Some(hr) = own_compute(desc).and_then(|o| go_background(this, f, desc, riid, ppv, true, o, standin_compute, build_compute)) {
@@ -5075,6 +5215,156 @@ fn mesh_shader_slots<'a>(ms_slot: Option<&'a [u8]>, as_slot: Option<&'a [u8]>) -
             (Some(a), None)
         }
         (ms, a) => (ms, a),
+    }
+}
+
+#[cfg(test)]
+mod deferred_pso_tests {
+    use super::*;
+    use crate::gpu::xbox::tests::{fssm, sample, CODE};
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    /// The thread each build ran on (a deferred build must never run on the title's thread).
+    static BUILDS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+    /// What `build_stream` does on a worker, without a device: note the thread, hand back `real`.
+    unsafe fn record_build(_dev: Dev, _d: &OwnedDesc, out: *mut *mut c_void) -> bool {
+        BUILDS.lock().unwrap().push(std::thread::current().name().unwrap_or("title").to_string());
+        *out = 0x7600_0002usize as *mut c_void;
+        true
+    }
+
+    /// A pipeline state stream: type, padding to the payload's alignment, payload, 8-byte rounded.
+    fn stream(subobjects: &[(u32, Vec<u8>)]) -> Vec<u8> {
+        let mut v = Vec::new();
+        for (ty, payload) in subobjects {
+            let (_, palign) = super::super::null::subobject_payload(*ty).expect("known subobject");
+            v.extend_from_slice(&ty.to_le_bytes());
+            v.resize(v.len() + if palign == 8 { 4 } else { 0 }, 0);
+            v.extend_from_slice(payload);
+            while v.len() % 8 != 0 {
+                v.push(0);
+            }
+        }
+        v
+    }
+
+    fn shader_subobject(blob: &[u8]) -> Vec<u8> {
+        let mut v = (blob.as_ptr() as u64).to_le_bytes().to_vec();
+        v.extend_from_slice(&(blob.len() as u64).to_le_bytes());
+        v
+    }
+
+    /// A console mesh pipeline stream (MS + PS), which is what the title's world load makes.
+    fn mesh_stream(ms: &[u8], ps: &[u8]) -> Vec<u8> {
+        stream(&[
+            (24, shader_subobject(ms)),
+            (25, shader_subobject(ps)),
+            (9, 0xffff_ffffu32.to_le_bytes().to_vec()),                // SAMPLE_MASK
+            (13, 2u32.to_le_bytes().to_vec()),                          // IB_STRIP_CUT_VALUE
+            (14, D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE.0.to_le_bytes().to_vec()),
+        ])
+    }
+
+    /// Creation with lazy pipelines on copies the description and returns; the translation and
+    /// the driver compile are the build job, which runs on a worker at the first resolve. Before
+    /// this change `CreatePipelineState` translated the whole shader on the title's thread (to
+    /// work out the cache key) and the second render thread waited on it.
+    #[test]
+    fn a_lazy_creation_returns_before_any_build_and_the_first_resolve_builds_on_a_worker() {
+        let ms = sample(13, &[fssm(&CODE, &[(8, 13)])]);
+        let ps = sample(0, &[fssm(&CODE, &[(5, 1)])]);
+        let s = mesh_stream(&ms, &ps);
+        let desc: [usize; 2] = [s.len(), s.as_ptr() as usize];
+        let desc = desc.as_ptr() as *const c_void;
+        assert!(unsafe { stream_is_console_mesh(desc) }, "a console MS with no AS is the deferred kind");
+        let standin = 0x7600_0001usize;
+        let mut ppv: usize = standin;
+        BUILDS.lock().unwrap().clear();
+        let t = Instant::now();
+        let owned = unsafe { deferred_stream_copy_for_test(desc) }.expect("the description is copied");
+        unsafe { hand_to_worker(std::ptr::null_mut(), std::mem::transmute::<usize, PsoFn>(0x1), &mut ppv, false, owned, record_build) };
+        assert!(t.elapsed() < Duration::from_secs(1), "creation took {:?}", t.elapsed());
+        assert!(BUILDS.lock().unwrap().is_empty(), "creation translated or compiled on the title's thread");
+        // the first resolve sends it: nothing of it ran before that
+        assert_eq!(super::super::pso_async::resolve_for_draw(standin), 0x7600_0002usize);
+        let builds = BUILDS.lock().unwrap().clone();
+        assert_eq!(builds.len(), 1, "built once: {builds:?}");
+        assert!(builds[0].starts_with("xcl-pso"), "built on the title's thread: {builds:?}");
+        let _ = super::super::pso_async::released(standin);
+    }
+
+    /// The title may free its description as soon as `CreatePipelineState` returns: the copy
+    /// holds its own shader blobs and its own input elements, with their names.
+    #[test]
+    fn a_deferred_copy_builds_after_the_title_memory_is_overwritten() {
+        let ms = sample(13, &[fssm(&CODE, &[(8, 13)])]);
+        let ps = sample(0, &[fssm(&CODE, &[(5, 1)])]);
+        let name = std::ffi::CString::new("POSITION").unwrap();
+        let element = D3D12_INPUT_ELEMENT_DESC {
+            SemanticName: PCSTR(name.as_ptr() as *const u8),
+            SemanticIndex: 0,
+            Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32G32B32_FLOAT,
+            InputSlot: 0,
+            AlignedByteOffset: 0,
+            InputSlotClass: D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA,
+            InstanceDataStepRate: 0,
+        };
+        let elements = [element];
+        let mut layout = 1u32.to_le_bytes().to_vec();
+        layout.extend_from_slice(&0u32.to_le_bytes());
+        layout.extend_from_slice(&(elements.as_ptr() as u64).to_le_bytes());
+        let mut s = stream(&[(24, shader_subobject(&ms)), (25, shader_subobject(&ps)), (12, layout)]);
+        let desc: [usize; 2] = [s.len(), s.as_ptr() as usize];
+        let owned = unsafe { deferred_stream_copy_for_test(desc.as_ptr() as *const c_void) }.expect("copied");
+        // the title frees its memory: the stream, the shaders and the element names are gone
+        let mut ms_free = ms.clone();
+        ms_free.iter_mut().for_each(|b| *b = 0xAA);
+        s.iter_mut().for_each(|b| *b = 0xAA);
+        let _dropped = (ms_free, name);
+        // the copy still reads what the build needs
+        let (size, base) = unsafe { (*(owned.ptr() as *const usize), *((owned.ptr() as usize + 8) as *const usize)) };
+        let subs = stream_subobjects(unsafe { std::slice::from_raw_parts(base as *const u8, size) }).expect("parses");
+        let copied_ms = subs.iter().find(|s| s.0 == 24).and_then(|s| payload_shader(s.1)).expect("MS copied");
+        assert_eq!(copied_ms, ms.as_slice(), "the copy is independent of the title's shader memory");
+        assert_ne!(copied_ms.as_ptr() as usize, ms.as_ptr() as usize, "not the title's pointer");
+        let (n, p) = subs.iter().find(|s| s.0 == 12).map(|s| (u32::from_le_bytes(s.1[0..4].try_into().unwrap()) as usize, u64::from_le_bytes(s.1[8..16].try_into().unwrap()) as usize)).expect("input layout copied");
+        assert_eq!(n, 1);
+        let e = unsafe { &*(p as *const D3D12_INPUT_ELEMENT_DESC) };
+        assert_eq!(unsafe { std::ffi::CStr::from_ptr(e.SemanticName.0 as *const std::ffi::c_char) }.to_str().unwrap(), "POSITION");
+        assert!((p as *const u8) != elements.as_ptr() as *const u8, "the elements were deep-copied");
+    }
+
+    /// A deferred build that fails leaves the stand-in: its draws skip (`two_pass_of` finds no
+    /// parts) and the failure is counted and said once – never a silent retry in a draw.
+    #[test]
+    fn a_failed_deferred_build_leaves_a_stand_in_that_skips_draws() {
+        let standin = 0x7620_0001usize;
+        let (go_tx, go_rx) = mpsc::channel::<()>();
+        super::super::pso_async::submit_lazy(
+            standin,
+            false,
+            Box::new(move || {
+                let _ = go_rx.recv_timeout(Duration::from_secs(5));
+                0
+            }),
+        );
+        let before = super::super::pso_async::counts().1;
+        assert_eq!(super::super::pso_async::resolve_for_draw(standin), standin, "the draw uses the stand-in");
+        assert!(two_pass_of(standin).is_none(), "DispatchMesh skips while there is nothing to draw");
+        go_tx.send(()).unwrap();
+        let t = Instant::now();
+        while super::super::pso_async::is_pending(standin) {
+            assert!(t.elapsed() < Duration::from_secs(5), "the failed build never finished");
+            std::thread::yield_now();
+        }
+        let failed = super::super::pso_async::counts().1;
+        assert!(failed > before, "the failure is counted");
+        assert_eq!(super::super::pso_async::resolve_for_draw(standin), standin, "still the stand-in");
+        assert_eq!(super::super::pso_async::counts().1, failed, "and it is not retried or counted twice");
+        assert!(two_pass_of(standin).is_none());
+        assert_eq!(super::super::pso_async::released(standin), 0, "a failed build has no pipeline to release");
     }
 }
 
@@ -5580,6 +5870,10 @@ unsafe fn stream_has_console_shader(desc: *const c_void) -> bool {
 pub(super) unsafe extern "system" fn dev_create_pipeline_state(this: *mut c_void, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
     super::null::capture_stream_desc(desc as *const u8);
     let f: PsoFn = std::mem::transmute(orig_fn(this, slot_of(this, "CreatePipelineState")));
+    // lazy pipelines: a console mesh pipeline is copied and built on a worker at its first use
+    if super::pso_async::lazy() && stream_is_console_mesh(desc) {
+        return defer_stream(this, f, desc, riid, ppv);
+    }
     let (translated, missed) = if super::pso_async::enabled() { attempt(|| translated_mesh_stream(this, desc, riid, ppv)) } else { (translated_mesh_stream(this, desc, riid, ppv), false) };
     if missed {
         if let Some(hr) = own_stream(desc).and_then(|o| go_background(this, f, desc, riid, ppv, false, o, standin_stream, build_stream)) {

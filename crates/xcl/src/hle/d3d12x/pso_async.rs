@@ -78,7 +78,14 @@ fn complete(p: &Pending, real: usize) {
         ticket.take();
     }
     if real == 0 {
-        FAILED.fetch_add(1, Ordering::Relaxed);
+        let n = FAILED.fetch_add(1, Ordering::Relaxed);
+        // the stand-in stays (draws and dispatches skip this pipeline): say why, a few times
+        if n < 8 || n % 256 == 0 {
+            crate::xlog_warn!(
+                "D3D12.X: a pipeline's deferred build failed – its draws and dispatches are skipped ({} so far)",
+                n + 1
+            );
+        }
     } else {
         BUILT.fetch_add(1, Ordering::Relaxed);
     }
