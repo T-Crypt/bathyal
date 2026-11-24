@@ -63,6 +63,20 @@ pub fn fail_summary() -> Option<String> {
 /// The page stays in `LAZY` when `VirtualAlloc(MEM_COMMIT)` fails so a later fault / `ensure`
 /// can retry instead of turning into a bare `0xc0000005` on still-reserved memory (#467).
 unsafe fn commit(page: usize) -> bool {
+    // SAFETY: the caller passes a page it marked lazy.
+    commit_with(page, |p| unsafe {
+        !VirtualAlloc(p as *const c_void, PAGE, MEM_COMMIT, PAGE_READWRITE).is_null()
+    })
+}
+
+/// [`commit`] with the allocation handed in, so a test can make it fail.
+///
+/// The page leaves the lazy set only once it is really committed. When the commit fails - the
+/// system's commit limit is reached, which a retail title on a 16 GB machine gets close to - the
+/// page stays lazy and is retried on the next access, instead of being dropped from the set with
+/// nothing committed: that left the next fault on it unrecognised, so the title died with
+/// `0xc0000005` on a reserved page and nothing said why.
+unsafe fn commit_with(page: usize, alloc: impl FnOnce(usize) -> bool) -> bool {
     let mut g = LAZY.write().unwrap_or_else(|e| e.into_inner());
     if !g.contains(&page) {
         return false;
@@ -71,7 +85,10 @@ unsafe fn commit(page: usize) -> bool {
     if ok {
         g.remove(&page);
     } else {
-        record_fail(page, GetLastError());
+        let e = std::io::Error::last_os_error();
+        record_fail(page, e.raw_os_error().unwrap_or(0) as u32);
+        drop(g);
+        crate::xlog_warn!("lazy page {page:#x}: commit failed ({e}); the title's next access to it faults here");
     }
     ok
 }
@@ -141,6 +158,28 @@ pub fn ensure(p: usize, len: usize) -> bool {
 mod tests {
     use super::*;
     use windows_sys::Win32::System::Memory::{VirtualFree, MEM_RELEASE, MEM_RESERVE};
+
+    /// A commit that fails (the system's commit limit) leaves the page lazy, so the next access
+    /// retries and the crash names the page instead of a silent `MEM_RESERVE` fault.
+    #[test]
+    fn a_failed_commit_leaves_the_page_lazy() {
+        unsafe {
+            let r = VirtualAlloc(std::ptr::null(), PAGE, MEM_RESERVE, PAGE_READWRITE) as usize;
+            assert_ne!(r, 0);
+            mark(r);
+            assert!(!commit_with(r, |_| false), "a failed commit is not a commit");
+            assert!(
+                LAZY.read().unwrap_or_else(|e| e.into_inner()).contains(&r),
+                "the page must stay lazy after a failed commit"
+            );
+            // The retry that succeeds takes it out of the set.
+            assert!(commit_with(r, |_| true));
+            assert!(!LAZY.read().unwrap_or_else(|e| e.into_inner()).contains(&r));
+            // A page that was never lazy is not committed either.
+            assert!(!commit_with(r, |_| true));
+            VirtualFree(r as *mut c_void, 0, MEM_RELEASE);
+        }
+    }
 
     /// A lazy page reads as zeros on first touch, keeps what is written; `ensure` commits it
     /// without a fault.
