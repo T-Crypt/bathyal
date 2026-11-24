@@ -743,8 +743,129 @@ pub unsafe fn place(this: *mut c_void, va: usize, desc: &D3D12_RESOURCE_DESC, st
 mod tests {
     use super::*;
     use std::time::{Duration, Instant};
+    use windows::Win32::Graphics::Dxgi::Common::{
+        DXGI_FORMAT_BC1_UNORM, DXGI_FORMAT_D32_FLOAT, DXGI_FORMAT_R8G8B8A8_UNORM,
+    };
 
     const MIB: usize = 1 << 20;
+
+    /// A reserved texture takes the PC's 64 KiB tiles, and `place` maps as many pages as
+    /// `GetResourceTiling` reports, so that count has to agree with the shape the same call
+    /// returns, and a texture smaller than a tile still gets one.
+    ///
+    /// Parity and self-consistency only: the tile shape is the driver's. The numbers are printed
+    /// so a CI log carries them; on an RX 9060 XT (RDNA4, Adrenalin 26.10.1) 8x8 RGBA8 and D32 are
+    /// one 128x128 tile, 256x256 RGBA8 is four, and 256x256 BC1 is one tile of 512x256 texels.
+    #[test]
+    fn reserved_texture_tiles_agree_with_the_shape() {
+        let Ok(dev) = crate::gpu::agility::create_device(
+            None,
+            windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0,
+        ) else {
+            println!("no D3D12 device - skipping");
+            crate::gpu::recomp::runner::skip_test("no GPU");
+            return;
+        };
+        let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS::default();
+        // SAFETY: a plain feature query on a live device.
+        let tier = unsafe {
+            dev.CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS,
+                &mut options as *mut _ as *mut c_void,
+                std::mem::size_of::<D3D12_FEATURE_DATA_D3D12_OPTIONS>() as u32,
+            )
+        }
+        .is_ok()
+            .then_some(options.TiledResourcesTier.0)
+            .unwrap_or(0);
+        if tier < 1 {
+            println!("tiled resources tier {tier} - skipping");
+            crate::gpu::recomp::runner::skip_test("no tiled resources");
+            return;
+        }
+
+        // The shapes the title's GPU-owned textures use, on both sides of one tile.
+        let cases = [
+            (DXGI_FORMAT_R8G8B8A8_UNORM, 8u64, 8u32, true),
+            (DXGI_FORMAT_R8G8B8A8_UNORM, 256, 256, false),
+            (DXGI_FORMAT_BC1_UNORM, 256, 256, true),
+            (DXGI_FORMAT_D32_FLOAT, 8, 8, true),
+        ];
+        let mut compared = 0;
+        for (format, width, height, one_tile) in cases {
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                Width: width,
+                Height: height,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                Format: format,
+                SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                // What `place` builds: the title's descriptor with the 64 KiB layout.
+                Layout: D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE,
+                ..Default::default()
+            };
+            let mut res: Option<ID3D12Resource> = None;
+            // SAFETY: a reserved resource takes no memory until pages are mapped.
+            if unsafe {
+                dev.CreateReservedResource(&desc, D3D12_RESOURCE_STATE_COMMON, None, &mut res)
+            }
+            .is_err()
+            {
+                println!("format {} {width}x{height}: refused - skipping", format.0);
+                continue;
+            }
+            let res = res.expect("a created resource");
+            let (mut total, mut shape) = (0u32, D3D12_TILE_SHAPE::default());
+            // `pNumSubresourceTilings` is in and out: ask for the one subresource of a one-mip
+            // texture.
+            let mut subresources = 1u32;
+            let mut tiling = D3D12_SUBRESOURCE_TILING::default();
+            // SAFETY: `res` is a live reserved resource and every out-pointer is valid.
+            unsafe {
+                dev.GetResourceTiling(
+                    &res,
+                    Some(&mut total),
+                    None,
+                    Some(&mut shape),
+                    Some(&mut subresources),
+                    0,
+                    &mut tiling,
+                );
+            }
+            let per_mip = u64::from(tiling.WidthInTiles)
+                * u64::from(tiling.HeightInTiles)
+                * u64::from(tiling.DepthInTiles);
+            println!(
+                "format {} {width}x{height}: total {total}, mip {per_mip} tiles, shape {}x{}x{}",
+                format.0, shape.WidthInTexels, shape.HeightInTexels, shape.DepthInTexels
+            );
+            assert!(total >= 1, "format {} {width}x{height}: no tile", format.0);
+            assert_eq!(
+                subresources, 1,
+                "format {}: one mip, one subresource",
+                format.0
+            );
+            assert_eq!(
+                u64::from(total),
+                per_mip,
+                "format {} {width}x{height}: the count disagrees with the tile shape",
+                format.0
+            );
+            if one_tile {
+                assert_eq!(
+                    total, 1,
+                    "format {} {width}x{height}: fits in one tile",
+                    format.0
+                );
+            }
+            compared += 1;
+        }
+        assert!(compared > 0, "no case could be created");
+    }
 
     /// One call per heap: its tiles in runs, the other heaps' skipped.
     #[test]
