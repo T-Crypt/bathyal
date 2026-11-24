@@ -66,7 +66,7 @@ fn queue() -> &'static Mutex<mpsc::Sender<Arc<Pending>>> {
         let (tx, rx) = mpsc::channel::<Arc<Pending>>();
         let rx = Arc::new(Mutex::new(rx));
         // translation recurses deeply on big programs; DXC itself runs on its own pool
-        let n = crate::gpu::recomp::dxc::compile_threads();
+        let n = pipeline_threads();
         for k in 0..n {
             let rx = rx.clone();
             let _ = std::thread::Builder::new().name(format!("xcl-pso-{k}")).stack_size(64 << 20).spawn(move || loop {
@@ -82,6 +82,38 @@ fn queue() -> &'static Mutex<mpsc::Sender<Arc<Pending>>> {
         Mutex::new(tx)
     })
 }
+
+/// How many `xcl-pso-N` workers build pipelines (each is a driver compile of its own).
+///
+/// On NVIDIA the driver compiler is what a worker spends its time in and its time grows
+/// faster than the program (#156): one big retail compute program takes minutes. Measured on
+/// an RTX 4090 (driver 621.01, i9-14900K) with the large synthetic programs of
+/// `nv_parallel_driver_compile`: 1 / 2 / 4 / 8 creator threads finished the same queue in
+/// 50.0 / 29.7 / 16.5 / 10.1 s, each program at 8.4 / 9.6 / 9.2 / 10.0 s. So the driver's
+/// compiler is not serialised here, but each program gets slower with more of them: 4 keeps
+/// the queue moving and the slowest machine in #156 (a 4-core 7700K / RTX 5080) measured
+/// best. Everywhere else it stays a worker per DXC thread. `XCL_PSO_THREADS` overrides both.
+fn pipeline_threads() -> usize {
+    static N: OnceLock<usize> = OnceLock::new();
+    *N.get_or_init(|| {
+        let over = std::env::var("XCL_PSO_THREADS").ok().and_then(|v| v.trim().parse::<usize>().ok());
+        let n = workers_for(super::real::adapter_vendor() == 0x10DE, over, crate::gpu::recomp::dxc::compile_threads());
+        crate::xlog_info!("D3D12.X: {n} pipeline build worker(s) (XCL_PSO_THREADS sets the count)");
+        n
+    })
+}
+
+/// [`pipeline_threads`] from the adapter and the environment, so its test needs no GPU.
+fn workers_for(nvidia: bool, over: Option<usize>, dxc: usize) -> usize {
+    match over {
+        Some(n) => n.clamp(1, 64),
+        None if nvidia => NVIDIA_WORKERS,
+        None => dxc,
+    }
+}
+
+/// Measured best on an RTX 4090 (see [`pipeline_threads`]).
+const NVIDIA_WORKERS: usize = 4;
 
 /// Release a pipeline state XCL owns (raw pointer, 0 = none).
 pub fn release(p: usize) {
@@ -200,4 +232,22 @@ pub fn is_pending(pso: usize) -> bool {
 pub fn counts() -> (usize, usize, usize) {
     let pending = PENDING.lock().unwrap().as_ref().map_or(0, |m| m.values().filter(|p| !*p.done.lock().unwrap()).count());
     (BUILT.load(Ordering::Relaxed), FAILED.load(Ordering::Relaxed), pending)
+}
+
+#[cfg(test)]
+mod worker_tests {
+    use super::*;
+
+    /// The pool from the adapter and the environment: the measured NVIDIA count, a worker
+    /// per DXC thread elsewhere, and `XCL_PSO_THREADS` past both (1 at least, 64 at most).
+    #[test]
+    fn the_pool_follows_the_adapter_and_the_override() {
+        assert_eq!(workers_for(true, None, 15), NVIDIA_WORKERS);
+        assert_eq!(workers_for(false, None, 15), 15);
+        assert_eq!(workers_for(true, Some(8), 15), 8);
+        assert_eq!(workers_for(false, Some(3), 15), 3);
+        assert_eq!(workers_for(false, Some(0), 15), 1, "a pool needs a worker");
+        assert_eq!(workers_for(false, Some(1000), 15), 64);
+        assert!(NVIDIA_WORKERS >= 1 && NVIDIA_WORKERS <= 8, "measured best on NVIDIA is 4");
+    }
 }

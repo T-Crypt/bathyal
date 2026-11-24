@@ -417,6 +417,14 @@ pub fn stats() -> D3d12Stats {
 
 static DEVICE: AtomicUsize = AtomicUsize::new(0);
 
+/// The device adapter's DXGI vendor id (0x10DE NVIDIA, 0x1002 AMD, 0x8086 Intel): 0 before
+/// `init` and for WARP. `pso_async` reads it to size its worker pool.
+static ADAPTER_VENDOR: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+pub fn adapter_vendor() -> u32 {
+    ADAPTER_VENDOR.load(Ordering::Relaxed)
+}
+
 pub fn device_raw() -> *mut c_void {
     DEVICE.load(Ordering::Acquire) as *mut c_void
 }
@@ -529,6 +537,7 @@ pub fn init() -> Result<String, String> {
                 if let Ok(dev) = crate::gpu::agility::create_device(&adapter, D3D_FEATURE_LEVEL_12_0) {
                     device = Some(dev);
                     name = format!("{} ({} MiB VRAM)", crate::gpu::adapter::name(&desc), desc.DedicatedVideoMemory >> 20);
+                    ADAPTER_VENDOR.store(desc.VendorId, Ordering::Relaxed);
                     break;
                 }
             }
