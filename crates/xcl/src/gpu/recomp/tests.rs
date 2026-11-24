@@ -2525,6 +2525,47 @@ fn draw_console_as(vs: Option<&[u8]>, ps: Option<&[u8]>, tris_px: &[[f32; 2]], w
     draw_console_views_as(vs, ps, tris_px, &[], &[], &[], wave64)
 }
 
+/// The first draw has matching screen/explicit gradients. The others request coarser and
+/// finer mips than the screen footprint, once with just dV/dY setting the coarser mip.
+#[test]
+fn gpu_ps_compare_mip_gradients() {
+    if !gpu_ready() {
+        return;
+    }
+    let mut failures = Vec::new();
+    // screen footprint, dU/dX, dV/dY, minimum LOD, expected mip. In the final case
+    // dU/dX grows across the quad: column zero selects mip 0, its neighbor selects mip 1.
+    for (op, scale, dx, dy, min_lod, mip, slope) in [
+        ("IMAGE_SAMPLE_C_D", 0.125f32, 0.125f32, 0.125f32, 0.0f32, 0, 0.0f32),
+        ("IMAGE_SAMPLE_C_D", 0.125, 0.0, 0.25, 0.0, 1, 0.0),
+        ("IMAGE_SAMPLE_C_D_CL", 0.25, 0.125, 0.125, 0.0, 0, 0.0),
+        ("IMAGE_SAMPLE_C_CD_O", 0.125, 0.25, 0.0, 0.0, 1, 0.0),
+        ("IMAGE_SAMPLE_C_CD_CL_O", 0.125, 0.125, 0.125, 1.0, 1, 0.0),
+        ("IMAGE_SAMPLE_C_D", 0.125, 0.10, 0.0, 0.0, 0, 0.0625),
+    ] {
+        let ps = prog(&[
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 8), ("SRC0", 240)], None), // compare 0.5
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 9), ("SRC0", 255)], Some(dx.to_bits())),
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 10), ("SRC0", 128)], None),
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 11), ("SRC0", 128)], None),
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 12), ("SRC0", 255)], Some(dy.to_bits())),
+            ("V_MUL_F32", "ENC_VOP2", &[("VDST", 13), ("SRC0", 255), ("VSRC1", 2)], Some(scale.to_bits())),
+            ("V_MUL_F32", "ENC_VOP2", &[("VDST", 14), ("SRC0", 255), ("VSRC1", 3)], Some(scale.to_bits())),
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 7), ("SRC0", 128)], None), // zero texel offset for _O
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 15), ("SRC0", 255)], Some(min_lod.to_bits())),
+            ("V_MUL_F32", "ENC_VOP2", &[("VDST", 16), ("SRC0", 255), ("VSRC1", 2)], Some(slope.to_bits())),
+            ("V_ADD_F32", "ENC_VOP2", &[("VDST", 9), ("SRC0", V + 16), ("VSRC1", 9)], None),
+            (op, "ENC_MIMG", &[("VDATA", 20), ("VADDR", if op.ends_with("_O") { 7 } else { 8 }), ("SRSRC", 4), ("SSAMP", 6), ("DMASK", 1), ("DIM", 1)], None),
+            ("EXP", "ENC_EXP", &[("TGT", 0), ("EN", 1), ("VSRC0", 20), ("DONE", 1), ("VM", 1)], None),
+        ]);
+        let want = |x| if slope == 0.0 { mip } else { u32::from(x > 0) };
+        if let Err(error) = check_ps_depth_mip(&ps, scale, want) {
+            failures.push(format!("{op}, scale {scale}, slope {slope}: {error}"));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
 /// `draw_console` with initial SGPRs and textures / samplers (see `runner::ViewTexture`).
 fn draw_console_views(
     vs: Option<&[u8]>,

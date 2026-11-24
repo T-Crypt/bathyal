@@ -2424,6 +2424,21 @@ impl Em {
                     None => l,
                 };
                 match (&cmp, &grads, &lod, &bias) {
+                    (Some(z), Some((dx, dy)), _, _) if ps => {
+                        let ty = ["float", "float2", "float3"][dx.len() - 1];
+                        let vector = |v: &[String]| if v.len() == 1 { v[0].clone() } else { format!("{ty}({})", v.join(", ")) };
+                        // Array layers have no derivatives. Cube gradients are in face space:
+                        // project the footprint back to directions on the selected pixel's face.
+                        let location = match dim {
+                            3 => {
+                                let face = format!("QuadReadLaneAt({}, {t}_q)", coords[2]);
+                                format!("float4(cube_dir({t}_p.x, {t}_p.y, {face}), cube_slice({face}))")
+                            }
+                            4 | 5 => format!("float{}({t}_p, round({}))", dx.len() + 1, coords[dx.len()]),
+                            _ => format!("{t}_p"),
+                        };
+                        self.sample_cmp_grad(&t, ty, &vector(&coords[..dx.len()]), &vector(dx), &vector(dy), &tail(format!("{location}, {z}")))
+                    }
                     (Some(z), _, _, _) if has_lz || !ps => format!("float4({t}_T.SampleCmpLevelZero({t}_S, {coord}, {z}).xxxx)"),
                     (Some(z), _, _, Some(b)) => {
                         // Bias is added to log2(footprint), so scale both screen derivatives by 2^bias.
