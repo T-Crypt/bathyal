@@ -6126,6 +6126,47 @@ pub fn log_device_removed() {
 /// At most this many command lists and allocations are read from the DRED lists.
 const DRED_MAX_NODES: usize = 16;
 const DRED_MAX_ALLOCATIONS: usize = 8;
+/// How many breadcrumbs a DRED report reads, and how many lists it prints.
+const DRED_SCAN_LIMIT: usize = 4096;
+const DRED_REPORT_LIMIT: usize = 64;
+
+/// DRED gives us a linked list in driver order. Keep the diagnostic bounded even on a long
+/// chain, with room in the log for work that the GPU had already started: lists with at least
+/// one operation done are reported first (up to 64), then unstarted ones.
+unsafe fn report_dred_lists(head: *const D3D12_AUTO_BREADCRUMB_NODE, mut report: impl FnMut(&D3D12_AUTO_BREADCRUMB_NODE, usize)) {
+    let nodes = || std::iter::successors(head.as_ref(), |node| node.pNext.as_ref()).take(DRED_SCAN_LIMIT);
+    let mut reported = 0;
+    for started in [true, false] {
+        for node in nodes() {
+            let done = node.pLastBreadcrumbValue.as_ref().copied().unwrap_or(0);
+            if done < node.BreadcrumbCount && (done != 0) == started {
+                report(node, done as usize);
+                reported += 1;
+                if reported == DRED_REPORT_LIMIT {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// `report_dred_lists` for the breadcrumbs of `ID3D12DeviceRemovedExtendedData1`.
+unsafe fn report_dred_lists1(head: *const D3D12_AUTO_BREADCRUMB_NODE1, mut report: impl FnMut(&D3D12_AUTO_BREADCRUMB_NODE1, Option<u32>)) {
+    let nodes = || std::iter::successors(head.as_ref(), |node| node.pNext.as_ref()).take(DRED_SCAN_LIMIT);
+    let mut reported = 0;
+    for started in [true, false] {
+        for node in nodes() {
+            let done = node.pLastBreadcrumbValue.as_ref().copied();
+            if done.is_none_or(|d| d < node.BreadcrumbCount) && done.is_some_and(|d| d != 0) == started {
+                report(node, done);
+                reported += 1;
+                if reported == DRED_REPORT_LIMIT {
+                    return;
+                }
+            }
+        }
+    }
+}
 
 /// A debug name the driver stored for a command list, queue or allocation: wide first, then
 /// ANSI. Null and empty names are `None`.
@@ -6182,14 +6223,12 @@ unsafe fn log_dred1(dred: &ID3D12DeviceRemovedExtendedData1) {
             return;
         }
     };
-    let mut n = bc.pHeadAutoBreadcrumbNode;
-    let mut k = 0;
-    while !n.is_null() && k < DRED_MAX_NODES {
-        let node = &*n;
+    let mut any = false;
+    report_dred_lists1(bc.pHeadAutoBreadcrumbNode, |node, done| {
+        any = true;
         let list = dred_debug_name(node.pCommandListDebugNameW, node.pCommandListDebugNameA).unwrap_or_else(|| format!("{:p}", node.pCommandList.as_ref().map_or(std::ptr::null_mut(), |l| l.as_raw())));
         let queue = dred_debug_name(node.pCommandQueueDebugNameW, node.pCommandQueueDebugNameA).unwrap_or_else(|| format!("{:p}", node.pCommandQueue.as_ref().map_or(std::ptr::null_mut(), |q| q.as_raw())));
         let count = (node.BreadcrumbCount as usize).min(1 << 16);
-        let done = if node.pLastBreadcrumbValue.is_null() { None } else { Some(*node.pLastBreadcrumbValue) };
         let window = match done {
             Some(d) if count > 0 && !node.pCommandHistory.is_null() => {
                 let ops = std::slice::from_raw_parts(node.pCommandHistory as *const i32, count);
@@ -6210,13 +6249,9 @@ unsafe fn log_dred1(dred: &ID3D12DeviceRemovedExtendedData1) {
         };
         let done = done.map(|d| d.to_string()).unwrap_or_else(|| "unknown".to_string());
         crate::xlog_warn!("DRED: command list {list}, queue {queue}: BreadcrumbCount {count}, last completed {done}{window}{contexts}");
-        n = node.pNext;
-        k += 1;
-    }
-    if n.is_null() && k == 0 {
-        crate::xlog_warn!("DRED: no auto-breadcrumb nodes");
-    } else if !n.is_null() {
-        crate::xlog_warn!("DRED: more than {DRED_MAX_NODES} breadcrumb nodes, the rest not read");
+    });
+    if !any {
+        crate::xlog_warn!("DRED: no unfinished auto-breadcrumb node (or no nodes)");
     }
 }
 
@@ -6236,30 +6271,22 @@ unsafe fn log_dred0(dred: &ID3D12DeviceRemovedExtendedData) {
         log_dred_page_fault(pf.PageFaultVA, names(pf.pHeadExistingAllocationNode), names(pf.pHeadRecentFreedAllocationNode));
     }
     if let Ok(bc) = dred.GetAutoBreadcrumbsOutput() {
-        let mut n = bc.pHeadAutoBreadcrumbNode;
-        let mut k = 0;
-        while !n.is_null() && k < DRED_MAX_NODES {
-            let node = &*n;
+        let mut any = false;
+        report_dred_lists(bc.pHeadAutoBreadcrumbNode, |node, done| {
+            any = true;
             let list = dred_debug_name(node.pCommandListDebugNameW, node.pCommandListDebugNameA).unwrap_or_else(|| format!("{:p}", node.pCommandList.as_ref().map_or(std::ptr::null_mut(), |l| l.as_raw())));
             let queue = dred_debug_name(node.pCommandQueueDebugNameW, node.pCommandQueueDebugNameA).unwrap_or_else(|| format!("{:p}", node.pCommandQueue.as_ref().map_or(std::ptr::null_mut(), |q| q.as_raw())));
             let count = (node.BreadcrumbCount as usize).min(1 << 16);
-            let done = if node.pLastBreadcrumbValue.is_null() { None } else { Some(*node.pLastBreadcrumbValue) };
-            let window = match done {
-                Some(d) if count > 0 && !node.pCommandHistory.is_null() => {
-                    let ops = std::slice::from_raw_parts(node.pCommandHistory as *const i32, count);
-                    format!(", around: {}", super::dred::breadcrumb_window(ops, d))
-                }
-                _ => String::new(),
+            let window = if count > 0 && !node.pCommandHistory.is_null() {
+                let ops = std::slice::from_raw_parts(node.pCommandHistory as *const i32, count);
+                format!(", around: {}", super::dred::breadcrumb_window(ops, done as u32))
+            } else {
+                String::new()
             };
-            let done = done.map(|d| d.to_string()).unwrap_or_else(|| "unknown".to_string());
             crate::xlog_warn!("DRED: command list {list}, queue {queue}: BreadcrumbCount {count}, last completed {done}{window}");
-            n = node.pNext;
-            k += 1;
-        }
-        if n.is_null() && k == 0 {
-            crate::xlog_warn!("DRED: no auto-breadcrumb nodes");
-        } else if !n.is_null() {
-            crate::xlog_warn!("DRED: more than {DRED_MAX_NODES} breadcrumb nodes, the rest not read");
+        });
+        if !any {
+            crate::xlog_warn!("DRED: no unfinished auto-breadcrumb list (or no nodes)");
         }
     }
 }
@@ -6278,6 +6305,32 @@ pub fn stop_if_device_removed() {
         crate::log::flush();
         unsafe {
             windows_sys::Win32::System::Threading::TerminateProcess(windows_sys::Win32::System::Threading::GetCurrentProcess(), e.code().0 as u32);
+        }
+    }
+}
+
+#[cfg(test)]
+mod dred_tests {
+    use super::*;
+
+    #[test]
+    fn a_late_partially_executed_list_is_reported_before_unstarted_lists() {
+        let progress = [0u32, 1, 2];
+        let mut nodes = vec![D3D12_AUTO_BREADCRUMB_NODE::default(); 606];
+        for (i, node) in nodes.iter_mut().enumerate() {
+            node.BreadcrumbCount = 2;
+            node.pLastBreadcrumbValue = if i < 193 { &progress[0] } else { &progress[2] };
+        }
+        nodes[605].pLastBreadcrumbValue = &progress[1];
+        for i in 1..nodes.len() {
+            nodes[i - 1].pNext = &nodes[i];
+        }
+        let mut reported = Vec::new();
+        unsafe { report_dred_lists(nodes.as_ptr(), |node, done| reported.push((std::ptr::from_ref(node), done))) };
+        assert_eq!(reported.first(), Some(&(std::ptr::from_ref(&nodes[605]), 1)));
+        assert_eq!(reported.len(), 64);
+        for (i, &(node, done)) in reported[1..].iter().enumerate() {
+            assert_eq!((node, done), (std::ptr::from_ref(&nodes[i]), 0));
         }
     }
 }
