@@ -517,6 +517,12 @@ fn resolve_compute_within(pso: usize, limit: Option<std::time::Duration>, budget
 
 fn resolve_compute_decided(pso: usize, limit: Option<std::time::Duration>, budget: &FrameBudget, never_skip: bool) -> usize {
     let Some(p) = entry(pso) else { return pso };
+    // bound: drawn with this run, so the next one builds it while the title loads (a compute
+    // pipeline's stand-in carries the shader identity it was created with). Before the decision,
+    // so a wait that never skips still enters the record.
+    if !p.noted.swap(true, Ordering::Relaxed) {
+        super::pso_disk::note_drawn(pso);
+    }
     // `complete` stores `real` and sets `done` under this lock: read both together, so a
     // build finishing now is seen as built (or as failed), never as neither
     let (real_now, done_now) = {
@@ -532,11 +538,6 @@ fn resolve_compute_decided(pso: usize, limit: Option<std::time::Duration>, budge
     let Some(limit) = limit else {
         return resolve_wait(pso);
     };
-    // bound: drawn with this run, so the next one builds it while the title loads (a compute
-    // pipeline's stand-in carries the shader identity it was created with)
-    if !p.noted.swap(true, Ordering::Relaxed) {
-        super::pso_disk::note_drawn(pso);
-    }
     if let r @ 1.. = real_now {
         return r;
     }
@@ -605,6 +606,10 @@ fn wait_for_build(p: &Arc<Pending>, pso: usize) -> usize {
     if !enqueue(p) {
         // no worker pool to build it: an unbounded wait could never end
         return pso;
+    }
+    // the title waits for it: the next run builds it before the other recorded pipelines
+    if !p.stall_noted.swap(true, Ordering::Relaxed) {
+        super::pso_disk::note_stalled(pso);
     }
     let started = Instant::now();
     let mut done = p.done.lock().unwrap();
