@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 
 use windows::Win32::Graphics::Direct3D::ID3DBlob;
 use windows::Win32::Graphics::Direct3D12::*;
@@ -514,18 +514,55 @@ impl ShaderCache {
     }
 }
 
-fn shader_flight(cache_id: usize, key: ShaderKey) -> Arc<Mutex<()>> {
-    type FlightMap = Mutex<HashMap<(usize, ShaderKey), Weak<Mutex<()>>>>;
+/// A program being translated and compiled. A second request for the same program sleeps on
+/// `done` until the build ends; no lock is held across the translation or the DXC compile, so
+/// two different programs compile at the same time. (A mutex held for the whole build made
+/// every mesh pipeline wait for the one program another thread was compiling.)
+struct Flight {
+    state: Mutex<FlightState>,
+    done: Condvar,
+}
+
+enum FlightState {
+    Building,
+    Built(Result<Arc<Compiled>, String>),
+}
+
+impl Flight {
+    /// The build ended: wake the waiters.
+    fn publish(&self, r: Result<Arc<Compiled>, String>) {
+        {
+            let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            *st = FlightState::Built(r);
+        }
+        self.done.notify_all();
+    }
+
+    /// The build's result (`publish` is the only writer).
+    fn wait(&self) -> Result<Arc<Compiled>, String> {
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            if let FlightState::Built(r) = &*st {
+                return r.clone();
+            }
+            st = self.done.wait(st).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+}
+
+/// The flight of `key`, and whether this caller leads it (the one that translates and compiles).
+fn shader_flight(cache_id: usize, key: ShaderKey) -> (Arc<Flight>, bool) {
+    type FlightMap = Mutex<HashMap<(usize, ShaderKey), Weak<Flight>>>;
     static FLIGHTS: OnceLock<FlightMap> = OnceLock::new();
     let mut flights = FLIGHTS.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap();
     flights.retain(|_, v| v.strong_count() != 0);
     let fk = (cache_id, key);
     if let Some(flight) = flights.get(&fk).and_then(Weak::upgrade) {
-        return flight;
+        return (flight, false);
     }
-    let flight = Arc::new(Mutex::new(()));
+    let flight = Arc::new(Flight { state: Mutex::new(FlightState::Building), done: Condvar::new() });
     flights.insert(fk, Arc::downgrade(&flight));
-    flight
+    (flight, true)
 }
 
 fn cached_shader(
@@ -548,16 +585,39 @@ fn cached_shader_status(
         return Ok((shader, true));
     }
     // Cached-only probes must never block waiting on another thread's in-flight build.
-    let flight = (!dxc::in_cached_only()).then(|| shader_flight(cache as *const Mutex<ShaderCache> as usize, key.clone()));
-    let _flight_guard = flight.as_ref().map(|f| f.lock().unwrap_or_else(|e| e.into_inner()));
-    if _flight_guard.is_some() {
-        if let Some(shader) = cache.lock().unwrap().get(&key, blob) {
+    let mut flight = None;
+    if !dxc::in_cached_only() {
+        let (f, leader) = shader_flight(cache as *const Mutex<ShaderCache> as usize, key.clone());
+        if !leader {
+            // The same program is being built: take its result. No lock is held while it builds.
             dxc::note_memory_hit();
-            return Ok((shader, true));
+            return f.wait().map(|shader| (shader, true));
+        }
+        flight = Some(f);
+    }
+    // Keep compilation outside the cache lock, including cached-only probes. A leader that
+    // stops without publishing (a panic) wakes its waiters with an error, not a hang.
+    struct Publish<'a>(Option<&'a Flight>);
+    impl Drop for Publish<'_> {
+        fn drop(&mut self) {
+            if let Some(f) = self.0.take() {
+                f.publish(Err("the build of this program stopped".into()));
+            }
         }
     }
-    // Keep compilation outside the cache lock, including cached-only probes.
-    let shader = Arc::new(compile_one()?);
+    let mut publish = Publish(flight.as_deref());
+    let shader = match compile_one() {
+        Ok(c) => Arc::new(c),
+        Err(e) => {
+            if let Some(f) = publish.0.take() {
+                f.publish(Err(e.clone()));
+            }
+            return Err(e);
+        }
+    };
+    if let Some(f) = publish.0.take() {
+        f.publish(Ok(shader.clone()));
+    }
     let mut cache = cache.lock().unwrap();
     if let Some(existing) = cache.get(&key, blob) {
         return Ok((existing, true));
