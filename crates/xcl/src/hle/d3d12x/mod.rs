@@ -30,6 +30,7 @@ mod pso_disk;
 mod queue_gate;
 pub mod real;
 pub mod sparse;
+pub mod tile_check;
 pub mod title_list;
 pub mod title_textures;
 pub mod vram;

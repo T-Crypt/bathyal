@@ -25,7 +25,10 @@
 
 use std::collections::HashSet;
 use std::ffi::c_void;
+use std::sync::atomic::AtomicU64;
 use std::sync::Mutex;
+
+use super::tile_check;
 
 use windows::core::Interface;
 use windows::Win32::Graphics::Direct3D12::*;
@@ -160,6 +163,32 @@ unsafe fn arena_heap(dev: &ID3D12Device, va: usize, size: usize, align: usize) -
 const PAGE: usize = 0x1_0000;
 /// pages of a video-memory pool heap (64 MiB)
 const POOL_PAGES: u32 = 1024;
+
+/// invalid tile mapping calls skipped, for the log-rate limit
+static TILE_CALLS_REJECTED: AtomicU64 = AtomicU64::new(0);
+
+/// Whether one pool-heap mapping call passes D3D12's rules for a region and its heap ranges.
+fn check_mapping(total: u32, start: u64, tiles: u64, ranges: &[(bool, u32, u32)]) -> Result<(), tile_check::Reject> {
+    let regions = [tile_check::Region { start, kind: tile_check::RegionKind::Tiles(tiles) }];
+    let ranges: Vec<tile_check::Range> = ranges
+        .iter()
+        .map(|&(mapped, offset, count)| tile_check::Range {
+            flag: if mapped { tile_check::RangeFlag::None } else { tile_check::RangeFlag::Skip },
+            offset: offset as u64,
+            count: count as u64,
+        })
+        .collect();
+    tile_check::check(&tile_check::Request {
+        reserved: true,
+        resource_present: true,
+        null_mapping: false,
+        total_tiles: Some(total as u64),
+        heap_tiles: Some(POOL_PAGES as u64),
+        regions: &regions,
+        ranges: &ranges,
+    })
+}
+
 /// a page no target uses any more is kept this long for the next target at its address (with
 /// what it holds – a title may make a target again over memory it rendered to)
 const IDLE: std::time::Duration = std::time::Duration::from_secs(2);
@@ -306,13 +335,18 @@ impl Pages {
         Some((h, 0))
     }
 
-    /// Map every tile of `res` (`tiles[i]`: overall tile i) – one call per pool heap.
-    unsafe fn map(&mut self, res: &ID3D12Resource, tiles: &[Tile]) {
+    /// Map every tile of `res` (`tiles[i]`: overall tile i, `total` tiles in all) – one call per
+    /// pool heap.
+    unsafe fn map(&mut self, res: &ID3D12Resource, tiles: &[Tile], total: u32) {
         let mut heaps: Vec<u32> = tiles.iter().map(|t| t.0).collect();
         heaps.sort_unstable();
         heaps.dedup();
         for h in heaps {
             let ranges = heap_ranges(h, tiles);
+            if let Err(r) = check_mapping(total, 0, tiles.len() as u64, &ranges) {
+                tile_check::log_reject("vram map", &TILE_CALLS_REJECTED, &r);
+                continue;
+            }
             let flags: Vec<D3D12_TILE_RANGE_FLAGS> = ranges.iter().map(|r| if r.0 { D3D12_TILE_RANGE_FLAG_NONE } else { D3D12_TILE_RANGE_FLAG_SKIP }).collect();
             let offsets: Vec<u32> = ranges.iter().map(|r| r.1).collect();
             let counts: Vec<u32> = ranges.iter().map(|r| r.2).collect();
@@ -357,6 +391,10 @@ impl Pages {
         heaps.dedup();
         for h in heaps {
             let ranges = heap_ranges(h, packed_tiles);
+            if let Err(r) = check_mapping(tiles.len() as u32, start as u64, n as u64, &ranges) {
+                tile_check::log_reject("vram map_packed_mips", &TILE_CALLS_REJECTED, &r);
+                continue;
+            }
             let flags: Vec<D3D12_TILE_RANGE_FLAGS> = ranges.iter().map(|r| if r.0 { D3D12_TILE_RANGE_FLAG_NONE } else { D3D12_TILE_RANGE_FLAG_SKIP }).collect();
             let offsets: Vec<u32> = ranges.iter().map(|r| r.1).collect();
             let counts: Vec<u32> = ranges.iter().map(|r| r.2).collect();
@@ -382,6 +420,24 @@ impl Pages {
     /// Unmap every tile of `res` (`D3D12_TILE_RANGE_FLAG_NULL`) so its unshared tiles can return
     /// to the pool even while the title keeps the COM object alive.
     unsafe fn unmap(&mut self, res: &ID3D12Resource, total: u32) {
+        if total == 0 {
+            return;
+        }
+        let regions = [tile_check::Region { start: 0, kind: tile_check::RegionKind::Tiles(total as u64) }];
+        let ranges = [tile_check::Range { flag: tile_check::RangeFlag::Null, offset: 0, count: total as u64 }];
+        let req = tile_check::Request {
+            reserved: true,
+            resource_present: true,
+            null_mapping: false,
+            total_tiles: Some(total as u64),
+            heap_tiles: None,
+            regions: &regions,
+            ranges: &ranges,
+        };
+        if let Err(r) = tile_check::check(&req) {
+            tile_check::log_reject("vram unmap", &TILE_CALLS_REJECTED, &r);
+            return;
+        }
         let coord = D3D12_TILED_RESOURCE_COORDINATE::default();
         let region = D3D12_TILE_REGION_SIZE { NumTiles: total, UseBox: false.into(), ..Default::default() };
         let flag = D3D12_TILE_RANGE_FLAG_NULL;
@@ -483,7 +539,7 @@ impl Pages {
             self.release_tiles(used, used_extra, now, true);
             return None;
         }
-        self.map(res, &tiles);
+        self.map(res, &tiles, total);
         self.map_packed_mips(dev, res, &tiles);
         Some((used, used_extra))
     }
