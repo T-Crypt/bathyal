@@ -871,6 +871,7 @@ fn libopus() -> Result<&'static LibOpus, String> {
     LIBOPUS
         .get_or_init(|| unsafe {
             use std::os::windows::ffi::OsStrExt;
+            use windows_sys::Win32::Foundation::FreeLibrary;
             use windows_sys::Win32::System::LibraryLoader::LoadLibraryW;
             let mut dirs: Vec<std::path::PathBuf> = Vec::new();
             if let Some(d) = std::env::var_os("XCL_OPUS_DIR") {
@@ -894,6 +895,8 @@ fn libopus() -> Result<&'static LibOpus, String> {
                     let (Some(create), Some(decode), Some(destroy), Some(ctl)) =
                         (f("opus_decoder_create"), f("opus_decode"), f("opus_decoder_destroy"), f("opus_decoder_ctl"))
                     else {
+                        // a DLL that is not libopus (one of the four symbols is missing): not kept loaded
+                        FreeLibrary(h as _);
                         continue;
                     };
                     return Ok(LibOpus {
@@ -917,6 +920,8 @@ struct LibDecoder {
     state: *mut c_void,
     channels: u16,
     output_rate: u32,
+    /// stream time of the next packet, as [`MftDecoder`] keeps it (0: nothing decoded since the start / the last flush)
+    timestamp_100ns: i64,
 }
 
 impl LibDecoder {
@@ -930,16 +935,19 @@ impl LibDecoder {
         if state.is_null() || err != 0 {
             return Err(format!("opus_decoder_create: {err}"));
         }
-        Ok(Self { lib, state, channels: ch, output_rate: rate })
+        Ok(Self { lib, state, channels: ch, output_rate: rate, timestamp_100ns: 0 })
     }
 
     fn flush(&mut self) {
         unsafe {
             (self.lib.ctl)(self.state, OPUS_RESET_STATE);
         }
+        self.timestamp_100ns = 0;
     }
 
     fn decode_packet(&mut self, packet: &[u8], out: &mut Vec<i16>) -> Result<usize, String> {
+        // as MftDecoder: an empty or malformed packet is an error (libopus would conceal a lost one)
+        parse_packet(packet, false).ok_or_else(|| "invalid RFC 6716 Opus packet".to_string())?;
         let max_frames = (MAX_PACKET_SAMPLES_48K as usize * self.output_rate as usize) / 48_000;
         let ch = self.channels as usize;
         let start = out.len();
@@ -950,6 +958,8 @@ impl LibDecoder {
             return Err(format!("opus_decode: {n}"));
         }
         out.truncate(start + n as usize * ch);
+        // the time the packet covers: its frames at the output rate
+        self.timestamp_100ns = self.timestamp_100ns.saturating_add(n as i64 * 10_000_000 / self.output_rate as i64);
         Ok(n as usize)
     }
 }
@@ -971,12 +981,18 @@ enum SingleStreamDecoder {
 
 impl SingleStreamDecoder {
     fn new(channels: u16, sample_rate: u32, head_bytes: Option<&[u8]>) -> Result<Self, String> {
+        // the decoder actually made, logged once (Media Foundation can load and still fail to make one)
         static CHOICE: std::sync::Once = std::sync::Once::new();
-        CHOICE.call_once(|| crate::xlog_info!("Opus: decoder = {}", backend()));
-        match MftDecoder::new(channels, sample_rate, head_bytes) {
+        let d = match MftDecoder::new(channels, sample_rate, head_bytes) {
             Ok(d) => Ok(Self::Mft(d)),
             Err(mft) => LibDecoder::new(channels, sample_rate).map(Self::Lib).map_err(|lib| format!("{mft}; {lib}")),
-        }
+        };
+        CHOICE.call_once(|| match &d {
+            Ok(Self::Mft(_)) => crate::xlog_info!("Opus: decoder = Windows' MSOpusDecoder (Media Foundation)"),
+            Ok(Self::Lib(l)) => crate::xlog_info!("Opus: decoder = libopus ({})", l.lib.path),
+            Err(e) => crate::xlog_info!("Opus: decoder = none ({e})"),
+        });
+        d
     }
 
     fn output_rate(&self) -> u32 {
@@ -990,7 +1006,7 @@ impl SingleStreamDecoder {
     fn timestamp_100ns(&self) -> i64 {
         match self {
             Self::Mft(d) => d.timestamp_100ns,
-            Self::Lib(_) => 0,
+            Self::Lib(d) => d.timestamp_100ns,
         }
     }
 
