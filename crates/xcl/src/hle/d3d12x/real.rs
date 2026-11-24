@@ -295,6 +295,7 @@ unsafe fn check_uma_import(device: &ID3D12Device, u: &crate::gpu::uma::Uma, bufs
 }
 
 unsafe fn open_uma(device: &ID3D12Device) {
+    crate::gpu::upload::set_device(device);
     let Some(u) = crate::gpu::uma::get() else {
         *UMA_ERROR.lock().unwrap() = "no UMA region".into();
         return;
@@ -353,6 +354,12 @@ unsafe fn open_uma(device: &ID3D12Device) {
     for (k, buf_raw, va) in &sparse {
         if let Some(slot) = bufs.get_mut(*k) {
             *slot = (*buf_raw, *va);
+        }
+    }
+    // the GPU_UPLOAD window: shaders add the 32-bit console offset to this base
+    if let Some((k, _cpu, va, _len)) = u.upload_window() {
+        if let Some(slot) = bufs.get_mut(k) {
+            slot.1 = va;
         }
     }
     let w0_va = bufs.first().map_or(0, |b| b.1);

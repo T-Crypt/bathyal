@@ -38,6 +38,9 @@ enum WindowKind {
     None,
     Committed(usize),
     Sparse,
+    /// a GPU_UPLOAD heap (`gpu::upload`): the CPU writes video memory at the mapping, no
+    /// upload copy. `len` bytes from `off` on in the window (the mapping's offset).
+    Upload { len: usize, off: usize, va: u64 },
 }
 
 pub struct Uma {
@@ -205,6 +208,78 @@ impl Uma {
         Uma::new(size)
     }
 
+    /// Runtime layout with one window backed by a GPU_UPLOAD heap (`upload::window`): the
+    /// window that follows the heap's CPU mapping is the upload one (its addresses ARE the
+    /// driver's mapping), one sparse window is given up, and the coherent window moves off
+    /// the upload index. `up` = (index, mapping address, shader base, bytes).
+    pub fn for_runtime_upload(size: usize, coherent: usize, up: (usize, usize, u64, usize)) -> Option<Uma> {
+        let (w, cpu, va, len) = up;
+        if w == 0 || w >= MAX_WINDOWS {
+            return None;
+        }
+        let c = if w == 3 { 1 } else { 3 };
+        let committed = ((size.min(coherent.max(RUNTIME_COMMITTED_CAP)) + GRAIN - 1) & !(GRAIN - 1)).clamp(GRAIN, MAX_SIZE);
+        let block = cpu & !(WINDOW - 1);
+        let low = cpu - block;
+        let base0 = block.checked_sub(w * WINDOW)?;
+        // base + w * WINDOW must be the mapping's block; slide the other windows down by
+        // 16 GiB steps when their 4 GiB reservations are taken
+        for n in 0..64usize {
+            let Some(base) = base0.checked_sub(n * MAX_WINDOWS * WINDOW) else { return None };
+            if base < (4usize << 32) {
+                return None;
+            }
+            let mut got: Vec<usize> = Vec::new();
+            let mut ok = true;
+            for k in 0..MAX_WINDOWS {
+                if k == w {
+                    continue;
+                }
+                let (want, flags) = if k == c { (committed, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH) } else { (WINDOW, MEM_RESERVE | MEM_WRITE_WATCH) };
+                let p = unsafe { VirtualAlloc((base + k * WINDOW) as *const std::ffi::c_void, want, flags, PAGE_READWRITE) };
+                if p as usize != base + k * WINDOW {
+                    if !p.is_null() {
+                        unsafe { VirtualFree(p, 0, MEM_RELEASE) };
+                    }
+                    ok = false;
+                    break;
+                }
+                got.push(base + k * WINDOW);
+            }
+            if !ok {
+                for p in got {
+                    unsafe { VirtualFree(p as *mut std::ffi::c_void, 0, MEM_RELEASE) };
+                }
+                continue;
+            }
+            let mut inner = Inner::default();
+            inner.free.insert(w * WINDOW + low, len);
+            inner.free.insert(c * WINDOW, committed);
+            let mut kinds = [WindowKind::None; MAX_WINDOWS];
+            let mut sparse_free: (BTreeMap<usize, usize>, BTreeMap<usize, usize>) = Default::default();
+            for k in 0..MAX_WINDOWS {
+                if k == w || k == c {
+                    continue;
+                }
+                kinds[k] = WindowKind::Sparse;
+                sparse_free.0.insert(k * WINDOW, WINDOW);
+            }
+            kinds[w] = WindowKind::Upload { len, off: low, va };
+            kinds[c] = WindowKind::Committed(committed);
+            let u = Uma {
+                base,
+                kinds,
+                win_allocs: got,
+                inner: Mutex::new(inner),
+                sparse_free: Mutex::new(sparse_free),
+                pool: Mutex::new((0, 0, Vec::new())),
+            };
+            u.reserve_pool(POOL);
+            return Some(u);
+        }
+        None
+    }
+
     /// The windows after the committed ones as one write-watched reservation (sparse windows).
     fn reserve_sparse_windows(&mut self) {
         let committed = self.windows();
@@ -248,6 +323,37 @@ impl Uma {
     /// Whether window `k` is a committed coherent window.
     pub fn is_committed_window(&self, k: usize) -> bool {
         self.kinds.get(k).is_some_and(|w| matches!(w, WindowKind::Committed(_)))
+    }
+
+    /// Whether window `k` is the GPU_UPLOAD heap (`gpu::upload`).
+    pub fn is_upload_window(&self, k: usize) -> bool {
+        self.kinds.get(k).is_some_and(|w| matches!(w, WindowKind::Upload { .. }))
+    }
+
+    /// Whether `p` is in the upload window.
+    pub fn is_upload(&self, p: usize) -> bool {
+        self.window_of(p).is_some_and(|k| self.is_upload_window(k))
+    }
+
+    /// The upload window: (index, mapping address, shader base, bytes).
+    pub fn upload_window(&self) -> Option<(usize, usize, u64, usize)> {
+        (0..MAX_WINDOWS).find_map(|k| match self.kinds[k] {
+            WindowKind::Upload { len, off, va } => Some((k, self.base + k * WINDOW + off, va, len)),
+            _ => None,
+        })
+    }
+
+    /// A block of the upload window (zeroed; the caller must have checked `upload_window`).
+    pub fn alloc_upload(&self, size: usize, align: usize) -> Option<*mut u8> {
+        let k = (0..MAX_WINDOWS).find(|&k| self.is_upload_window(k))?;
+        self.alloc_where(size, align, Some(k), true)
+    }
+
+    /// Bytes of the upload window handed out.
+    pub fn upload_used(&self) -> usize {
+        let Some(k) = (0..MAX_WINDOWS).find(|&k| self.is_upload_window(k)) else { return 0 };
+        let g = self.inner.lock().unwrap();
+        g.used.iter().filter(|(&o, _)| o / WINDOW == k).map(|(_, &l)| l).sum()
     }
 
     /// Whether this Uma has any sparse VRAM windows.
@@ -438,6 +544,7 @@ impl Uma {
         let len = match self.kinds.get(k).copied().unwrap_or(WindowKind::None) {
             WindowKind::Committed(s) => s,
             WindowKind::Sparse => WINDOW,
+            WindowKind::Upload { len, off, .. } => off + len,
             WindowKind::None => 0,
         };
         (self.base + k * WINDOW, len)
@@ -456,6 +563,7 @@ impl Uma {
                     out.push((self.base + k * WINDOW, s));
                     k += 1;
                 }
+                WindowKind::Upload { .. } => k += 1,
                 WindowKind::Sparse => {
                     let start = self.base + k * WINDOW;
                     let mut len = 0usize;
@@ -489,7 +597,7 @@ impl Uma {
         if self.is_sparse(p) {
             return self.sparse_reservation(p).is_some();
         }
-        if !self.is_committed(p) {
+        if !self.is_committed(p) && !self.is_upload(p) {
             return false;
         }
         let off = p - self.base;
@@ -573,7 +681,7 @@ impl Uma {
 
     /// Release a block from `alloc` (false: not one of ours).
     pub fn free(&self, p: usize) -> bool {
-        if !self.is_committed(p) {
+        if !self.is_committed(p) && !self.is_upload(p) {
             return false;
         }
         {
@@ -736,12 +844,23 @@ pub fn get() -> Option<&'static Uma> {
         .get_or_init(|| {
             let mb = std::env::var("XCL_UMA_MB").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(2048);
             let coherent = coherent_hint();
-            let u = Uma::for_runtime_with((mb << 20).max(coherent), coherent);
+            // a GPU_UPLOAD window: its heap is made first, so the window layout follows its
+            // CPU mapping (the title's allocation address) – only when the device already exists
+            let up = crate::gpu::upload::ensure_window().and_then(|_| crate::gpu::upload::window());
+            let u = match up {
+                Some(spec) => Uma::for_runtime_upload((mb << 20).max(coherent), coherent, spec)
+                    .or_else(|| {
+                        crate::xlog_warn!("UMA: GPU_UPLOAD window could not be laid out; the usual four windows");
+                        Uma::for_runtime_with((mb << 20).max(coherent), coherent)
+                    }),
+                None => Uma::for_runtime_with((mb << 20).max(coherent), coherent),
+            };
             match &u {
                 Some(u) => {
                     let sparse_n = (0..MAX_WINDOWS).filter(|&k| u.is_sparse_window(k)).count();
+                    let up = u.upload_window().map_or(String::new(), |(k, cpu, va, len)| format!(", window {k} a GPU_UPLOAD heap ({:#x} CPU, {:#x} GPU, {} MB)", cpu, va, len >> 20));
                     crate::xlog_info!(
-                        "UMA: {} sparse VRAM window(s) ({} GiB VA) + {} MB coherent window at {:#x}",
+                        "UMA: {} sparse VRAM window(s) ({} GiB VA) + {} MB coherent window at {:#x}{up}",
                         sparse_n,
                         sparse_n * 4,
                         u.size() >> 20,

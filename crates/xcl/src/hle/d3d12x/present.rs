@@ -70,6 +70,16 @@ unsafe fn present_x_frame(queue: *mut c_void, plane_count: u32, planes: *const u
         if let Some(t) = LAST.lock().unwrap().replace(now) {
             crate::xlog_info!("D3D12.X: {frames} frames presented, {:.1} fps over the last 300", 300.0 / (now - t).as_secs_f64());
         }
+        if let Some(u) = crate::gpu::uma::get() {
+            if let Some((_k, _cpu, _va, len)) = u.upload_window() {
+                crate::xlog_info!(
+                    "D3D12.X: GPU_UPLOAD window: {} used, write-watch {:.2} ms per submit",
+                    crate::gpu::upload::window_used(u.upload_used()),
+                    super::sparse::watch_ms_per_submit()
+                );
+                let _ = len;
+            }
+        }
     }
     super::real::stop_if_device_removed();
     if !PRESENTX.swap(true, Ordering::Relaxed) {

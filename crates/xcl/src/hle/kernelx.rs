@@ -264,6 +264,11 @@ pub unsafe extern "system" fn VirtualAlloc(addr: *const c_void, size: usize, t: 
             crate::gpu::uma::GRAIN
         };
         let rounded = size.max(1).div_ceil(align) * align;
+        if let Some(q) = crate::hle::d3d12x::sparse::alloc_upload(rounded, align) {
+            crate::memstat::note(crate::memstat::GRAPHICS, rounded);
+            trace_mem("VirtualAlloc (graphics, GPU_UPLOAD window)", 0, rounded, t as u64, p, q);
+            return q as *mut c_void;
+        }
         if let Some((q, _)) = crate::hle::d3d12x::sparse::alloc(rounded, align) {
             trace_mem("VirtualAlloc (graphics, sparse VRAM)", 0, rounded, t as u64, p, q);
             return q as *mut c_void;
@@ -392,6 +397,14 @@ fn keep_last_error<R>(f: impl FnOnce() -> R) -> R {
 pub unsafe extern "system" fn VirtualFree(addr: *mut c_void, size: usize, t: u32) -> BOOL {
     if let Some(ok) = placeholders::free(addr, size, t) {
         return ok;
+    }
+    // a block of the GPU_UPLOAD window: the heap's own memory goes back to it
+    if let Some(u) = crate::gpu::uma::get().filter(|u| u.is_upload(addr as usize)) {
+        if t & mem::MEM_RELEASE == 0 || size != 0 || !u.free(addr as usize) {
+            fnd::SetLastError(fnd::ERROR_INVALID_PARAMETER);
+            return 0;
+        }
+        return 1;
     }
     // the title's reservations in a sparse window: decommit (and on release give the address
     // space back); their video memory goes with it
@@ -542,7 +555,13 @@ pub unsafe extern "system" fn XMemAllocDefault(size: usize, attrs: u64) -> *mut 
         fnd::SetLastError(fnd::ERROR_NOT_ENOUGH_MEMORY);
         return std::ptr::null_mut();
     };
-    // Graphics memory types live in the sparse VRAM pool (fallback to coherent UMA, then Windows).
+    // Graphics memory types: the GPU_UPLOAD window first (the CPU writes video memory there
+    // directly: no write-watch page, no upload), then the sparse VRAM pool.
+    if let Some(q) = crate::hle::d3d12x::sparse::alloc_upload(rounded, align) {
+        crate::memstat::note(crate::memstat::GRAPHICS, rounded);
+        trace_mem("XMemAlloc (graphics, GPU_UPLOAD window)", 0, rounded, attrs, 0, q);
+        return q as *mut c_void;
+    }
     if let Some((q, _)) = crate::hle::d3d12x::sparse::alloc(rounded, align) {
         trace_mem("XMemAlloc (graphics, sparse VRAM)", 0, rounded, attrs, 0, q);
         return q as *mut c_void;

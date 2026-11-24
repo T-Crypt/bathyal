@@ -1193,6 +1193,26 @@ pub unsafe fn flush_written(va: usize, len: usize) {
     }
 }
 
+/// Largest single XMem/VirtualAlloc graphics allocation that goes to the GPU_UPLOAD window
+/// (`XCL_GPU_UPLOAD_WINDOW_MAX_KB`, default 8192 KiB): larger ones stay in the sparse windows'
+/// uploaded video memory.
+fn upload_max() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    (*N.get_or_init(|| std::env::var("XCL_GPU_UPLOAD_WINDOW_MAX_KB").ok().and_then(|v| v.trim().parse::<usize>().ok()).unwrap_or(8192)) << 10).max(PAGE)
+}
+
+/// A zeroed block of the GPU_UPLOAD window, at the address the title gets (the heap's CPU
+/// mapping plus an offset): what the CPU writes is video memory already – no write-watch page,
+/// no upload before the submit. None when the window is off, full, or the block is too big.
+pub unsafe fn alloc_upload(size: usize, align: usize) -> Option<usize> {
+    let u = crate::gpu::uma::get()?;
+    let (_k, _cpu, _va, len) = u.upload_window()?;
+    if size == 0 || size > upload_max() || size > len {
+        return None;
+    }
+    u.alloc_upload(size, align).map(|p| p as usize)
+}
+
 /// Allocate a zeroed, write-watched block in the sparse VRAM windows (never straddling a
 /// 4 GiB window boundary when `size <= 4 GiB`). Commits the CPU pages and maps VRAM tiles
 /// (or queues them until the D3D12 device exists). Returns `(address, rounded_size)`.

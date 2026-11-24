@@ -427,3 +427,204 @@ mod gpu_tests {
         }
     }
 }
+
+// ---------------------------------------------------------------------------------------
+// The upload window: one of the four console memory windows backed by a GPU_UPLOAD heap
+// ---------------------------------------------------------------------------------------
+
+/// `XCL_GPU_UPLOAD_WINDOW=1`: make one 4 GiB console window a GPU_UPLOAD heap (off by default).
+pub fn window_mode() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XCL_GPU_UPLOAD_WINDOW").is_ok_and(|v| v != "0" && !v.is_empty()))
+}
+
+fn window_want() -> usize {
+    let mb = std::env::var("XCL_GPU_UPLOAD_WINDOW_MB").ok().and_then(|v| v.trim().parse::<usize>().ok()).unwrap_or(1024);
+    (mb.clamp(64, 3072)) << 20
+}
+
+/// The device the title made (set at device creation, before `open_uma`); the input heap is
+/// built from it so that the window layout can follow the heap's CPU mapping.
+static DEVICE: Mutex<Option<ID3D12Device>> = Mutex::new(None);
+
+pub fn set_device(dev: &ID3D12Device) {
+    *DEVICE.lock().unwrap() = Some(dev.clone());
+}
+
+/// The device, while it is alive (None before the title creates it).
+pub fn device() -> Option<ID3D12Device> {
+    DEVICE.lock().unwrap().clone()
+}
+
+/// A GPU_UPLOAD heap that is one console window: the CPU mapping `cpu`, the GPU address `gpu`
+/// of the buffer over it, and the window index its mapping lands in.
+pub struct Window {
+    _heap: ID3D12Heap,
+    _buffer: ID3D12Resource,
+    pub index: usize,
+    /// the driver's CPU mapping (the title's allocation address in the window)
+    pub cpu: usize,
+    /// the resource's GPU address; the window's shader base is `gpu - low32(cpu)`
+    pub gpu: u64,
+    /// bytes from `cpu` on (a claim on the window's address space)
+    pub len: usize,
+}
+
+unsafe impl Send for Window {}
+
+static WINDOW: Mutex<Option<Window>> = Mutex::new(None);
+
+/// The window's shader base (what `uma_window_vas` holds for it and what shaders add the
+/// 32-bit offset to): the heap's GPU address minus the mapping's offset in its 4 GiB block.
+pub fn window_shader_va(w: &Window) -> u64 {
+    w.gpu - (w.cpu as u64 & 0xFFFF_FFFF)
+}
+
+/// `window_mode`: make the heap (once) and return it. Shrunk so that the mapping's offset in
+/// its 4 GiB block plus the heap stays inside one 32-bit offset (`low32(cpu) + len <= 4 GiB`).
+pub fn ensure_window() -> Option<usize> {
+    if !window_mode() {
+        return None;
+    }
+    {
+        let g = WINDOW.lock().unwrap();
+        if let Some(w) = g.as_ref() {
+            return Some(w.index);
+        }
+    }
+    let Some(dev) = device() else {
+        static ONCE: OnceLock<()> = OnceLock::new();
+        ONCE.get_or_init(|| {
+            crate::xlog_warn!("GPU_UPLOAD window: off – the title allocated memory before its D3D12 device existed (the windows are already laid out)")
+        });
+        return None;
+    };
+    let mut len = window_want();
+    let h = create(&dev, len)?;
+    let index = (h.cpu >> 32) & 3;
+    let low = h.cpu & 0xFFFF_FFFF;
+    if index == 0 {
+        crate::xlog_warn!("GPU_UPLOAD window: off – the heap maps into window 0 ({:#x}), which holds 32-bit descriptor tables", h.cpu);
+        return None;
+    }
+    if low + len > (1usize << 32) {
+        len = ((1usize << 32) - low) / GRAIN * GRAIN;
+        if len < (64 << 20) {
+            crate::xlog_warn!("GPU_UPLOAD window: off – the heap maps at +{low:#x} in its window, leaving only {len} bytes of 32-bit offsets", h.cpu);
+            return None;
+        }
+        crate::xlog_info!("GPU_UPLOAD window: {} MB (the mapping at +{low:#x} leaves {len} bytes before the 32-bit offset wraps)", len >> 20);
+    }
+    let w = Window { _heap: h._heap, _buffer: h._buffer, index, cpu: h.cpu, gpu: h.gpu, len };
+    crate::xlog_info!(
+        "GPU_UPLOAD window {} at CPU {:#x} (GPU VA {:#x}, shader base {:#x}), {} MB",
+        w.index,
+        w.cpu,
+        w.gpu,
+        window_shader_va(&w),
+        w.len >> 20
+    );
+    let i = w.index;
+    *WINDOW.lock().unwrap() = Some(w);
+    // the heap's CPU mapping is the window's memory: do not count it in the small arena
+    Some(i)
+}
+
+/// The window, once made.
+pub fn window() -> Option<(usize, usize, u64, usize)> {
+    let g = WINDOW.lock().unwrap();
+    g.as_ref().map(|w| (w.index, w.cpu, window_shader_va(w), w.len))
+}
+
+/// Bytes of the window in use, of its size (for the frame log).
+pub fn window_used(used: usize) -> String {
+    let g = WINDOW.lock().unwrap();
+    match g.as_ref() {
+        Some(w) => format!("{} MB of {} MB", used >> 20, w.len >> 20),
+        None => "-".into(),
+    }
+}
+
+#[cfg(test)]
+mod window_tests {
+    use super::*;
+    use windows::core::Interface;
+    use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
+
+    /// The upload window end to end: the CPU writes at the window's address (the driver's CPU
+    /// mapping), and a compute shader reads those words through the window's shader base
+    /// (`H - low32(M)`) plus the 32-bit console offset – no upload copy in between.
+    #[test]
+    fn gpu_upload_window_cpu_writes_reach_a_compute_shader() {
+        if std::env::var_os("XCL_GPU_UPLOAD_WINDOW").is_some_and(|v| v == "0") {
+            println!("XCL_GPU_UPLOAD_WINDOW=0 – skipping");
+            return;
+        }
+        unsafe {
+            std::env::set_var("XCL_GPU_UPLOAD_WINDOW", "1");
+            let mut dev: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut dev).is_err() {
+                println!("no D3D12 device – skipping");
+                return;
+            }
+            let dev = dev.expect("device");
+            set_device(&dev);
+            let Some(_k) = ensure_window() else {
+                println!("no GPU_UPLOAD window here – skipping");
+                return;
+            };
+            let (index, cpu, base, len) = window().expect("window");
+            let low = cpu & 0xFFFF_FFFF;
+            println!("upload window {index}: CPU {cpu:#x}, shader base {base:#x}, {len} bytes, low {low:#x}");
+            let p = cpu as *mut u8;
+            std::ptr::write_volatile(p.add(4) as *mut u32, 20);
+            std::ptr::write_volatile(p.add(8) as *mut u32, 22);
+            std::ptr::write_volatile(p as *mut u32, 0);
+            let hlsl = format!(
+                "RWByteAddressBuffer b : register(u0);\n[numthreads(1,1,1)] void main() {{ b.Store({low}, b.Load({a}) + b.Load({b})); }}\n",
+                a = low + 4,
+                b = low + 8
+            );
+            let dxil = match crate::gpu::recomp::dxc::compile(&hlsl, "main", "cs_6_6", &[]) {
+                Ok(d) => d,
+                Err(e) => {
+                    println!("no DXC ({e}) – skipping");
+                    return;
+                }
+            };
+            let param = D3D12_ROOT_PARAMETER {
+                ParameterType: D3D12_ROOT_PARAMETER_TYPE_UAV,
+                Anonymous: D3D12_ROOT_PARAMETER_0 { Descriptor: D3D12_ROOT_DESCRIPTOR { ShaderRegister: 0, RegisterSpace: 0 } },
+                ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+            };
+            let desc = D3D12_ROOT_SIGNATURE_DESC { NumParameters: 1, pParameters: &param, ..Default::default() };
+            let mut blob = None;
+            D3D12SerializeRootSignature(&desc, D3D_ROOT_SIGNATURE_VERSION_1, &mut blob, None).expect("serialize RS");
+            let blob = blob.expect("RS blob");
+            let rs: ID3D12RootSignature = dev.CreateRootSignature(0, std::slice::from_raw_parts(blob.GetBufferPointer() as *const u8, blob.GetBufferSize())).expect("root signature");
+            let pso: ID3D12PipelineState = dev
+                .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                    pRootSignature: std::mem::ManuallyDrop::new(Some(rs.clone())),
+                    CS: D3D12_SHADER_BYTECODE { pShaderBytecode: dxil.as_ptr() as *const _, BytecodeLength: dxil.len() },
+                    ..Default::default()
+                })
+                .expect("compute PSO");
+            let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).expect("queue");
+            let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).expect("allocator");
+            let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, Some(&pso)).expect("list");
+            list.SetComputeRootSignature(&rs);
+            list.SetComputeRootUnorderedAccessView(0, base);
+            list.Dispatch(1, 1, 1);
+            list.Close().expect("close");
+            let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).expect("fence");
+            queue.ExecuteCommandLists(&[Some(list.cast::<ID3D12CommandList>().unwrap())]);
+            queue.Signal(&fence, 1).expect("signal");
+            let ev = windows::Win32::System::Threading::CreateEventW(None, false, false, None).expect("event");
+            fence.SetEventOnCompletion(1, ev).expect("fence event");
+            windows::Win32::System::Threading::WaitForSingleObject(ev, 10_000);
+            let _ = windows::Win32::Foundation::CloseHandle(ev);
+            let got = std::ptr::read_volatile(cpu as *const u32);
+            assert_eq!(got, 42, "the shader's sum of the CPU's two words in the GPU_UPLOAD window");
+        }
+    }
+}
