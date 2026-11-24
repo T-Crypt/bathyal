@@ -9,7 +9,7 @@ fn precompile_accepts_a_single_file() {
     blob[24..28].copy_from_slice(&32u32.to_le_bytes());
     let file = std::env::temp_dir().join(format!("xcl-single-shader-{}.dxbc", std::process::id()));
     std::fs::write(&file, blob).unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_xcl"))
+    let output = Command::new(env!("CARGO_BIN_EXE_bathyal"))
         .arg("shaders")
         .arg(&file)
         .args(["--precompile", "--split", "0"])
