@@ -74,7 +74,7 @@ fn queue() -> &'static Mutex<mpsc::Sender<Arc<Pending>>> {
         let (tx, rx) = mpsc::channel::<Arc<Pending>>();
         let rx = Arc::new(Mutex::new(rx));
         // translation recurses deeply on big programs; DXC itself runs on its own pool
-        let n = crate::gpu::recomp::dxc::compile_threads();
+        let n = pipeline_threads();
         for k in 0..n {
             let rx = rx.clone();
             let _ = std::thread::Builder::new().name(format!("xcl-pso-{k}")).stack_size(64 << 20).spawn(move || loop {
@@ -310,14 +310,57 @@ pub fn is_pending(pso: usize) -> bool {
     entry(pso).is_some_and(|p| !*p.done.lock().unwrap())
 }
 
+/// How many `xcl-pso-N` workers build pipelines. A worker's cost is mostly the driver's
+/// compile (`Create*PipelineState`), so this is how many driver compiles run at once.
+///
+/// On NVIDIA the driver compiler keeps one heap lock and its time grows faster than the
+/// program (#156): four creator threads did the work of 3.84, and eight on four cores
+/// finished the same queue no sooner than four, with each program taking longer. Retail
+/// frames also wait in `resolve_for_draw` behind whichever compile holds the lock. So NVIDIA
+/// gets a small fixed count and everything else keeps a worker per core minus one, as
+/// before. `XCL_PSO_THREADS` overrides both.
+fn pipeline_threads() -> usize {
+    static N: OnceLock<usize> = OnceLock::new();
+    *N.get_or_init(|| {
+        let over = std::env::var("XCL_PSO_THREADS").ok().and_then(|v| v.trim().parse::<usize>().ok());
+        let n = workers_for(super::real::adapter_vendor() == 0x10DE, over, crate::gpu::recomp::dxc::compile_threads());
+        crate::xlog_info!("D3D12.X: {n} pipeline build worker(s) (XCL_PSO_THREADS sets the count)");
+        n
+    })
+}
+
+/// [`pipeline_threads`] from the adapter and the environment, so its test needs no GPU.
+fn workers_for(nvidia: bool, over: Option<usize>, dxc: usize) -> usize {
+    match over {
+        Some(n) => n.clamp(1, 64),
+        None if nvidia => NVIDIA_WORKERS,
+        None => dxc,
+    }
+}
+
+/// Measured best on an RTX 4090 with the synthetic large programs of
+/// `nv_parallel_driver_compile` (the 5070 Ti and 3080 numbers in #156 agree in direction):
+/// two creators finish a queue of big programs about twice as fast as one, and four finish
+/// it no sooner while each program takes longer.
+const NVIDIA_WORKERS: usize = 2;
+
 /// How many uncached driver compiles may run at once. Each one fans out across the GPU
 /// driver's own compiler, so a few of them already fill the machine; more of them fight
-/// over the same cores and the load takes longer. `XCL_PSO_COMPILES` overrides it.
+/// over the same cores and the load takes longer. `XCL_PSO_COMPILES` overrides it; else it
+/// is the pool size on NVIDIA, and the pool capped as before elsewhere.
 fn driver_compile_limit() -> usize {
     static N: OnceLock<usize> = OnceLock::new();
     *N.get_or_init(|| {
+        if let Some(n) = std::env::var("XCL_PSO_COMPILES").ok().and_then(|v| v.trim().parse::<usize>().ok()) {
+            return n.clamp(1, 64);
+        }
         let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
-        std::env::var("XCL_PSO_COMPILES").ok().and_then(|v| v.parse().ok()).unwrap_or((cores / 4).clamp(2, 4))
+        let pool = pipeline_threads();
+        if super::real::adapter_vendor() == 0x10DE {
+            pool
+        } else {
+            (cores / 4).clamp(2, 4).min(pool)
+        }
     })
 }
 
@@ -482,5 +525,19 @@ mod tests {
         assert_eq!(resolve_wait(standin), standin);
         assert!(!p.is_active());
         assert_eq!(released(standin), 0);
+    }
+
+    /// The pool: NVIDIA gets the measured best count, everything else keeps a worker per core
+    /// minus one, and `XCL_PSO_THREADS` wins over both (clamped to 1..=64).
+    #[test]
+    fn the_pipeline_pool_size_follows_the_adapter_and_xcl_pso_threads() {
+        assert_eq!(workers_for(true, None, 15), NVIDIA_WORKERS);
+        assert_eq!(workers_for(true, Some(1), 15), 1);
+        assert_eq!(workers_for(true, Some(8), 15), 8);
+        assert_eq!(workers_for(false, None, 15), 15);
+        assert_eq!(workers_for(false, Some(3), 15), 3);
+        assert_eq!(workers_for(false, Some(0), 15), 1, "a pool needs a worker");
+        assert_eq!(workers_for(false, Some(1000), 15), 64);
+        assert!(NVIDIA_WORKERS >= 1 && NVIDIA_WORKERS <= 2, "measured best on NVIDIA is 1-2");
     }
 }
