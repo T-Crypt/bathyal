@@ -6482,7 +6482,7 @@ mod pso_memo_tests {
         static V: OnceLock<usize> = OnceLock::new();
         *V.get_or_init(|| {
             let v: [usize; 3] = [fake_qi as usize, fake_addref as usize, fake_release as usize];
-            Box::leak(v.into_boxed_slice()).as_ptr() as usize
+            Box::leak(Box::new(v)).as_ptr() as usize
         }) as *const usize
     }
 

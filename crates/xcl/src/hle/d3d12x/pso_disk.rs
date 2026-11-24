@@ -719,7 +719,7 @@ mod tests {
     }
 
     fn rs(v: usize) -> std::mem::ManuallyDrop<Option<ID3D12RootSignature>> {
-        std::mem::transmute::<usize, std::mem::ManuallyDrop<Option<ID3D12RootSignature>>>(v)
+        unsafe { std::mem::transmute::<usize, std::mem::ManuallyDrop<Option<ID3D12RootSignature>>>(v) }
     }
 
     fn console_graphics(vs: &[u8], elements: &[D3D12_INPUT_ELEMENT_DESC], root: usize) -> D3D12_GRAPHICS_PIPELINE_STATE_DESC {
