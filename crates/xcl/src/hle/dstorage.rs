@@ -1243,8 +1243,9 @@ enum Entry {
         /// the pending-work report forgets this entry when the ticket drops
         ticket: Ticket,
     },
-    /// refused at enqueue: reported in queue order by the worker
+    /// refused at enqueue: reported in queue order by the worker (unless cancelled, as a request)
     Refused {
+        seq: u64,
         hr: HRESULT,
         req: Request,
         file: Option<Arc<FileInner>>,
@@ -1441,7 +1442,11 @@ impl QueueInner {
                         self.note_failure(E_ACCESS_VIOLATION);
                     }
                 }
-                Entry::Refused { hr, req, file, fill } => {
+                Entry::Refused { seq, hr, req, file, fill } => {
+                    // a cancelled request is no failure, refused or not
+                    if self.is_cancelled(seq, req.tag) {
+                        continue;
+                    }
                     if let Some(t) = &fill {
                         // the destination gets solid blocks; the request still fails
                         unsafe { bcpack_fill(&req, t) };
@@ -1496,6 +1501,35 @@ impl QueueInner {
     }
 
     fn enqueue_request(self: &Arc<Self>, req: Request, file: Option<Arc<FileInner>>, dest_pages: Option<Vec<usize>>, src_pages: Option<Vec<usize>>) {
+        self.enqueue_numbered(|seq| {
+            let ticket = self.request_ticket(&req);
+            Entry::Request { seq, req, file, dest_pages, src_pages, ticket }
+        });
+    }
+
+    /// A request refused at enqueue, numbered as a request so `CancelRequestsWithTag` covers it.
+    fn enqueue_refused(self: &Arc<Self>, hr: HRESULT, req: Request, file: Option<Arc<FileInner>>, fill: Option<FillTarget>) {
+        self.enqueue_numbered(|seq| Entry::Refused { seq, hr, req, file, fill });
+    }
+
+    /// The pending-work ticket of a request (the report forgets it when the ticket drops).
+    fn request_ticket(&self, req: &Request) -> Ticket {
+        if pending::enabled() {
+            pending::begin(
+                pending::Kind::DStorageRequest,
+                Meta {
+                    size: req.destination_size as u64,
+                    index: self.id,
+                    mode: req.bcpack() as u32,
+                    extra: if req.memory_source() { 1 } else { 0 },
+                },
+            )
+        } else {
+            Ticket::NONE
+        }
+    }
+
+    fn enqueue_numbered(self: &Arc<Self>, entry: impl FnOnce(u64) -> Entry) {
         let n = {
             let mut p = self.pending.lock().unwrap();
             if self.closed.load(Ordering::Acquire) {
@@ -1503,20 +1537,7 @@ impl QueueInner {
             }
             let seq = p.next_seq;
             p.next_seq += 1;
-            let ticket = if pending::enabled() {
-                pending::begin(
-                    pending::Kind::DStorageRequest,
-                    Meta {
-                        size: req.destination_size as u64,
-                        index: self.id,
-                        mode: req.bcpack() as u32,
-                        extra: if req.memory_source() { 1 } else { 0 },
-                    },
-                )
-            } else {
-                Ticket::NONE
-            };
-            p.entries.push(Entry::Request { seq, req, file, dest_pages, src_pages, ticket });
+            p.entries.push(entry(seq));
             p.entries.len()
         };
         if n >= (self.capacity / 2).max(1) {
@@ -1525,32 +1546,10 @@ impl QueueInner {
     }
 
     fn enqueue_placeholder(self: &Arc<Self>, req: Request, dest_pages: Option<Vec<usize>>) {
-        let n = {
-            let mut p = self.pending.lock().unwrap();
-            if self.closed.load(Ordering::Acquire) {
-                return;
-            }
-            let seq = p.next_seq;
-            p.next_seq += 1;
-            let ticket = if pending::enabled() {
-                pending::begin(
-                    pending::Kind::DStorageRequest,
-                    Meta {
-                        size: req.destination_size as u64,
-                        index: self.id,
-                        mode: req.bcpack() as u32,
-                        extra: if req.memory_source() { 1 } else { 0 },
-                    },
-                )
-            } else {
-                Ticket::NONE
-            };
-            p.entries.push(Entry::Placeholder { seq, req, dest_pages, ticket });
-            p.entries.len()
-        };
-        if n >= (self.capacity / 2).max(1) {
-            self.submit();
-        }
+        self.enqueue_numbered(|seq| {
+            let ticket = self.request_ticket(&req);
+            Entry::Placeholder { seq, req, dest_pages, ticket }
+        });
     }
 }
 
@@ -1679,7 +1678,7 @@ unsafe extern "system" fn queue_enqueue_request(p: *mut c_void, req: *const u8) 
             let dest_pages = if r.dest_physical_pages() {
                 match snapshot_page_array(r.destination, r.destination_page_offset, r.destination_size) {
                     Ok(pages) => Some(pages),
-                    Err(hr) => return q.enqueue(Entry::Refused { hr, req: r, file: None, fill: None }),
+                    Err(hr) => return q.enqueue_refused(hr, r, None, None),
                 }
             } else {
                 None
@@ -1698,7 +1697,7 @@ unsafe extern "system" fn queue_enqueue_request(p: *mut c_void, req: *const u8) 
                 };
             }
         }
-        return q.enqueue(Entry::Refused { hr, req: r, file: None, fill });
+        return q.enqueue_refused(hr, r, None, fill);
     }
     let file = if r.memory_source() {
         None
@@ -1707,7 +1706,7 @@ unsafe extern "system" fn queue_enqueue_request(p: *mut c_void, req: *const u8) 
         let f = r.source as *mut c_void;
         let mut vt = 0usize;
         if !read_own(f as usize, &mut vt as *mut usize as *mut u8, 8) || vt != file_vtbl().as_ptr() as usize {
-            return q.enqueue(Entry::Refused { hr: E_FILE_HANDLE, req: r, file: None, fill: None });
+            return q.enqueue_refused(E_FILE_HANDLE, r, None, None);
         }
         Some(Arc::clone(inner::<FileInner>(f)))
     };
@@ -1715,7 +1714,7 @@ unsafe extern "system" fn queue_enqueue_request(p: *mut c_void, req: *const u8) 
         match snapshot_page_array(r.destination, r.destination_page_offset, r.destination_size) {
             Ok(pages) => Some(pages),
             Err(hr) => {
-                return q.enqueue(Entry::Refused { hr, req: r, file, fill: None });
+                return q.enqueue_refused(hr, r, file, None);
             }
         }
     } else {
@@ -1725,7 +1724,7 @@ unsafe extern "system" fn queue_enqueue_request(p: *mut c_void, req: *const u8) 
         match snapshot_page_array(r.source, r.source_page_offset, r.source_size) {
             Ok(pages) => Some(pages),
             Err(hr) => {
-                return q.enqueue(Entry::Refused { hr, req: r, file, fill: None });
+                return q.enqueue_refused(hr, r, file, None);
             }
         }
     } else {
@@ -1784,7 +1783,7 @@ unsafe extern "system" fn queue_cancel(p: *mut c_void, mask: u64, value: u64) {
     let q = queue(p);
     let cutoff = {
         let mut pend = q.pending.lock().unwrap();
-        pend.entries.retain(|e| !matches!(e, Entry::Request { req, .. } | Entry::Placeholder { req, .. } if req.tag & mask == value));
+        pend.entries.retain(|e| !matches!(e, Entry::Request { req, .. } | Entry::Placeholder { req, .. } | Entry::Refused { req, .. } if req.tag & mask == value));
         pend.next_seq.saturating_sub(1)
     };
     if cutoff == 0 {
@@ -2186,6 +2185,73 @@ mod tests {
             assert_eq!(fence.refs.load(Ordering::Acquire), 1, "queue_close releases pending fence");
             assert_eq!(hresult(s, 2), E_QUEUE_CLOSED);
 
+            queue_release(q);
+            status_release(s);
+        }
+    }
+
+    /// A request refused at enqueue (here a file source on a memory queue) and
+    /// then cancelled by tag – submitted or still pending – is no failure: "a cancelled request
+    /// is not counted as a failure in either IDStorageStatusArray or DSTORAGE_ERROR_RECORD".
+    /// One with a tag the cancel does not match, or enqueued after it, still fails.
+    #[test]
+    fn a_refused_request_that_is_cancelled_is_no_failure() {
+        unsafe {
+            let mut f = std::ptr::null_mut();
+            assert_eq!(DStorageGetFactory(&IID_FACTORY, &mut f), S_OK);
+            let vt = *(f as *const *const usize);
+            let create_queue: unsafe extern "system" fn(*mut c_void, *const u8, *const GUID, *mut *mut c_void) -> HRESULT = std::mem::transmute(*vt.add(3));
+            let create_status: unsafe extern "system" fn(*mut c_void, u32, *const u8, *const GUID, *mut *mut c_void) -> HRESULT = std::mem::transmute(*vt.add(5));
+            let mut desc = [0u8; 0x18];
+            desc[0..4].copy_from_slice(&1u32.to_le_bytes()); // memory queue
+            desc[8..10].copy_from_slice(&32u16.to_le_bytes());
+            desc[10] = 2;
+            let mut q = std::ptr::null_mut();
+            assert_eq!(create_queue(f, desc.as_ptr(), &IID_QUEUE, &mut q), S_OK);
+            let mut s = std::ptr::null_mut();
+            assert_eq!(create_status(f, 3, std::ptr::null(), &IID_STATUS_ARRAY, &mut s), S_OK);
+            let qv = *(q as *const *const usize);
+            let enqueue: unsafe extern "system" fn(*mut c_void, *const u8) = std::mem::transmute(*qv.add(3));
+            let status: unsafe extern "system" fn(*mut c_void, *mut c_void, u32) = std::mem::transmute(*qv.add(4));
+            let submit: unsafe extern "system" fn(*mut c_void) = std::mem::transmute(*qv.add(6));
+            let cancel: unsafe extern "system" fn(*mut c_void, u64, u64) = std::mem::transmute(*qv.add(7));
+            let record: unsafe extern "system" fn(*mut c_void, *mut u8) = std::mem::transmute(*qv.add(10));
+            let sv = *(s as *const *const usize);
+            let complete: unsafe extern "system" fn(*mut c_void, u32) -> bool = std::mem::transmute(*sv.add(3));
+            let hresult: unsafe extern "system" fn(*mut c_void, u32) -> HRESULT = std::mem::transmute(*sv.add(4));
+
+            // a file source on this memory queue: refused at enqueue with E_SOURCE_TYPE
+            let not_a_file = [0usize; 2];
+            let mut dst = [0u8; 4];
+            let dst_ptr = dst.as_mut_ptr() as u64;
+            let refused = |tag: u64| request_ex(0, dst_ptr, 0, 4, not_a_file.as_ptr() as u64, 0, 4, 0, tag);
+
+            let gate = Arc::new(std::sync::Barrier::new(2));
+            queue(q).enqueue(Entry::Gate(Arc::clone(&gate)));
+            enqueue(q, refused(0x1001).as_ptr()); // submitted, cancelled below
+            status(q, s, 0);
+            submit(q);
+            enqueue(q, refused(0x1002).as_ptr()); // pending, cancelled below
+            enqueue(q, refused(0x2001).as_ptr()); // pending, another tag: still fails
+            status(q, s, 1);
+            cancel(q, 0xF000, 0x1000);
+            enqueue(q, refused(0x1003).as_ptr()); // after the cancel: still fails
+            status(q, s, 2);
+            submit(q);
+            gate.wait();
+            let t = std::time::Instant::now();
+            while !complete(s, 2) && t.elapsed().as_secs() < 5 {
+                std::thread::yield_now();
+            }
+            assert!(complete(s, 0) && complete(s, 1) && complete(s, 2));
+            assert_eq!(hresult(s, 0), S_OK, "the cancelled submitted request is no failure");
+            assert_eq!(hresult(s, 1), E_SOURCE_TYPE, "the cancelled pending one is none; the other tag is one");
+            assert_eq!(hresult(s, 2), E_SOURCE_TYPE, "enqueued after the cancel");
+            let mut rec = [0u8; ERROR_RECORD_BYTES];
+            record(q, rec.as_mut_ptr());
+            assert_eq!(u32::from_le_bytes(rec[0..4].try_into().unwrap()), 2, "two failures: tag 0x2001 and the one after the cancel");
+
+            queue_close(q);
             queue_release(q);
             status_release(s);
         }
