@@ -9450,3 +9450,47 @@ fn gpu_ps_reductions_in_branches_and_loops() {
     }
     assert_eq!(bad, 0);
 }
+/// #701: the first structured form (`emit_structured`, also inside the `pc` chain's guards).
+/// (1) A loop with two exits to the same block: the second exit's flag is already pending,
+/// so the open `if (!(xcl_skip_…))` must be re-tested after it. (2) A jump from the if branch
+/// to the start of the else branch: the else branch runs. s11 = 2: the second test is taken.
+#[test]
+fn first_structured_form_follows_jumps_to_pending_targets_and_into_the_else() {
+    if !gpu_ready() {
+        return;
+    }
+    // s[r] += 1; scc = bit s0 of s[r]
+    let a = |r: u64| ("S_ADD_U32", "ENC_SOP2", vec![("SDST", r), ("SSRC0", r), ("SSRC1", 129)]);
+    let b = |r: u64| ("S_BITCMP1_B32", "ENC_SOPC", vec![("SSRC0", r), ("SSRC1", 0)]);
+    let br = |n: &'static str, k: u64| (n, "ENC_SOPP", vec![("SIMM16", k)]);
+    let two_breaks = vec![
+        a(0), b(10), br("S_CBRANCH_SCC1", 9), // → out
+        a(1), b(11), br("S_CBRANCH_SCC1", 6), // → out
+        a(2), b(12), br("S_CBRANCH_SCC1", 1), // → latch
+        a(4),
+        ("S_CMP_LT_U32", "ENC_SOPC", vec![("SSRC0", 0), ("SSRC1", 131)]), // latch
+        br("S_CBRANCH_SCC1", 0xFFF4),                                      // → loop
+        a(3),                                                              // out
+    ];
+    let into_else = vec![
+        a(0), b(10), br("S_CBRANCH_SCC1", 5), // → else
+        a(1), b(11), br("S_CBRANCH_SCC1", 2), // → else
+        a(2), br("S_BRANCH", 1),              // → join
+        a(3),                                 // else
+        a(4),                                 // join
+    ];
+    for (name, list, want) in [("two breaks", two_breaks, [1, 1, 0, 1, 0]), ("jump into else", into_else, [1, 1, 0, 1, 1])] {
+        let l: Vec<(&str, &str, &[(&str, u64)], Option<u32>)> = list.iter().map(|(n, e, f)| (*n, *e, &f[..], None)).collect();
+        let code = prog(&l);
+        for structured in [true, false] {
+            let t = translate(&code, &Options { wave64: false, structured, ..Default::default() }).unwrap();
+            assert!(t.complete(), "{:?}", t.unsupported_why);
+            let dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap();
+            let mem: Vec<u32> = code.chunks(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
+            let mut st = KernelState::default();
+            st.sgpr[11] = 2;
+            let r = runner::run(&dxil, &st, &mem).unwrap();
+            assert_eq!(r.sgpr[..5], want, "{name}, structured {structured}\n{}", t.hlsl);
+        }
+    }
+}

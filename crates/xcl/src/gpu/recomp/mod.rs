@@ -779,6 +779,11 @@ fn rotated_loop(c: &Ctx, start: u64, end: u64, u: u64, lo: u64, hi: u64) -> Opti
 /// `if (!c) { [end, t) } else { [t, u) }` holds: both branches structured, the if branch does
 /// not jump into the else branch.
 fn else_ok(c: &Ctx, end: u64, t: u64, u: u64, nest: usize, cont: Option<u64>) -> bool {
+    // a jump to t from inside the if branch is not raised (it ends that level: a plain if
+    // there), but as an if / else it would skip the else branch
+    if c.edges.iter().any(|&(src, dst)| dst == t && src >= end && src < t) {
+        return false;
+    }
     let none = BTreeSet::new();
     match structurable_to(c, end, t, Some(u), nest + 1, cont, &none) {
         Some(r) if !r.iter().any(|&x| x >= t && x < u) => structurable_to(c, t, u, None, nest + 1, cont, &none).is_some(),
@@ -1040,6 +1045,12 @@ fn emit_structured(
                 }
             }
         };
+        // a flag set here is tested again before the next item, even one already pending
+        // (the open guard was tested before it was set)
+        if !raised.is_empty() && guard.take().is_some() {
+            body.push_str(&format!("{pad}}}
+"));
+        }
         pending.extend(raised);
     }
     if guard.is_some() {
