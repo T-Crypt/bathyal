@@ -153,6 +153,8 @@ class ReportTest(unittest.TestCase):
         self.assertEqual((report["cache"]["hits"], report["cache"]["misses"]), (900, 12))
         # the tail's line is the last report here too
         self.assertEqual(report["driver_pipelines"]["reused"], 950)
+        # a later "reused" report does not clear the last "saved" count
+        self.assertEqual(report["driver_pipelines"]["saved"], 500)
 
     def test_end_status_names_the_hang(self):
         report = self.analyse(FRAG_HEAD + FRAG_TAIL)
