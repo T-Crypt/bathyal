@@ -151,6 +151,7 @@ bathyal rpf D:\data\shaders.rpf --extract NAME --out folder
   adapter's video memory, refreshed once a second. It is copied into the frame on XCL's own
   command list (no extra window), so it also appears in screenshots and recordings. 8-bit
   back buffers only.
+  Opening an original directory with `CREATE_ALWAYS` when it is absent from the overlay fails and leaves the directory visible.
 - Every run writes `report.json` (called stubs, unknown D3D12.X slots and interfaces, XGameRuntime
   classes asked for, shader statistics, audio formats, crash).
   `d3d12.presents` counts presentations, not visible content. With `XCL_FRAME_DUMP=N` (`N > 1`),
