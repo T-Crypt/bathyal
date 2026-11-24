@@ -1859,6 +1859,8 @@ mod tests {
         let out = watch_ranges(&regions, wanted);
         assert!(out.iter().any(|&(lo, n)| lo <= written && written + 0x1000 <= lo + n), "the page between the ranges is walked");
         assert_eq!(out.len(), 1, "the gap is under WATCH_GAP: one scan");
+    }
+
     /// The title's bytes are used where they are when all of them are readable, and read with the
     /// pages that are not committed as zeros otherwise – the same bytes either way.
     #[test]
