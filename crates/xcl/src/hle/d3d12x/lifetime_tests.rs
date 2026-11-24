@@ -8,7 +8,7 @@ use std::ffi::c_void;
 use windows::core::Interface;
 use windows::Win32::Graphics::Direct3D12::*;
 
-use super::{device_x, fence_x, lifetime, list_x, real};
+use super::{fence_x, lifetime, list_x, real};
 
 const BYTES: u64 = 64;
 
@@ -70,15 +70,14 @@ fn a_resource_released_after_submit_outlives_its_submission() {
         src.Unmap(0, None);
 
         let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).expect("allocator");
-        let mut raw_list: *mut c_void = std::ptr::null_mut();
-        let iid = windows_sys::core::GUID::from_u128(0x5b160d0f_ac1b_4185_8ba8_b3ae42a5a455);
-        let hr = device_x::create_command_list_pc(dev.as_raw(), 0, D3D12_COMMAND_LIST_TYPE_DIRECT.0 as u32, alloc.as_raw() as usize, 0, &iid, &mut raw_list);
-        assert!(hr >= 0 && !raw_list.is_null(), "CreateCommandList: {hr:#x}");
+        let mut made: Option<ID3D12GraphicsCommandList> = None;
+        dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None::<&ID3D12PipelineState>, &mut made).expect("CreateCommandList");
+        let list = made.expect("command list");
+        let raw_list = list.as_raw() as *mut c_void;
 
         // the two copies name the source, the destination and the readback buffer
         list_x::copy_buffer_region_x(raw_list, dst.as_raw() as usize, 0, src.as_raw() as usize, 0, BYTES);
         list_x::copy_buffer_region_x(raw_list, rb.as_raw() as usize, 0, dst.as_raw() as usize, 0, BYTES);
-        let list = ID3D12GraphicsCommandList::from_raw_borrowed(&raw_list).expect("title list");
         list.Close().expect("Close");
 
         let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() }).expect("queue");
@@ -109,7 +108,7 @@ fn a_resource_released_after_submit_outlives_its_submission() {
         release(rb.as_raw() as usize);
 
         // the list goes last (its allocator is what keeps its unified memory)
-        release(raw_list as usize);
+        drop(list);
         drop(alloc);
     }
 }
