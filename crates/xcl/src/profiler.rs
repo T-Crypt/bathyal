@@ -153,7 +153,8 @@ impl Shared {
         let sites_total = sites.len();
         sites.truncate(self.settings.top.max(1));
         let mut threads: Vec<(u32, ThreadCount)> = st.threads.iter().map(|(&tid, t)| (tid, t.clone())).collect();
-        threads.sort_by(|a, b| b.1.samples.cmp(&a.1.samples));
+        // the threads that did the most work first (a waiting thread has samples too)
+        threads.sort_by(|a, b| (b.1.samples - b.1.waiting).cmp(&(a.1.samples - a.1.waiting)).then_with(|| b.1.samples.cmp(&a.1.samples)));
         Snapshot { seconds: self.started.elapsed().as_secs_f64(), total: st.total, missed: st.missed, sites_total, sites, threads }
     }
 
