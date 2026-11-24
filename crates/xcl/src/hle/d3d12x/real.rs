@@ -2087,6 +2087,13 @@ unsafe extern "system" fn dev_create_srv_x(this: *mut c_void, res: *mut c_void, 
     // view becomes the cube array of that one cube (a dimension mismatch is undefined in D3D12)
     let cube = desc.as_ref().and_then(cube_as_cube_array);
     let desc = cube.as_ref().map_or(desc, |v| v as *const _);
+    if res.is_null() {
+        static DBG: AtomicU64 = AtomicU64::new(0);
+        if DBG.fetch_add(1, Ordering::Relaxed) < 6 {
+            let w: Vec<u32> = unsafe { std::slice::from_raw_parts(slot.at as *const u32, 8) }.to_vec();
+            crate::xlog_warn!("D3D12.X dbg null srv: desc_null={} idx={} k={} shared={:#x} pc={:#x} words={:x?}", desc.is_null(), slot.index, slot.k, slot.shared_srv, slot.pc_srv, w);
+        }
+    }
     f(this, res, null_swapped(res, desc), slot.pc_srv);
     super::console_heap::publish(&slot, false);
     super::console_heap::note_resource(&slot, res as usize);
