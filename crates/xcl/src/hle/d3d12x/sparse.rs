@@ -1549,10 +1549,6 @@ mod tests {
         assert_eq!(budget_from(Some("nonsense")), Some(std::time::Duration::from_millis(WATCH_BUDGET_MS)), "a value that is not a number: the default");
     }
 
-    /// The GPU-visible spans keep only the mapped tiles, merged, and a span inside one that is
-    /// already watched adds nothing.
-    #[test]
-
     #[test]
     fn aligned_tile_addresses_spread_across_hash_buckets() {
         use std::hash::BuildHasher;
