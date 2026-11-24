@@ -715,6 +715,7 @@ pub unsafe fn on_create(list: *mut c_void, alloc: usize, pso: usize, ty: D3D12_C
 
 /// Clean up all tracked state when a command list is released for good.
 pub(super) fn on_release(list: usize) {
+    super::lifetime::forget_list(list);
     super::title_textures::list_reset(list);
     let old = LISTS.lock().unwrap().as_mut().and_then(|m| m.remove(&list));
     if let Some(old) = old {
@@ -747,6 +748,7 @@ pub(super) fn on_allocator_release(alloc: usize) {
 /// syncing `ID3D12GraphicsCommandList9::RSSetDepthBias` when the bound PSO uses native dynamic
 /// depth bias.
 pub(super) unsafe fn on_set_pipeline_state(list: *mut c_void, pso: usize) {
+    super::lifetime::note(list as usize, pso);
     let key = list as usize;
     let sync_target = {
         let mut g = LISTS.lock().unwrap();
@@ -799,6 +801,7 @@ pub(super) unsafe fn on_set_pipeline_state(list: *mut c_void, pso: usize) {
 
 /// Track `ClearState` on a command list: resets dynamic state and binds `pso`.
 pub(super) unsafe fn on_clear_state(list: *mut c_void, pso: usize) {
+    super::lifetime::note(list as usize, pso);
     let key = list as usize;
     let is_bundle = {
         let mut g = LISTS.lock().unwrap();
@@ -1566,6 +1569,7 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
     type ExecFn = unsafe extern "system" fn(*mut c_void, u32, *const *mut c_void);
     let exec: ExecFn = transmute_copy(&real::orig_fn(q_raw, PC_QUEUE_EXECUTE_COMMAND_LISTS));
     let one = [this];
+    super::lifetime::submit(queue, &one);
     exec(q_raw, 1, one.as_ptr());
     // what ran is in the textures' states; the list records anew after its Reset below
     super::title_textures::submitted(&one);
@@ -1986,11 +1990,17 @@ pub(super) unsafe fn pc_heaps(n: u32, heaps: *const usize) -> Vec<Option<ID3D12D
 pub(super) unsafe extern "system" fn set_descriptor_heaps_x(this: *mut c_void, n: u32, heaps: *const usize) {
     const PC_SET_DESCRIPTOR_HEAPS: usize = 28;
     let f = pc::<unsafe extern "system" fn(*mut c_void, u32, *const usize)>(this, PC_SET_DESCRIPTOR_HEAPS);
-    if heaps.is_null() || super::console_heap::global_heap().is_none() {
-        if !heaps.is_null() {
-            let given = std::slice::from_raw_parts(heaps, n as usize).to_vec();
-            with_bindings(this, |b| b.heaps = given);
-        }
+    if heaps.is_null() || n == 0 {
+        // no heaps: nothing bound any more
+        with_bindings(this, |b| b.heaps.clear());
+        return f(this, n, heaps);
+    }
+    for &h in std::slice::from_raw_parts(heaps, n as usize).iter() {
+        super::lifetime::note(this as usize, h);
+    }
+    if super::console_heap::global_heap().is_none() {
+        let given = std::slice::from_raw_parts(heaps, n as usize).to_vec();
+        with_bindings(this, |b| b.heaps = given);
         return f(this, n, heaps);
     }
     let h = pc_heaps(n, heaps);
@@ -2111,6 +2121,7 @@ type QueryFn = unsafe extern "system" fn(*mut c_void, usize, D3D12_QUERY_TYPE, u
 /// # Safety
 /// `this` must be a valid adopted `ID3D12GraphicsCommandList` pointer.
 pub unsafe extern "system" fn reset_x(this: *mut c_void, alloc: usize, pso: usize) -> i32 {
+    super::lifetime::forget_list(this as usize);
     // A failed native Reset leaves the old recording alive. Do not discard its tracked state or
     // transfer its allocations until the driver accepts the new recording.
     let ext = *(this as *const usize);
@@ -2303,6 +2314,8 @@ pub(super) unsafe extern "system" fn copy_buffer_region_x(this: *mut c_void, dst
             note_gpu_write("CopyBufferRegion", a + dst_off as usize, n);
         }
     }
+    super::lifetime::note(this as usize, dst);
+    super::lifetime::note(this as usize, src);
     pc::<unsafe extern "system" fn(*mut c_void, usize, u64, usize, u64, u64)>(this, PC_COPY_BUFFER_REGION)(this, dst, dst_off + real::buffer_delta(dst), src, src_off + real::buffer_delta(src), n)
 }
 
@@ -2332,6 +2345,10 @@ unsafe fn trace_watched_copy(what: &str, dst: usize, src: usize) {
 
 /// CopyTextureRegion(dst, x, y, z, src, box) (PC #16; DMA list #12)
 pub(super) unsafe extern "system" fn copy_texture_region_x(this: *mut c_void, dst: *const D3D12_TEXTURE_COPY_LOCATION, x: u32, y: u32, z: u32, src: *const D3D12_TEXTURE_COPY_LOCATION, bx: *const D3D12_BOX) {
+    for l in [dst, src].into_iter().filter_map(|l| l.as_ref()) {
+        let r: usize = transmute_copy(&l.pResource);
+        super::lifetime::note(this as usize, r);
+    }
     if let Some(d) = dst.as_ref() {
         let r: usize = transmute_copy(&d.pResource);
         super::present::note_use(r, super::present::USE_COPY);
@@ -2463,6 +2480,8 @@ unsafe fn trace_resolve(what: &str, dst: usize, src: usize, format: i32, extra: 
 /// command list #19 ResolveSubresource(dst, dst sub, src, src sub, format) (PC #19)
 pub(super) unsafe extern "system" fn resolve_subresource_x(this: *mut c_void, dst: usize, dst_sub: u32, src: usize, src_sub: u32, format: i32) {
     super::present::note_use(dst, super::present::USE_COPY);
+    super::lifetime::note(this as usize, dst);
+    super::lifetime::note(this as usize, src);
     trace_resolve("ResolveSubresource", dst, src, format, "");
     pc::<unsafe extern "system" fn(*mut c_void, usize, u32, usize, u32, i32)>(this, PC_RESOLVE_SUBRESOURCE)(this, dst, dst_sub, src, src_sub, format)
 }
@@ -2472,6 +2491,8 @@ pub(super) unsafe extern "system" fn resolve_subresource_x(this: *mut c_void, ds
 #[allow(clippy::too_many_arguments)]
 pub(super) unsafe extern "system" fn resolve_subresource_region_x(this: *mut c_void, dst: usize, dst_sub: u32, x: u32, y: u32, src: usize, src_sub: u32, rect: *const windows::Win32::Foundation::RECT, format: i32, mode: i32) {
     super::present::note_use(dst, super::present::USE_COPY);
+    super::lifetime::note(this as usize, dst);
+    super::lifetime::note(this as usize, src);
     if super::present::trace_frame() {
         trace_resolve("ResolveSubresourceRegion", dst, src, format, &format!(" mode {mode} at ({x}, {y}) rect {:?}", rect.as_ref().map(|r| (r.left, r.top, r.right, r.bottom))));
     }
@@ -2483,6 +2504,8 @@ pub(super) unsafe extern "system" fn resolve_subresource_region_x(this: *mut c_v
 pub(super) unsafe extern "system" fn copy_resource_x(this: *mut c_void, dst: usize, src: usize) {
     super::present::note_use(dst, super::present::USE_COPY);
     super::title_textures::note_gpu_write(dst);
+    super::lifetime::note(this as usize, dst);
+    super::lifetime::note(this as usize, src);
     if super::present::trace_frame() {
         trace_watched_copy("CopyResource", dst, src);
     }

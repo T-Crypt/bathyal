@@ -19,6 +19,7 @@ mod fence_x;
 pub mod frame;
 pub mod guard;
 pub mod layout;
+mod lifetime;
 pub mod list_x;
 pub mod null;
 pub mod present;

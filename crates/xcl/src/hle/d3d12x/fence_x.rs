@@ -65,7 +65,8 @@ unsafe fn arm(fence: usize, value: u64) {
 }
 
 /// A queue was told to signal `fence` (one of the title's) with `value`.
-pub(super) unsafe fn note_queue_signal(fence: usize, value: u64) {
+pub(super) unsafe fn note_queue_signal(queue: usize, fence: usize, value: u64) {
+    super::lifetime::signal(queue, fence, value);
     let cell = {
         let mut g = FENCES.lock().unwrap_or_else(|e| e.into_inner());
         let f = g.get_or_insert_with(HashMap::new).entry(fence).or_default();
@@ -136,12 +137,12 @@ mod tests {
                 }
             };
             queue.Signal(&fence, 6).unwrap();
-            note_queue_signal(p as usize, 6);
+            note_queue_signal(queue.as_raw() as usize, p as usize, 6);
             let cell = completed_value_address(p);
             assert_eq!(cell, completed_value_address(p));
             wait(cell, 6);
             queue.Signal(&fence, 7).unwrap();
-            note_queue_signal(p as usize, 7);
+            note_queue_signal(queue.as_raw() as usize, p as usize, 7);
             wait(cell, 7);
             fence.Signal(9).unwrap();
             note_cpu_signal(p as usize);

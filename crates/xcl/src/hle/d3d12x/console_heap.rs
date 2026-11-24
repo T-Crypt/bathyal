@@ -380,6 +380,11 @@ pub fn unregister(obj: usize) {
         heaps.iter().position(|h| h.obj == obj).map(|i| heaps.swap_remove(i))
     };
     if let Some(h) = gone {
+        let bytes = h.n.max(1) as usize * if h.sampler { SAMPLER_SLOT as usize } else { SLOT as usize };
+        if let Some(m) = NAMED.lock().unwrap().as_mut() {
+            let end = h.shadow + bytes;
+            m.retain(|&a, _| a < h.shadow || a >= end);
+        }
         for &f in h.placed.values() {
             release_global(f, SLOT_DESCRIPTORS);
         }
@@ -473,9 +478,25 @@ pub unsafe fn publish_range(first: &Slot, n: u32) {
 /// view slot address → the resource its view names (`XCL_TRACE_FRAME` diagnostics)
 static RES: Mutex<Option<std::collections::HashMap<usize, usize>>> = Mutex::new(None);
 
+/// view slot address → the resource its view names, always kept: when a resource is retired
+/// its slots are nulled before the next submission reads the heap.
+static NAMED: Mutex<Option<std::collections::HashMap<usize, usize>>> = Mutex::new(None);
+
 /// The view in slot `s` names `res` (0: none).
 pub fn note_resource(s: &Slot, res: usize) {
-    if s.sampler || !super::present::trace_frame() {
+    if s.sampler {
+        return;
+    }
+    {
+        let mut g = NAMED.lock().unwrap();
+        let m = g.get_or_insert_with(Default::default);
+        if res == 0 {
+            m.remove(&s.at);
+        } else {
+            m.insert(s.at, res);
+        }
+    }
+    if !super::present::trace_frame() {
         return;
     }
     let mut g = RES.lock().unwrap();
@@ -484,6 +505,43 @@ pub fn note_resource(s: &Slot, res: usize) {
         m.remove(&s.at);
     } else {
         m.insert(s.at, res);
+    }
+}
+
+=
+/// `res` was released for good: every console slot that named it becomes a null slot, and the
+/// shared shader-visible PC heap gets null descriptors in the places those slots name. No
+/// later submission can read a descriptor of memory that is gone.
+pub fn retire_resource(res: usize) {
+    if res == 0 {
+        return;
+    }
+    let (slots, dev, inc) = {
+        let mut g = NAMED.lock().unwrap();
+        let m = g.get_or_insert_with(Default::default);
+        let slots: Vec<usize> = m.iter().filter(|&(_, &r)| r == res).map(|(&a, _)| a).collect();
+        m.retain(|_, &mut r| r != res);
+        let (dev, inc) = GLOBAL
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map_or((None, 0), |s| (Some(s.dev.clone()), s.inc));
+        (slots, dev, inc)
+    };
+    for at in slots {
+        let Some(s) = slot(at as u64) else { continue };
+        write(&s, &[0; 8]);
+        let Some(dev) = &dev else { continue };
+        unsafe {
+            dev.CreateShaderResourceView(None, None, D3D12_CPU_DESCRIPTOR_HANDLE { ptr: s.pc_srv as usize });
+            if s.pc_uav != 0 {
+                dev.CreateUnorderedAccessView(None, None, None, D3D12_CPU_DESCRIPTOR_HANDLE { ptr: s.pc_uav as usize });
+            }
+            if s.shared_srv != 0 {
+                dev.CreateShaderResourceView(None, None, D3D12_CPU_DESCRIPTOR_HANDLE { ptr: s.shared_srv as usize });
+                dev.CreateUnorderedAccessView(None, None, None, D3D12_CPU_DESCRIPTOR_HANDLE { ptr: s.shared_srv + inc as u64 });
+            }
+        }
     }
 }
 
@@ -697,7 +755,8 @@ pub fn copy_words(src: &Slot, dst: &Slot) {
     }
     write(dst, &w[..n]);
     if !src.sampler {
-        note_resource(dst, resource_at(src.at).unwrap_or(0));
+        let named = NAMED.lock().unwrap().as_ref().and_then(|m| m.get(&src.at).copied()).unwrap_or(0);
+        note_resource(dst, named);
     }
 }
 
