@@ -3665,6 +3665,14 @@ unsafe fn finish_pso_cached(this: *mut c_void, f: PsoFn, desc: *mut c_void, grap
         crate::xlog_warn!("D3D12.X: pipeline {key:016x} is not compiled: it removes the device");
         return E_INVALIDARG;
     }
+    // a cached-only attempt runs on the title's thread (pipeline creation): the driver's
+    // compile of a pipeline it has no blob for goes to the pipeline worker, never inline
+    // behind the compile limiter (a retail title's loading thread waited there with every
+    // slot busy on big compiles, and its loading screen looped)
+    if crate::gpu::recomp::dxc::in_cached_only() {
+        crate::gpu::recomp::dxc::defer_to_worker();
+        return 0x8000_000Au32 as HRESULT; // E_PENDING
+    }
     let _guard = super::pso_async::uncached_compile();
     super::pso_disk::note_lookup(false);
     if graphics {
@@ -3727,6 +3735,14 @@ unsafe fn finish_stream_cached(this: *mut c_void, f: PsoFn, stream: &[u8], key: 
             return hr;
         }
         super::pso_disk::rejected(key);
+    }
+    // a cached-only attempt runs on the title's thread (pipeline creation): the driver's
+    // compile of a pipeline it has no blob for goes to the pipeline worker, never inline
+    // behind the compile limiter (a retail title's loading thread waited there with every
+    // slot busy on big compiles, and its loading screen looped)
+    if crate::gpu::recomp::dxc::in_cached_only() {
+        crate::gpu::recomp::dxc::defer_to_worker();
+        return 0x8000_000Au32 as HRESULT; // E_PENDING
     }
     let _guard = super::pso_async::uncached_compile();
     super::pso_disk::note_lookup(false);
