@@ -45,6 +45,10 @@ pub(super) struct Em {
     /// instruction (`x64_masks`); a mask written to none of them is only read lane by lane
     /// (split: stays in its half, no exchange; pixel: no quad reads for the helper lanes)
     pub mask_whole_live: BTreeMap<u64, u128>,
+    /// split wave64: pcs of the conditional branches whose condition is combined across the
+    /// two halves (`xcl_x_wide`): an `s_barrier` is reachable from either successor
+    /// (`x64_masks::branches_reaching_barrier`)
+    pub wide_cond: BTreeSet<u64>,
     /// pixel shaders: the program's loops (`loop_ranges`); a mask written in one takes its
     /// helper lanes' bits from quad reads of its vector operands (`quad_bits`, #134)
     pub loops: Vec<(u64, u64)>,
@@ -544,6 +548,11 @@ fn to_f16_rounded_expr(dynamic_rm: bool, e: &str) -> String {
     format!("f32_to_f16_rm({e}, {rm})")
 }
 
+/// The split wave64 form applies to this program and adapter (`Em::x64`).
+pub fn split_form(opt: &Options) -> bool {
+    opt.wave64 && opt.split_wave64 && matches!(opt.mode, Mode::Kernel | Mode::Compute(_) | Mode::Mesh(_) | Mode::Geometry(_))
+}
+
 impl Em {
     pub fn new(opt: Options) -> Self {
         Em {
@@ -563,6 +572,7 @@ impl Em {
             uses_scratch: false,
             x64_words: 1,
             mask_whole_live: BTreeMap::new(),
+            wide_cond: BTreeSet::new(),
             loops: Vec::new(),
             cs_pad: false,
             upper: None,
@@ -649,7 +659,7 @@ impl Em {
     /// hardware wave32 halves that exchange masks and lane values (`PRELUDE_X64`,
     /// docs/wave64-on-wave32.md).
     fn x64(&self) -> bool {
-        self.opt.wave64 && self.opt.split_wave64 && matches!(self.opt.mode, Mode::Kernel | Mode::Compute(_) | Mode::Mesh(_) | Mode::Geometry(_))
+        split_form(&self.opt)
     }
 
     /// `ballot` of the program's wave (both halves' words in the split form, the helper lanes'
@@ -1099,19 +1109,27 @@ impl Em {
                     self.unsupported(d, "SOPP");
                     return Flow::Next;
                 };
-                match name {
-                    "s_branch" => Flow::Jump(t),
-                    "s_cbranch_scc0" => Flow::Cond("scc == 0u".into(), t),
-                    "s_cbranch_scc1" => Flow::Cond("scc != 0u".into(), t),
-                    "s_cbranch_vccz" => Flow::Cond(self.mask_zero(106), t),
-                    "s_cbranch_vccnz" => Flow::Cond(format!("!({})", self.mask_zero(106)), t),
-                    "s_cbranch_execz" => Flow::Cond(self.mask_zero(126), t),
-                    "s_cbranch_execnz" => Flow::Cond(format!("!({})", self.mask_zero(126)), t),
+                let cond = match name {
+                    "s_branch" => return Flow::Jump(t),
+                    "s_cbranch_scc0" => "scc == 0u".to_string(),
+                    "s_cbranch_scc1" => "scc != 0u".to_string(),
+                    "s_cbranch_vccz" => self.mask_zero(106),
+                    "s_cbranch_vccnz" => format!("!({})", self.mask_zero(106)),
+                    "s_cbranch_execz" => self.mask_zero(126),
+                    "s_cbranch_execnz" => format!("!({})", self.mask_zero(126)),
                     _ => {
                         self.unsupported(d, "conditional branch");
-                        Flow::Next
+                        return Flow::Next;
                     }
+                };
+                // split wave64: a branch on a path to an `s_barrier` is taken the same way by
+                // both halves, or one of them never reaches the barrier and the group hangs
+                if self.wide_cond.contains(&d.pc) {
+                    let w = self.t();
+                    self.line(&format!("bool {w} = xcl_x_wide({cond});"));
+                    return Flow::Cond(w, t);
                 }
+                Flow::Cond(cond, t)
             }
         }
     }
@@ -5667,6 +5685,15 @@ uint2 xcl_x_ballot(bool b) {
     xcl_x_put(0u, m);
     uint o = xcl_x_meet() ? xcl_x_get(0u) : 0u;
     return xcl_half != 0u ? uint2(o, m) : uint2(m, o);
+}
+// a branch condition combined across the two halves (either half's value, the same in both):
+// the branches on every path to an `s_barrier` go the same way in both, so both reach the
+// barrier (a half whose EXEC is empty runs the block with no active lanes, as on the console)
+bool xcl_x_wide(bool b) {
+    uint m = WaveActiveBallot(b).x;
+    xcl_x_put(0u, m);
+    uint o = xcl_x_meet() ? xcl_x_get(0u) : 0u;
+    return (m | o) != 0u;
 }
 // v_readlane / v_readfirstlane: the same lane index in both halves; the owner half's value
 uint xcl_x_rla_uniform(uint v, uint l) {

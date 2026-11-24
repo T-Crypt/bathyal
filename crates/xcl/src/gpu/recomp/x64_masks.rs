@@ -26,7 +26,7 @@
 //! (`LOOP_GUARD`) is checked: what is live after a loop, or at the end, is live before each of
 //! its instructions.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use super::emit::ext_encoding;
 use crate::gpu::rdna2::{self, Decoded, Variant, F_CONDITIONAL, F_INDIRECT, F_TERMINATOR};
@@ -129,13 +129,10 @@ pub fn uses(d: &Decoded) -> (Regs, Regs) {
     (whole, written)
 }
 
-/// For each instruction (index in `insts`): the SGPRs whose whole value may be read after it.
-/// `end_reads_all`: the program's end reads every SGPR (kernel mode).
-pub fn whole_live_out(insts: &[Decoded], end_reads_all: bool) -> Vec<Regs> {
+/// Instruction indices each instruction may continue at; `None` = unknown (indirect jump).
+fn successors(insts: &[Decoded]) -> Vec<Option<Vec<usize>>> {
     let pcs: BTreeMap<u64, usize> = insts.iter().enumerate().map(|(i, d)| (d.pc, i)).collect();
-    let at_end = if end_reads_all { ALL } else { EXEC };
-    // successors; None = unknown (indirect): everything is live
-    let succ: Vec<Option<Vec<usize>>> = insts
+    insts
         .iter()
         .enumerate()
         .map(|(i, d)| {
@@ -158,7 +155,62 @@ pub fn whole_live_out(insts: &[Decoded], end_reads_all: bool) -> Vec<Regs> {
             }
             Some(out)
         })
-        .collect();
+        .collect()
+}
+
+/// Conditional branches whose condition is combined across the two halves (`xcl_x_wide`):
+/// an `s_barrier` is reachable from either successor. Two halves that take different paths
+/// around a barrier never meet again in the group that barrier waits for, so the dispatch
+/// hangs; the branches on every path to a barrier are made to agree instead.
+///
+/// The halves hold the same 64-bit EXEC and VCC (`whole_live_out`), so their conditions
+/// agree unless the scalar value they are computed from differs: a non-coherent scalar load
+/// (`emit::smem` exchanges only GLC / DLC loads), or a pair whose exchange gave up
+/// (`xcl_x_dead`). A branch that only *follows* a barrier is combined too: a barrier in each
+/// arm, reached by a different half, hangs the group as well.
+pub fn branches_reaching_barrier(insts: &[Decoded]) -> BTreeSet<u64> {
+    let pcs: BTreeMap<u64, usize> = insts.iter().enumerate().map(|(i, d)| (d.pc, i)).collect();
+    let succ = successors(insts);
+    // a barrier, or a path to one; an indirect jump may lead anywhere
+    let mut reaches = vec![false; insts.len()];
+    loop {
+        let mut changed = false;
+        for i in (0..insts.len()).rev() {
+            let r = insts[i].inst.name.eq_ignore_ascii_case("S_BARRIER")
+                || match &succ[i] {
+                    None => true,
+                    Some(s) => s.iter().any(|&j| reaches[j]),
+                };
+            if r != reaches[i] {
+                reaches[i] = r;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    let mut out = BTreeSet::new();
+    for (i, d) in insts.iter().enumerate() {
+        if d.inst.flags & F_CONDITIONAL == 0 || d.far_target.is_some() {
+            continue;
+        }
+        let target = rdna2::branch_target(d).and_then(|t| pcs.get(&t).copied());
+        let fallthrough = insts.get(i + 1).and_then(|n| pcs.get(&n.pc).copied());
+        if target.is_some_and(|j| reaches[j]) || fallthrough.is_some_and(|j| reaches[j]) {
+            out.insert(d.pc);
+        }
+    }
+    out
+}
+
+/// For each instruction (index in `insts`): the SGPRs whose whole value may be read after it.
+/// `end_reads_all`: the program's end reads every SGPR (kernel mode).
+pub fn whole_live_out(insts: &[Decoded], end_reads_all: bool) -> Vec<Regs> {
+    let pcs: BTreeMap<u64, usize> = insts.iter().enumerate().map(|(i, d)| (d.pc, i)).collect();
+    let at_end = if end_reads_all { ALL } else { EXEC };
+    // successors; None = unknown (indirect): everything is live
+    let succ = successors(insts);
     // `LOOP_GUARD`: a loop may be left where its guard runs – at its top, before the head
     // instruction, and in the `pc` dispatcher form before every block of it – to the code
     // after it (structured) or the end of the program (dispatcher: no later block matches

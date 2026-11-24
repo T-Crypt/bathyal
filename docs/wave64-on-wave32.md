@@ -97,6 +97,13 @@ it. A program that really uses the whole 32 KB of LDS therefore loses its top dw
    is exactly one console wave, whose control flow is identical in both halves; console
    `s_barrier` stays a group barrier (all console waves reach it, as on the console). The GS
    phase (lower half only) has no exchanges and its `s_barrier` is dropped (one wave).
+   Every conditional branch from which an `s_barrier` is reachable, in a branch or in a loop
+   (`x64_masks::branches_reaching_barrier`), takes its condition through `xcl_x_wide`: both
+   halves' values are exchanged and OR-ed, so both halves go the same way and both reach the
+   barrier (the half without active lanes runs the block, as on the console). This holds even
+   where the halves' scalar values differ (hazard 1) and covers a barrier in each arm of an
+   `if`. A program with such a branch is counted in the log (`recomp: split wave64 programs
+   with a barrier inside a branch or loop: N`, at the first and every power of two).
 3. **Lane numbering** – handled by `xcl_x_thread` (see above); NVIDIA really does form waves
    of non-consecutive thread indices for 3-D groups (`gpu_split_wave64_waves_diverge` fails
    without the remap).
