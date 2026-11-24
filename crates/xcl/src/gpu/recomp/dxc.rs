@@ -1043,7 +1043,8 @@ mod gate_tests {
             for _ in 0..32 {
                 s.spawn(|| {
                     for _ in 0..10 {
-                        let _slot = admit(&TEST_GATE, commit);
+                        let never: Wanted = Box::new(|| false);
+                        let _slot = admit(&TEST_GATE, commit, &never);
                         let n = now.fetch_add(1, Ordering::SeqCst) + 1;
                         peak.fetch_max(n, Ordering::SeqCst);
                         // the first ones in stay until the cap is full: it is reached for sure
@@ -1071,7 +1072,8 @@ mod gate_tests {
             for _ in 0..32 {
                 s.spawn(|| {
                     for _ in 0..5 {
-                        let _slot = wait_for_memory(&Box::new(|| false));
+                        let never: Wanted = Box::new(|| false);
+                        let _slot = wait_for_memory(&never);
                         std::thread::sleep(Duration::from_millis(1));
                     }
                     done.fetch_add(1, Ordering::SeqCst);

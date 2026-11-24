@@ -6830,7 +6830,7 @@ mod srv_tests {
                 SampleDesc: DXGI_SAMPLE_DESC { Count: samples, Quality: 0 },
                 ..Default::default()
             };
-            let v = pc_srv(&desc, None).expect("a typeless depth buffer gets a view of its own");
+            let v = pc_srv(None, &desc, None).expect("a typeless depth buffer gets a view of its own");
             assert_eq!(v.Format, DXGI_FORMAT_R24_UNORM_X8_TYPELESS);
             assert_eq!(v.ViewDimension, dimension, "{samples} samples, {slices} slices");
             let a = &v.Anonymous;
