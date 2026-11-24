@@ -1305,9 +1305,39 @@ pub fn run_in_arena(dxil: &[u8], state: &KernelState, arena: &crate::gpu::uma::U
 }
 
 fn run_in_region(dxil: &[u8], state: &KernelState, arena: &Arena) -> Result<KernelResult, String> {
-    with_gpu(|gpu| {
-        if arena.windows.is_empty() || arena.windows.len() > ARENA_MAX_WINDOWS {
-            return Err(format!("arena: {} memory windows (1..={ARENA_MAX_WINDOWS} supported)", arena.windows.len()));
+    let mut g = GPU.lock().unwrap();
+    let gpu = g.get_or_insert_with(init).as_mut().map_err(|x| x.clone())?;
+    let mut io: Vec<u32> = state.sgpr.clone();
+    io.resize(KERNEL_SGPRS, 0);
+    io[KERNEL_SCC_SLOT] = state.scc;
+    if let Some(&(base, _)) = arena.windows.first() {
+        io[super::IO_UMA_BASE_HI] = ((base as usize) >> 32) as u32;
+    }
+    for lane in 0..KERNEL_LANES {
+        let mut regs = state.vgpr.get(lane).cloned().unwrap_or_default();
+        regs.resize(KERNEL_VGPRS, 0);
+        io.extend_from_slice(&regs);
+    }
+    unsafe {
+        let dev = &gpu.dev;
+        let dev3: ID3D12Device3 = dev.cast().map_err(e)?;
+        let mut bufs: Vec<ID3D12Resource> = Vec::new();
+        for &(base, size) in &arena.windows {
+        let heap: ID3D12Heap = dev3.OpenExistingHeapFromAddress(base as *const std::ffi::c_void).map_err(|x| format!("OpenExistingHeapFromAddress: {x}"))?;
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: size as u64,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS | D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER,
+            ..Default::default()
+        };
+        let mut mem_buf: Option<ID3D12Resource> = None;
+        dev.CreatePlacedResource(&heap, 0, &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut mem_buf).map_err(|x| format!("CreatePlacedResource: {x}"))?;
+        bufs.push(mem_buf.ok_or("arena")?);
         }
         let io = pack_io(state);
         unsafe {

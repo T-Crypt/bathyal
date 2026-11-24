@@ -146,11 +146,8 @@ bathyal rpf D:\data\shaders.rpf --extract NAME --out folder
 - Bathyal works on **unpacked** game files you own; it contains nothing for decrypting or
   circumventing DRM.
 - **The game folder is never modified** – writes go to the overlay.
-- `XCL_OVERLAY=1` draws a small stats panel into the top-left corner of the shown frame: the
-  title's fps and frame time, draws and dispatches per second, the process's commit and the
-  adapter's video memory, refreshed once a second. It is copied into the frame on XCL's own
-  command list (no extra window), so it also appears in screenshots and recordings. 8-bit
-  back buffers only.
+- Translated shaders are reused across XCL rebuilds when the translator sources and DXC
+  toolchain are unchanged; `XCL_TRANSLATED_CACHE=0` disables that disk cache.
 - Every run writes `report.json` (called stubs, unknown D3D12.X slots and interfaces, XGameRuntime
   classes asked for, shader statistics, audio formats, crash).
   `d3d12.presents` counts presentations, not visible content. With `XCL_FRAME_DUMP=N` (`N > 1`),

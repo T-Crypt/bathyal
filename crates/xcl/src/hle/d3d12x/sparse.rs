@@ -1975,16 +1975,6 @@ mod tests {
         }
     }
 
-    /// The budget is a knob: a number of milliseconds, 4 unless set, and 0 turns it off.
-    #[test]
-    fn the_watch_budget_is_a_knob_and_zero_turns_it_off() {
-        assert_eq!(budget_from(None), Some(std::time::Duration::from_millis(WATCH_BUDGET_MS)));
-        assert_eq!(budget_from(Some("0")), None);
-        assert_eq!(budget_from(Some("12")), Some(std::time::Duration::from_millis(12)));
-        assert_eq!(budget_from(Some(" 250 ")), Some(std::time::Duration::from_millis(250)));
-        assert_eq!(budget_from(Some("nonsense")), Some(std::time::Duration::from_millis(WATCH_BUDGET_MS)), "a value that is not a number: the default");
-    }
-
     #[test]
     fn aligned_tile_addresses_spread_across_hash_buckets() {
         use std::hash::BuildHasher;
