@@ -197,6 +197,7 @@ pub(super) fn poll() {
         let mut free = Vec::new();
         st.deferred.retain(|&h| {
             let busy = st.objects.get(&h).map_or(true, |e| e.open > 0) || st.in_flight.iter().any(|s| !s.done && s.objects.contains(&h));
+            eprintln!("retain h={h:x} busy={busy} open={:?} subs={}", st.objects.get(&h).map(|e| e.open), st.in_flight.len());
             if !busy {
                 if let Some(e) = st.objects.remove(&h) {
                     free.push((h, e.free));
