@@ -2922,7 +2922,7 @@ mod tests {
                 queue_gate::gate_lists(q1, &lists(0xA1), vec![vec![w]], vec![vec![]]);
                 assert!(SEEN.lock().unwrap().is_empty());
                 let hr = queue_gate::gate_signal(q1, 0x1234, 9);
-                assert_eq!(hr.0, 0);
+                assert_eq!(hr, 0);
                 assert!(SEEN.lock().unwrap().is_empty(), "the Signal is held too");
                 CELL.store(0x2A, Ordering::Release);
             }
