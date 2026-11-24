@@ -685,7 +685,7 @@ fn nv_parallel_driver_compile() {
                         let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         let Some(dxil) = programs.get(i) else { break };
                         let t = std::time::Instant::now();
-                        let pso = unsafe { dev.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC { pRootSignature: transmute_copy(&rs_ptr), CS: D3D12_SHADER_BYTECODE { pShaderBytecode: dxil.as_ptr() as _, BytecodeLength: dxil.len() }, ..Default::default() }) };
+                        let pso: windows::core::Result<ID3D12PipelineState> = unsafe { dev.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC { pRootSignature: transmute_copy(&rs_ptr), CS: D3D12_SHADER_BYTECODE { pShaderBytecode: dxil.as_ptr() as _, BytecodeLength: dxil.len() }, ..Default::default() }) };
                         // a failure is a result too (the driver refuses some shapes): count it
                         let pso = match pso {
                             Ok(p) => p,
