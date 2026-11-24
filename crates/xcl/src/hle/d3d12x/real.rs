@@ -5259,8 +5259,8 @@ mod deferred_pso_tests {
     /// A console mesh pipeline stream (MS + PS), which is what the title's world load makes.
     fn mesh_stream(ms: &[u8], ps: &[u8]) -> Vec<u8> {
         stream(&[
-            (24, shader_subobject(ms)),
-            (25, shader_subobject(ps)),
+            (D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS.0 as u32, shader_subobject(ms)),
+            (D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS.0 as u32, shader_subobject(ps)),
             (9, 0xffff_ffffu32.to_le_bytes().to_vec()),                // SAMPLE_MASK
             (13, 2u32.to_le_bytes().to_vec()),                          // IB_STRIP_CUT_VALUE
             (14, D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE.0.to_le_bytes().to_vec()),
@@ -5315,7 +5315,7 @@ mod deferred_pso_tests {
         let mut layout = 1u32.to_le_bytes().to_vec();
         layout.extend_from_slice(&0u32.to_le_bytes());
         layout.extend_from_slice(&(elements.as_ptr() as u64).to_le_bytes());
-        let mut s = stream(&[(24, shader_subobject(&ms)), (25, shader_subobject(&ps)), (12, layout)]);
+        let mut s = stream(&[(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS.0 as u32, shader_subobject(&ms)), (D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS.0 as u32, shader_subobject(&ps)), (12, layout)]);
         let desc: [usize; 2] = [s.len(), s.as_ptr() as usize];
         let owned = unsafe { deferred_stream_copy_for_test(desc.as_ptr() as *const c_void) }.expect("copied");
         // the title frees its memory: the stream, the shaders and the element names are gone
@@ -5326,7 +5326,7 @@ mod deferred_pso_tests {
         // the copy still reads what the build needs
         let (size, base) = unsafe { (*(owned.ptr() as *const usize), *((owned.ptr() as usize + 8) as *const usize)) };
         let subs = stream_subobjects(unsafe { std::slice::from_raw_parts(base as *const u8, size) }).expect("parses");
-        let copied_ms = subs.iter().find(|s| s.0 == 24).and_then(|s| unsafe { payload_shader(s.1) }).expect("MS copied");
+        let copied_ms = subs.iter().find(|s| s.0 == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS.0 as u32).and_then(|s| unsafe { payload_shader(s.1) }).expect("MS copied");
         assert_eq!(copied_ms, ms.as_slice(), "the copy is independent of the title's shader memory");
         assert_ne!(copied_ms.as_ptr() as usize, ms.as_ptr() as usize, "not the title's pointer");
         let (n, p) = subs.iter().find(|s| s.0 == 12).map(|s| (u32::from_le_bytes(s.1[0..4].try_into().unwrap()) as usize, u64::from_le_bytes(s.1[8..16].try_into().unwrap()) as usize)).expect("input layout copied");
