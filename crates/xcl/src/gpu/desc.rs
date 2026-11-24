@@ -341,6 +341,31 @@ pub fn xcl_sampler_words(s: &[u32; 4], sampler_heap_index: u32) -> [u32; 4] {
     w
 }
 
+/// GFX10 IMG_FORMAT of a buffer that reads as zero: 32_FLOAT.
+pub const NULL_FORMAT: u32 = 22;
+
+/// The GFX10 IMG_FORMAT of the null textures: 128-bit, one per format class (0 float,
+/// 1 uint, 2 int) – `FMT_INFO` gives the class the recompiled shaders branch on.
+pub fn null_class_format(class: u32) -> u32 {
+    match class {
+        1 => 75,
+        2 => 76,
+        _ => 77,
+    }
+}
+
+/// A null T# of image type `ty` for the SRV at `srv_heap_index`: a 1×1×1 view of the null
+/// texture of `class`. Word 2 is 0, so the same four words also read as a V# of no records –
+/// a buffer or constant read through it returns zero too.
+pub fn null_image_words(srv_heap_index: u32, ty: ImageType, class: u32) -> [u32; 8] {
+    xcl_image_for_view(srv_heap_index, null_class_format(class), ty, 1, 1, 1, 1)
+}
+
+/// A null V#: no records, so every read is out of range and returns zero.
+pub fn null_buffer_words() -> [u32; 4] {
+    buffer_words(0, 0, 0, NULL_FORMAT)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Buffer {
     pub address: u64,
@@ -631,6 +656,34 @@ pub fn xcl_image_for_view(srv_heap_index: u32, format: u32, ty: ImageType, width
 #[cfg(test)]
 mod view_tests {
     use super::*;
+
+    /// A null T# of every image type decodes as that type – 1×1×1, its class's format, the
+    /// null pool's SRV index in word 0 (never 0, which is a live descriptor) – and the same
+    /// words are a V# of no records, so a buffer or constant read returns zero.
+    #[test]
+    fn null_descriptors_decode_to_their_kind() {
+        use ImageType::*;
+        for ty in [D1, D2, D3, Cube, D1Array, D2Array, D2Msaa, D2MsaaArray] {
+            for class in 0..3 {
+                let w = null_image_words(77, ty, class);
+                let i = image(&w).expect("a null T# is an image descriptor");
+                assert_eq!((i.ty, i.width, i.height, i.depth), (ty, 1, 1, 1), "{ty:?} class {class}");
+                assert_eq!(i.format, null_class_format(class));
+                assert_eq!((i.base_level, i.last_level), (0, 0));
+                assert_eq!(w[0], 77, "word 0 is the null SRV's heap index");
+                let v = buffer(&w[..4]);
+                assert_eq!((v.num_records, w[2]), (0, 0), "{ty:?} class {class}: a V# of no records too");
+            }
+        }
+        // a null V#: no records, an address of 0, and type bits below 8 so a copy leaves it
+        let v = null_buffer_words();
+        let b = buffer(&v);
+        assert_eq!((b.address, b.stride, b.num_records), (0, 0, 0));
+        assert!(v[3] >> 28 < 8, "a null V# is not an image to descriptor copies");
+        // the class formats are 128-bit: a shader's float4 / uint4 / int4 loads fit
+        assert_eq!((null_class_format(0), null_class_format(1), null_class_format(2)), (77, 75, 76));
+        assert_eq!((format_bytes(77), format_bytes(75), format_bytes(76)), (16, 16, 16));
+    }
 
     #[test]
     fn view_descriptors_decode_back() {

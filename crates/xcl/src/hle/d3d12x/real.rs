@@ -1062,16 +1062,31 @@ unsafe extern "system" fn dev_create_descriptor_heap_x(this: *mut c_void, desc: 
         return dev_create_descriptor_heap(this, desc as usize, riid, ppv);
     }
     // views: an SRV / UAV pair per console slot (in the shared shader-visible heap, the
-    // title's own a CPU-only mirror – `console_heap`); samplers: one per slot
-    let pc_n = if sampler { d[1] } else { d[1].saturating_mul(2) };
+    // title's own a CPU-only mirror – `console_heap`); samplers: one per slot, at most the
+    // PC limit – the slots above it share the scratch descriptors at the top of the heap
     let visible = d[2] & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE.0 as u32 != 0;
     let shared = match ID3D12Device::from_raw_borrowed(&this) {
         Some(dev) if !sampler && !desc.is_null() => super::console_heap::shared_heap(dev),
         _ => false,
     };
     let flags = if shared { d[2] & !(D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE.0 as u32) } else { d[2] };
-    let pc = [d[0], pc_n, flags, d[3]];
-    let hr = dev_create_descriptor_heap(this, pc.as_ptr() as usize, riid, ppv);
+    let cap = if sampler { super::console_heap::capped(super::console_heap::SAMPLER_MAX) } else { u32::MAX };
+    if sampler && d[1] > cap {
+        static N: AtomicU64 = AtomicU64::new(0);
+        if N.fetch_add(1, Ordering::Relaxed) < 4 {
+            crate::xlog_warn!("D3D12.X: a sampler heap of {} slots – the PC takes {cap}; the slots above it share the top quarter of the heap", d[1]);
+        }
+    }
+    let mut pc_n = if sampler { d[1].min(cap).max(1) } else { d[1].saturating_mul(2) };
+    // a driver that refuses the sampler heap as asked: half of it, down to one
+    let hr = loop {
+        let pc = [d[0], pc_n, flags, d[3]];
+        let hr = dev_create_descriptor_heap(this, pc.as_ptr() as usize, riid, ppv);
+        if hr >= 0 || !sampler || pc_n <= 1 {
+            break hr;
+        }
+        pc_n = (pc_n / 2).max(1);
+    };
     if hr >= 0 {
         let raw = *ppv;
         let heap = ID3D12DescriptorHeap::from_raw_borrowed(&raw).unwrap();
@@ -1095,16 +1110,18 @@ unsafe extern "system" fn dev_create_descriptor_heap_x(this: *mut c_void, desc: 
                 MinLOD: 0.0,
                 MaxLOD: 0.0,
             };
-            for k in 0..d[1] as u64 {
+            for k in 0..pc_n as u64 {
                 dev.CreateSampler(&zero, D3D12_CPU_DESCRIPTOR_HANDLE { ptr: (cpu + k * inc as u64) as usize });
             }
         }
-        if !super::console_heap::register(raw as usize, d[1], cpu, gpu, inc, sampler, shared, visible) {
+        if !super::console_heap::register(raw as usize, d[1], pc_n, cpu, gpu, inc, sampler, shared, visible) {
             crate::xlog_warn!("console descriptor heap: no room in UMA for {} slots", d[1]);
         }
     }
     hr
 }
+
+
 
 unsafe extern "system" fn dev_increment_size_x(this: *mut c_void, ty: u32) -> u32 {
     let ty = pc_heap_type(ty);
@@ -1146,6 +1163,100 @@ unsafe fn view_shape(res: &ID3D12Resource, format: windows::Win32::Graphics::Dxg
         _ => 1,
     };
     Some((fmt, ty, w, h, depth, mips))
+}
+
+/// The D3D12 view dimensions of the console's image types (SRV numbering).
+fn srv_dimension_kind(dim: i32) -> Option<crate::gpu::desc::ImageType> {
+    use crate::gpu::desc::ImageType as T;
+    Some(match dim {
+        2 => T::D1,
+        3 => T::D1Array,
+        4 => T::D2,
+        5 => T::D2Array,
+        6 => T::D2Msaa,
+        7 => T::D2MsaaArray,
+        8 => T::D3,
+        // the cube view, and the cube array that stands for it
+        9 | 10 => T::Cube,
+        _ => return None,
+    })
+}
+
+/// The format class (0 float, 1 uint, 2 int) of a view's DXGI format, 0 when it names none.
+fn view_class(format: i32) -> u32 {
+    crate::gpu::desc::gfx10_format(windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(format)).map_or(0, super::console_heap::format_class)
+}
+
+/// What a view of no resource asks the shader for, from the view's description: a buffer for
+/// a buffer view, else a texture of the view's dimension and format class.
+fn null_kind_of_srv(d: Option<&D3D12_SHADER_RESOURCE_VIEW_DESC>) -> super::console_heap::NullKind {
+    use super::console_heap::NullKind;
+    let Some(v) = d else { return NullKind::Image(crate::gpu::desc::ImageType::D2, 0) };
+    if v.ViewDimension == D3D12_SRV_DIMENSION_BUFFER {
+        return NullKind::Buffer;
+    }
+    NullKind::Image(srv_dimension_kind(v.ViewDimension.0).unwrap_or(crate::gpu::desc::ImageType::D2), view_class(v.Format.0))
+}
+
+fn null_kind_of_uav(d: Option<&D3D12_UNORDERED_ACCESS_VIEW_DESC>) -> super::console_heap::NullKind {
+    use super::console_heap::NullKind;
+    let Some(v) = d else { return NullKind::Image(crate::gpu::desc::ImageType::D2, 0) };
+    if v.ViewDimension == D3D12_UAV_DIMENSION_BUFFER {
+        return NullKind::Buffer;
+    }
+    // UAV dimensions: 2 tex1d, 3 tex1d array, 4 tex2d, 5 tex2d array, 8 tex3d
+    let ty = match v.ViewDimension.0 {
+        2 => crate::gpu::desc::ImageType::D1,
+        3 => crate::gpu::desc::ImageType::D1Array,
+        5 => crate::gpu::desc::ImageType::D2Array,
+        8 => crate::gpu::desc::ImageType::D3,
+        _ => crate::gpu::desc::ImageType::D2,
+    };
+    NullKind::Image(ty, view_class(v.Format.0))
+}
+
+/// A complete UAV description for a null resource: the caller's own (with the PC's format
+/// names), else one made from the resource. A NULL description is never passed: that makes a
+/// real null descriptor, and a title that then reads the slot as a typed view removes the
+/// device (0x887A0001) – at a depth buffer's null UAV views, at start-up.
+fn complete_uav_desc(rd: &D3D12_RESOURCE_DESC, d: Option<&D3D12_UNORDERED_ACCESS_VIEW_DESC>) -> D3D12_UNORDERED_ACCESS_VIEW_DESC {
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
+    if let Some(v) = pc_uav_desc(rd, d) {
+        return v;
+    }
+    if let Some(v) = d {
+        return *v;
+    }
+    let f = super::device_x::pc_unorm_format(super::device_x::pc_shader_view_format(rd.Format.0 as u32, 0));
+    let mut c = D3D12_UNORDERED_ACCESS_VIEW_DESC { Format: DXGI_FORMAT(f as i32), ..Default::default() };
+    match rd.Dimension {
+        D3D12_RESOURCE_DIMENSION_BUFFER => {
+            c.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+            let stride = if rd.Format.0 == 0 { 4 } else { crate::gpu::desc::format_bytes(crate::gpu::desc::gfx10_format(rd.Format).unwrap_or(22)) };
+            c.Anonymous.Buffer = D3D12_BUFFER_UAV { FirstElement: 0, NumElements: (rd.Width / stride.max(1) as u64) as u32, StructureByteStride: 0, CounterOffsetInBytes: 0, Flags: D3D12_BUFFER_UAV_FLAG_NONE };
+        }
+        D3D12_RESOURCE_DIMENSION_TEXTURE1D if rd.DepthOrArraySize > 1 => {
+            c.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE1DARRAY;
+            c.Anonymous.Texture1DArray = D3D12_TEX1D_ARRAY_UAV { MipSlice: 0, FirstArraySlice: 0, ArraySize: rd.DepthOrArraySize as u32 };
+        }
+        D3D12_RESOURCE_DIMENSION_TEXTURE1D => {
+            c.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE1D;
+            c.Anonymous.Texture1D = D3D12_TEX1D_UAV { MipSlice: 0 };
+        }
+        D3D12_RESOURCE_DIMENSION_TEXTURE3D => {
+            c.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE3D;
+            c.Anonymous.Texture3D = D3D12_TEX3D_UAV { MipSlice: 0, FirstWSlice: 0, WSize: rd.DepthOrArraySize as u32 };
+        }
+        _ if rd.DepthOrArraySize > 1 => {
+            c.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2DARRAY;
+            c.Anonymous.Texture2DArray = D3D12_TEX2D_ARRAY_UAV { MipSlice: 0, FirstArraySlice: 0, ArraySize: rd.DepthOrArraySize as u32, PlaneSlice: 0 };
+        }
+        _ => {
+            c.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+            c.Anonymous.Texture2D = D3D12_TEX2D_UAV { MipSlice: 0, PlaneSlice: 0 };
+        }
+    }
+    c
 }
 
 fn resource_dim_to_view(r: &D3D12_RESOURCE_DESC) -> i32 {
@@ -1991,6 +2102,16 @@ unsafe extern "system" fn dev_create_srv_x(this: *mut c_void, res: *mut c_void, 
     // view becomes the cube array of that one cube (a dimension mismatch is undefined in D3D12)
     let cube = desc.as_ref().and_then(cube_as_cube_array);
     let desc = cube.as_ref().map_or(desc, |v| v as *const _);
+    // A view of no resource (not a raytracing one, above): the console keeps a null T# and the
+    // PC gets a null descriptor of the kind the view asks for. A real description beside the
+    // null resource is a fault inside the driver (`[res+0x3c]`), and eight zero words make the
+    // shader read index 0 of the shared heap – a live descriptor of another kind. So the slot
+    // is written as a null of its own kind and no view is made in the title's heap.
+    if res.is_null() {
+        let dev = ID3D12Device::from_raw_borrowed(&this).unwrap();
+        super::console_heap::write_null(&dev, &slot, null_kind_of_srv(desc.as_ref()));
+        return;
+    }
     f(this, res, desc, slot.pc_srv);
     super::console_heap::publish(&slot, false);
     super::console_heap::note_resource(&slot, res as usize);
@@ -2162,15 +2283,29 @@ unsafe extern "system" fn dev_create_uav_x(this: *mut c_void, res: *mut c_void, 
         }
     }
     // a resource without ALLOW_UNORDERED_ACCESS (a console depth buffer that also had it: the PC
-    // refuses the pair, `device_x::pc_resource_desc`): a null view – a UAV of it is an invalid
-    // call, and the device is removed (0x887A0001)
+    // refuses the pair, `device_x::pc_resource_desc`), or no resource at all: a typed null UAV.
+    // Its description is always complete – a NULL description made a real null descriptor the
+    // title then read as a typed view, and the device was removed (0x887A0001).
     let no_uav = ID3D12Resource::from_raw_borrowed(&res).is_some_and(|r| r.GetDesc().Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0);
-    let null_desc = D3D12_UNORDERED_ACCESS_VIEW_DESC { Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32_FLOAT, ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2D, ..Default::default() };
+    let null_desc = ID3D12Resource::from_raw_borrowed(&res)
+        .map(|r| complete_uav_desc(&r.GetDesc(), desc.as_ref()))
+        .unwrap_or_else(|| {
+            let rd = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                Width: 1,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM,
+                ..Default::default()
+            };
+            complete_uav_desc(&rd, desc.as_ref())
+        });
     let pc_uav = |at: u64| {
-        if no_uav {
+        if no_uav || res.is_null() {
             static N: AtomicU64 = AtomicU64::new(0);
-            if N.fetch_add(1, Ordering::Relaxed) < 4 {
-                crate::xlog_warn!("D3D12.X: a UAV of a resource that cannot have one on the PC (a depth buffer) – a null view");
+            if no_uav && N.fetch_add(1, Ordering::Relaxed) < 4 {
+                crate::xlog_warn!("D3D12.X: a UAV of a resource that cannot have one on the PC (a depth buffer) – a typed null view");
             }
             f(this, std::ptr::null_mut(), std::ptr::null_mut(), &null_desc, at)
         } else {
@@ -2182,7 +2317,9 @@ unsafe extern "system" fn dev_create_uav_x(this: *mut c_void, res: *mut c_void, 
     super::console_heap::publish(&slot, true);
     super::console_heap::note_resource(&slot, res as usize);
     let Some(r) = ID3D12Resource::from_raw_borrowed(&res) else {
-        return super::console_heap::write(&slot, &[0; 8]);
+        let dev = ID3D12Device::from_raw_borrowed(&this).unwrap();
+        return super::console_heap::write_null(&dev, &slot, null_kind_of_uav(desc.as_ref()));
+
     };
     let rd = r.GetDesc();
     if let Some(v) = desc.as_ref().filter(|v| v.ViewDimension == D3D12_UAV_DIMENSION_BUFFER) {
@@ -5197,7 +5334,7 @@ mod readback_routing_tests {
             // Console-slot paths (`copy_console_slots` invoked from both Simple and Ranges)
             let heap_obj = 0x5555_DEADusize;
             if crate::gpu::uma::get().is_some()
-                && super::super::console_heap::register(heap_obj, 4, 0x10_0000, 0, 32, false, false, false)
+                && super::super::console_heap::register(heap_obj, 4, 4, 0x10_0000, 0, 32, false, false, false)
             {
                 let start = super::super::console_heap::start(heap_obj).unwrap();
                 let dst_h = start + super::super::console_heap::SLOT as u64;
@@ -5432,5 +5569,213 @@ mod console_format_query_tests {
             let pc = unsafe { dev.GetResourceAllocationInfo(0, &[d]) };
             assert!(pc.SizeInBytes != u64::MAX && pc.SizeInBytes >= 1920 * 1080 * 4 && pc.Alignment > 0, "PC {format} as {}: {:#x}", d.Format.0, pc.SizeInBytes);
         }
+    }
+}
+
+#[cfg(test)]
+mod console_pso_guard_tests {
+    use super::*;
+
+    /// Minimal synthetic DXBC container with a DXIL part carrying `XDAT` (what `pso::is_console`
+    /// recognizes as console bytecode).
+    fn synthetic_console_shader() -> Vec<u8> {
+        let mut dxil = vec![0u8; 28];
+        dxil[24..28].copy_from_slice(b"XDAT");
+        let part_offset = 36u32;
+        let total = part_offset as usize + 8 + dxil.len();
+        let mut blob = Vec::with_capacity(total);
+        blob.extend_from_slice(b"DXBC");
+        blob.extend_from_slice(&[0u8; 16]); // hash
+        blob.extend_from_slice(&1u32.to_le_bytes()); // version
+        blob.extend_from_slice(&(total as u32).to_le_bytes());
+        blob.extend_from_slice(&1u32.to_le_bytes()); // part count
+        blob.extend_from_slice(&part_offset.to_le_bytes());
+        blob.extend_from_slice(b"DXIL");
+        blob.extend_from_slice(&(dxil.len() as u32).to_le_bytes());
+        blob.extend_from_slice(&dxil);
+        blob
+    }
+
+    fn push_shader_subobject(stream: &mut Vec<u8>, ty: u32, blob: &[u8]) {
+        stream.extend_from_slice(&ty.to_le_bytes());
+        stream.extend_from_slice(&0u32.to_le_bytes()); // 8-byte alignment pad
+        stream.extend_from_slice(&(blob.as_ptr() as u64).to_le_bytes());
+        stream.extend_from_slice(&(blob.len() as u64).to_le_bytes());
+    }
+
+    #[test]
+    fn graphics_desc_detects_console_shader_in_any_stage() {
+        let console = synthetic_console_shader();
+        assert!(crate::gpu::recomp::pso::is_console(&console));
+        let pc = dummy().vs.as_slice();
+        assert!(!crate::gpu::recomp::pso::is_console(pc));
+
+        let empty = D3D12_GRAPHICS_PIPELINE_STATE_DESC::default();
+        assert!(!unsafe { graphics_has_console_shader(&empty as *const _ as *const c_void) });
+        assert!(!unsafe { graphics_has_console_shader(std::ptr::null()) });
+
+        let pc_only = D3D12_GRAPHICS_PIPELINE_STATE_DESC { VS: bytecode(pc), PS: bytecode(&dummy().ps), ..Default::default() };
+        assert!(!unsafe { graphics_has_console_shader(&pc_only as *const _ as *const c_void) });
+
+        for stage in 0..5 {
+            let mut d = pc_only.clone();
+            match stage {
+                0 => d.VS = bytecode(&console),
+                1 => d.PS = bytecode(&console),
+                2 => d.DS = bytecode(&console),
+                3 => d.HS = bytecode(&console),
+                _ => d.GS = bytecode(&console),
+            }
+            assert!(unsafe { graphics_has_console_shader(&d as *const _ as *const c_void) }, "stage {stage}");
+        }
+    }
+
+    #[test]
+    fn pipeline_stream_detects_console_shader_subobjects() {
+        let console = synthetic_console_shader();
+        let pc = dummy().vs.as_slice();
+
+        let mut pc_stream = Vec::new();
+        push_shader_subobject(&mut pc_stream, 1, pc);
+        let desc = [pc_stream.len(), pc_stream.as_ptr() as usize];
+        assert!(!unsafe { stream_has_console_shader(desc.as_ptr() as *const c_void) });
+        assert!(!unsafe { stream_has_console_shader(std::ptr::null()) });
+
+        for ty in [1u32, 2, 3, 4, 5, 6, 24, 25] {
+            let mut s = Vec::new();
+            push_shader_subobject(&mut s, ty, &console);
+            let d = [s.len(), s.as_ptr() as usize];
+            assert!(unsafe { stream_has_console_shader(d.as_ptr() as *const c_void) }, "subobject {ty}");
+        }
+    }
+
+    #[test]
+    fn mesh_streams_are_found_by_kind_not_by_slot() {
+        use crate::gpu::xbox::tests::{fssm, sample, CODE};
+        let mesh = sample(13, &[fssm(&CODE, &[(7, 6)])]);
+        let amp = sample(14, &[fssm(&CODE, &[(7, 6)])]);
+        assert_eq!(crate::gpu::xbox::parse(&mesh).unwrap().stage, "MS");
+        assert_eq!(crate::gpu::xbox::parse(&amp).unwrap().stage, "AS");
+        let subs_of = |list: &[(u32, &[u8])]| {
+            let mut s = Vec::new();
+            for &(ty, blob) in list {
+                push_shader_subobject(&mut s, ty, blob);
+            }
+            s
+        };
+        let classify = |buf: &[u8]| {
+            let subs = stream_subobjects(buf).expect("a stream");
+            let (m, a) = console_mesh_programs(&subs);
+            (m.map(|c| c.as_ptr()), a.map(|c| c.as_ptr()))
+        };
+        let m = |list: &[(u32, &[u8])]| classify(&subs_of(list));
+        // the console's form: the mesh program in subobject 24 (the PC's AS slot), no 25
+        assert_eq!(m(&[(24, &mesh)]), (Some(mesh.as_ptr()), None));
+        // the PC's form, and both in the console's numbering
+        assert_eq!(m(&[(25, &mesh)]), (Some(mesh.as_ptr()), None));
+        assert_eq!(m(&[(24, &mesh), (25, &amp)]), (Some(mesh.as_ptr()), Some(amp.as_ptr())));
+        assert_eq!(m(&[(25, &amp), (24, &mesh)]), (Some(mesh.as_ptr()), Some(amp.as_ptr())));
+        // a PC shader in either slot is not a console mesh program
+        let pc = dummy().vs.as_slice();
+        assert_eq!(m(&[(24, pc)]), (None, None));
+        assert_eq!(m(&[(25, pc)]), (None, None));
+    }
+
+    #[test]
+    fn fallback_stream_rewrites_console_rtv_and_dsv_formats() {
+        let console = synthetic_console_shader();
+        let mut s = Vec::new();
+        push_shader_subobject(&mut s, 1, &console);
+        // subobject 15: D3D12_RT_FORMAT_ARRAY (8 × DXGI_FORMAT + NumRenderTargets)
+        s.extend_from_slice(&15u32.to_le_bytes());
+        let rtv_off = s.len();
+        for f in [116u32, 117, 86, 115, 28, 0, 0, 0, 5] {
+            s.extend_from_slice(&f.to_le_bytes());
+        }
+        // subobject 16: DSVFormat = D16_UNORM_S8_UINT (118)
+        s.extend_from_slice(&16u32.to_le_bytes());
+        let dsv_off = s.len();
+        s.extend_from_slice(&118u32.to_le_bytes());
+
+        let desc = [s.len(), s.as_ptr() as usize];
+        let (out, _) = unsafe { fallback_stream(desc.as_ptr() as *const u8) }.expect("fallback stream");
+        let vs_ptr = u64::from_le_bytes(out[8..16].try_into().unwrap()) as usize;
+        assert_eq!(vs_ptr, dummy().vs.as_ptr() as usize, "console VS replaced with dummy VS");
+
+        let rtv: [u32; 8] = std::array::from_fn(|k| u32::from_le_bytes(out[rtv_off + 4 * k..rtv_off + 4 * k + 4].try_into().unwrap()));
+        assert_eq!(rtv, [10, 10, 28, 28, 28, 0, 0, 0]);
+        let dsv = u32::from_le_bytes(out[dsv_off..dsv_off + 4].try_into().unwrap());
+        assert_eq!(dsv, 45);
+    }
+}
+
+#[cfg(test)]
+mod null_view_tests {
+    use super::{complete_uav_desc, null_kind_of_srv, null_kind_of_uav};
+    use windows::Win32::Graphics::Direct3D12::*;
+
+    /// A depth buffer's texture, as `pc_resource_desc` makes it on the PC: typeless, no UAV.
+    fn depth_desc() -> D3D12_RESOURCE_DESC {
+        D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 1920,
+            Height: 1080,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            // R24G8_TYPELESS: a depth buffer that a console title also made UAV views of
+            Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(44),
+            ..Default::default()
+        }
+    }
+
+    /// A null UAV of a depth-format resource carries a complete, typed description: a NULL
+    /// description made a real null descriptor, and a typed read of it removed the device.
+    #[test]
+    fn a_null_uav_of_a_depth_buffer_is_a_typed_null() {
+        let d = complete_uav_desc(&depth_desc(), None);
+        assert_ne!(d.Format.0, 0, "the description names a format");
+        assert_eq!(d.ViewDimension, D3D12_UAV_DIMENSION_TEXTURE2D);
+        assert_ne!(d.Anonymous.Texture2D.MipSlice, u32::MAX, "the union member is initialized");
+        // a caller's description with a format of its own is kept (as the PC's names)
+        let named = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+            Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(46),
+            ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2D,
+            ..Default::default()
+        };
+        let d = complete_uav_desc(&depth_desc(), Some(&named));
+        assert_eq!(d.Format.0, 46);
+        assert_eq!(d.ViewDimension, D3D12_UAV_DIMENSION_TEXTURE2D);
+        // a caller's description with no format takes the resource's, never zero
+        let unnamed = D3D12_UNORDERED_ACCESS_VIEW_DESC { Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(0), ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2D, ..Default::default() };
+        assert_ne!(complete_uav_desc(&depth_desc(), Some(&unnamed)).Format.0, 0);
+        // a buffer resource gets a buffer description
+        let b = D3D12_RESOURCE_DESC { Dimension: D3D12_RESOURCE_DIMENSION_BUFFER, Width: 4096, Height: 1, DepthOrArraySize: 1, MipLevels: 1, ..Default::default() };
+        let d = complete_uav_desc(&b, None);
+        assert_eq!(d.ViewDimension, D3D12_UAV_DIMENSION_BUFFER);
+        assert!(d.Anonymous.Buffer.NumElements > 0);
+    }
+
+    /// A null SRV/UAV names the kind its description asks for, so the console slot it writes
+    /// is a null of that kind (a buffer, or a texture of that dimension) and never index 0 of
+    /// some other kind. No description at all: a 2D float texture, the common case.
+    #[test]
+    fn a_view_of_no_resource_keeps_the_kind_it_asks_for() {
+        use super::super::console_heap::NullKind;
+        use crate::gpu::desc::ImageType as T;
+        assert_eq!(null_kind_of_srv(None), NullKind::Image(T::D2, 0));
+        let buffer = D3D12_SHADER_RESOURCE_VIEW_DESC { ViewDimension: D3D12_SRV_DIMENSION_BUFFER, ..Default::default() };
+        assert_eq!(null_kind_of_srv(Some(&buffer)), NullKind::Buffer);
+        let tex = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2DARRAY,
+            Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UINT,
+            ..Default::default()
+        };
+        assert_eq!(null_kind_of_srv(Some(&tex)), NullKind::Image(T::D2Array, 1), "uint stays uint");
+        let cube = D3D12_SHADER_RESOURCE_VIEW_DESC { ViewDimension: D3D12_SRV_DIMENSION_TEXTURECUBE, Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32_FLOAT, ..Default::default() };
+        assert_eq!(null_kind_of_srv(Some(&cube)), NullKind::Image(T::Cube, 0));
+        let ub = D3D12_UNORDERED_ACCESS_VIEW_DESC { ViewDimension: D3D12_UAV_DIMENSION_BUFFER, ..Default::default() };
+        assert_eq!(null_kind_of_uav(Some(&ub)), NullKind::Buffer);
+        let u3 = D3D12_UNORDERED_ACCESS_VIEW_DESC { ViewDimension: D3D12_UAV_DIMENSION_TEXTURE3D, Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32_SINT, ..Default::default() };
+        assert_eq!(null_kind_of_uav(Some(&u3)), NullKind::Image(T::D3, 2), "sint stays sint");
     }
 }

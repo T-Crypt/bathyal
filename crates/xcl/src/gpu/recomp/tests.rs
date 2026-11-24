@@ -3224,7 +3224,7 @@ fn gpu_sparse_vram_descriptors_buffers_and_xmem() {
 
     // 1. Console descriptor heap in Window 0 sparse VRAM (32-bit hi = 0 table addressing)
     let heap_obj = 0xDEAD_5EA7usize;
-    assert!(crate::hle::d3d12x::console_heap::register(heap_obj, 4, 0x1000, 0x5000, 32, false, false, true));
+    assert!(crate::hle::d3d12x::console_heap::register(heap_obj, 4, 4, 0x1000, 0x5000, 32, false, false, true));
     let heap_va = crate::hle::d3d12x::console_heap::start(heap_obj).unwrap() as usize;
     assert_eq!(u.window_of(heap_va), Some(0), "descriptor heap must live in window 0");
     assert!(u.is_sparse(heap_va), "descriptor heap must live in sparse VRAM");
