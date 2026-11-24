@@ -5437,6 +5437,9 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
         stop_if_device_removed();
         return;
     }
+    // objects whose submissions are done are freed, and their descriptor slots nulled, before
+    // the GPU can read a heap this submission binds
+    super::lifetime::poll();
     // textures in title memory the CPU wrote since: uploaded again first
     super::title_textures::refresh(this);
     // console-shaped lists run as the PC lists they were translated into
