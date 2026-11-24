@@ -3229,16 +3229,16 @@ mod tests {
         }
     }
 
-    /// A BC7 BCPack request (no decoder, no game data) completes under the default switch:
+    /// A BC2 BCPack request (no decoder, no game data) completes under the default switch:
     /// S_OK, the fence after it signals, and the destination holds the placeholder block. With
     /// `XCL_BCPACK_PLACEHOLDER=0` it fails as before.
     #[test]
     fn an_undecodable_bcpack_request_completes_with_a_placeholder_block() {
         let _env = ENV_LOCK.lock().unwrap();
-        // the block decodes as one mid-grey, opaque colour in the reference BC7 decoder
-        let block = bcpack_placeholder_block(7).unwrap();
-        assert_eq!(block, BC7_GREY.to_vec());
-        assert!(bc7_mode6_texels(&block).iter().all(|t| *t == [127, 127, 127, 255]), "BC7 placeholder: mid grey, opaque");
+        // BC2 has no decoder: its placeholder is explicit alpha 15 and solid magenta
+        let block = bcpack_placeholder_block(2).unwrap();
+        assert_eq!((block.len(), &block[..8]), (16, &[0xFF; 8][..]), "BC2 explicit alpha 15");
+        assert!(bc1_texels(&block[8..], true).iter().all(|t| *t == [255, 0, 255, 255]), "BC2 placeholder: magenta");
         assert_eq!((bcpack_placeholder_block(8), bcpack_placeholder_block(0)), (None, None), "no block size: still refused");
         unsafe {
             let mut f = std::ptr::null_mut();
@@ -3288,11 +3288,11 @@ mod tests {
             let (q, s) = new_queue(f, 8);
             let n = 0x1008usize; // a part block at the end
             let mut dst = vec![0xCDu8; n + 64];
-            let before = PLACEHOLDERS.requests[7].load(Ordering::Relaxed);
-            assert_eq!(run(q, s, &mut dst, n as u32, 7, 0), S_OK, "the placeholder completes");
-            assert!(dst[..n].chunks(16).all(|c| c == &block[..c.len()]), "solid BC7 blocks up to the destination size");
+            let before = PLACEHOLDERS.requests[2].load(Ordering::Relaxed);
+            assert_eq!(run(q, s, &mut dst, n as u32, 2, 0), S_OK, "the placeholder completes");
+            assert!(dst[..n].chunks(16).all(|c| c == &block[..c.len()]), "solid BC2 blocks up to the destination size");
             assert!(dst[n..].iter().all(|&b| b == 0xCD), "nothing past the destination size");
-            assert!(PLACEHOLDERS.requests[7].load(Ordering::Relaxed) > before, "the placeholder is counted");
+            assert!(PLACEHOLDERS.requests[2].load(Ordering::Relaxed) > before, "the placeholder is counted");
 
             // the signal enqueued after it reaches the fence, as for a normal request
             let (_, _, submit) = table(q);
@@ -3313,11 +3313,11 @@ mod tests {
             queue_release(q);
             status_release(s);
 
-            // opt-out: the same BC7 request fails as before and writes nothing
+            // opt-out: the same BC2 request fails as before and writes nothing
             let _off = EnvVar::set("XCL_BCPACK_PLACEHOLDER", "0");
             let (q, s) = new_queue(f, 4);
             let mut dst0 = vec![0xCDu8; n + 64];
-            assert_eq!(run(q, s, &mut dst0, n as u32, 7, 0), E_DECOMPRESSION, "with XCL_BCPACK_PLACEHOLDER=0 it fails");
+            assert_eq!(run(q, s, &mut dst0, n as u32, 2, 0), E_DECOMPRESSION, "with XCL_BCPACK_PLACEHOLDER=0 it fails");
             assert!(dst0.iter().all(|&b| b == 0xCD), "with XCL_BCPACK_PLACEHOLDER=0 the destination is left as it was");
             queue_close(q);
             queue_release(q);

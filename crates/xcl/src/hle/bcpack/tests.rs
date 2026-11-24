@@ -108,12 +108,15 @@ fn bc1_fixtures_decode_to_their_blocks() {
         }
         assert_eq!(super::decode(1, &bin, units * 8).as_deref(), Ok(&blocks[..]), "{stem}");
     }
-    // the modes without a block rebuild
-    for mode in [0u8, 2, 3, 4, 6, 7, 8, 15] {
+    // no lane layout or mode: refused; the modes with a block rebuild (ours for BC1/BC5, the
+    // ported decoder for BC3/BC4/BC6H/BC7) decode
+    for mode in [0u8, 2, 8, 15] {
         assert!(!super::can_decode(mode));
         assert_eq!(super::decode(mode, &[], 16), Err(Error::Unsupported));
     }
-    assert!(super::can_decode(5));
+    for mode in [1u8, 3, 4, 5, 6, 7] {
+        assert!(super::can_decode(mode), "mode {mode}");
+    }
 }
 
 /// One BC1 block by hand: every field of the rebuild, without the entropy stage.
