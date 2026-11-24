@@ -6173,9 +6173,9 @@ mod mesh_stream_kind_tests {
     /// `stream_subobjects`).
     fn push_shader_subobject(stream: &mut Vec<u8>, ty: u32, blob: &[u8]) {
         stream.extend_from_slice(&ty.to_le_bytes());
-        stream.extend_from_slice(&[0u8; 4]);
-        stream.extend_from_slice(&(blob.len() as u64).to_le_bytes());
+        stream.extend_from_slice(&0u32.to_le_bytes()); // 8-byte alignment pad
         stream.extend_from_slice(&(blob.as_ptr() as u64).to_le_bytes());
+        stream.extend_from_slice(&(blob.len() as u64).to_le_bytes());
     }
 
     /// A console mesh program passes as an MS, an amplification program as an AS, whatever
