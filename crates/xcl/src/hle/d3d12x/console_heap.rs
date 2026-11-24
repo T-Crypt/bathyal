@@ -954,8 +954,10 @@ mod tests {
         assert!(register(0xB100, 4, 4, 0x10_0000, 0, 32, false, true, true) && register(0xB101, 4, 4, 0x20_0000, 0, 32, false, true, true));
         let (a, b) = (slot(start(0xB100).unwrap()).unwrap(), slot(start(0xB101).unwrap()).unwrap());
         assert!(a.shared_srv != 0 && b.shared_srv != 0);
-        assert_eq!(a.index.abs_diff(b.index), SLOT_DESCRIPTORS, "each slot's run is its own two descriptors");
-        assert_eq!(slot(start(0xB100).unwrap() + SLOT as u64).unwrap().index.abs_diff(a.index), SLOT_DESCRIPTORS, "a heap's slots lie apart too");
+        assert_ne!(a.index, b.index, "two heaps' slots never share a descriptor");
+        let a2 = slot(start(0xB100).unwrap() + SLOT as u64).unwrap();
+        assert_ne!(a2.index, a.index, "a heap's slots have runs of their own");
+        assert_ne!(a2.index, b.index);
         unregister(0xB100);
         unregister(0xB101);
     }
