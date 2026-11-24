@@ -136,7 +136,7 @@ pub fn report() -> (u64, u64, u64) {
 /// The recorded value for `va` and whether the submission that will store it has completed on
 /// its queue. On `reader` itself the writer is accepted as done (GPU order, or the same-queue
 /// write that no CPU-side gate can wait for without deadlocking).
-fn recorded_for(va: u64, width: u8, reader: usize) -> Option<(u64, bool)> {
+pub(super) fn recorded_for(va: u64, width: u8, reader: usize) -> Option<(u64, bool)> {
     let (value, writer) = {
         let g = IMMEDIATES.lock().unwrap_or_else(|e| e.into_inner());
         let m = g.as_ref()?;
@@ -460,7 +460,7 @@ unsafe fn run(queue: usize, op: &Op, immediates: &[u64]) -> i32 {
     }
     let q_raw = queue as *mut c_void;
     match op {
-        Op::Lists(_) => submit_lists_now(queue, lists, immediates),
+        Op::Lists(list_ids) => submit_lists_now(queue, list_ids, immediates),
         Op::Signal(fence, value) => {
             let f: unsafe extern "system" fn(*mut c_void, *mut c_void, u64) -> i32 =
                 std::mem::transmute_copy(&super::real::orig_fn(q_raw, PC_SIGNAL));
