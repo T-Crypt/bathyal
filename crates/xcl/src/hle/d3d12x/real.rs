@@ -2066,7 +2066,7 @@ unsafe extern "system" fn dev_create_srv_x(this: *mut c_void, res: *mut c_void, 
         copy = Some(v);
     }
     let desc = copy.as_ref().map_or(desc, |c| c as *const _);
-    let Some(slot) = super::console_heap::slot(cpu) else { return f(this, res, null_swapped(res, desc), cpu) };
+    let Some(slot) = super::console_heap::slot(cpu) else { return f(this, res, desc, cpu) };
     // Raytracing acceleration structure SRV (pResource == NULL, Location == console GPU VA):
     // translated shaders read BVH nodes from UMA (`bvh_intersect`), never from a PC DXR SRV,
     // so write the RDNA2 BVH descriptor directly and skip forwarding the console VA to PC.
@@ -2087,7 +2087,7 @@ unsafe extern "system" fn dev_create_srv_x(this: *mut c_void, res: *mut c_void, 
     // view becomes the cube array of that one cube (a dimension mismatch is undefined in D3D12)
     let cube = desc.as_ref().and_then(cube_as_cube_array);
     let desc = cube.as_ref().map_or(desc, |v| v as *const _);
-    f(this, res, null_swapped(res, desc), slot.pc_srv);
+    f(this, res, desc, slot.pc_srv);
     super::console_heap::publish(&slot, false);
     super::console_heap::note_resource(&slot, res as usize);
     if super::present::trace_frame() && super::title_textures::address(res as usize).is_some() {
