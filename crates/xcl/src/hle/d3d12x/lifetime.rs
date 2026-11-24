@@ -53,6 +53,7 @@ struct State {
 
 static STATE: Mutex<Option<State>> = Mutex::new(None);
 
+#[cfg(test)]
 fn with<R>(f: impl FnOnce(&mut State) -> R) -> R {
     let mut g = STATE.lock().unwrap_or_else(|e| e.into_inner());
     f(g.get_or_insert_with(State::default))
