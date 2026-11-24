@@ -2204,6 +2204,11 @@ impl Em {
             self.line(&format!("if ({act}) {{ {} }}", st.join(" ")));
             return Ok(());
         }
+        // gather4h / gather4h_pck / gather8h_pck fetch a horizontal row of texels, not the 2x2
+        // footprint of Gather: rejected until the row's position and rounding are measured
+        if base.starts_with("gather4h") || base.starts_with("gather8h") {
+            return Err("image_gather4h");
+        }
         // body coordinates per DIM: 1D, 2D, 3D, CUBE, 1D_ARRAY, 2D_ARRAY, 2D_MSAA, 2D_MSAA_ARRAY
         let body = [1u64, 2, 3, 3, 2, 3, 3, 4][dim as usize];
         let sampling = base.starts_with("sample") || base.starts_with("gather4");

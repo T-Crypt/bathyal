@@ -7965,6 +7965,18 @@ fn float_compares_random(wave64: bool) {
     assert_eq!(total_bad, 0);
 }
 
+/// image_gather4h(_pck) / image_gather8h_pck read a row of texels: not translated as a 2x2 Gather.
+#[test]
+fn image_gather4h_is_unsupported() {
+    for name in ["IMAGE_GATHER4H", "IMAGE_GATHER4H_PCK", "IMAGE_GATHER8H_PCK"] {
+        let code = prog(&[(name, "ENC_MIMG", &[("VDATA", 10), ("VADDR", 0), ("SRSRC", 4), ("SSAMP", 6), ("DMASK", 0x1), ("DIM", 1)], None)]);
+        let t = translate(&code, &Options::default()).unwrap();
+        assert!(!t.complete(), "{name}\n{}", t.hlsl);
+        let key = format!("{}: image_gather4h", name.to_ascii_lowercase());
+        assert!(t.unsupported_why.contains_key(&key), "{name}: {:?}", t.unsupported_why);
+    }
+}
+
 fn hwreg_imm(id: u64, offset: u64, width: u64) -> u64 {
     id | (offset << 6) | ((width - 1) << 11)
 }
