@@ -1546,7 +1546,12 @@ pub(super) fn set_test_buffer_delta(res: usize, delta: Option<u64>) {
     }
 }
 
-/// The heap `res` lives in (None: none to ask – a reserved resource).
+/// Whether the PC's Map works on `res`: not a reserved resource, and its heap has CPU pages.
+unsafe fn pc_can_map(res: *mut c_void) -> bool {
+    !is_reserved(res as usize) && pc_mappable(heap_properties(res))
+}
+
+/// The heap `res` lives in (not to be asked of a reserved resource).
 unsafe fn heap_properties(res: *mut c_void) -> Option<D3D12_HEAP_PROPERTIES> {
     let r = ID3D12Resource::from_raw_borrowed(&res)?;
     let mut p = D3D12_HEAP_PROPERTIES::default();
@@ -1594,7 +1599,7 @@ unsafe extern "system" fn res_map(this: *mut c_void, sub: u32, range: *const c_v
     }
     // the PC's Map only on a resource it can map: on a reserved one or one without CPU pages it is
     // an invalid call (debug layer 824 / 822) that the runtime answers with E_INVALIDARG
-    let hr = if pc_mappable(heap_properties(this)) {
+    let hr = if pc_can_map(this) {
         let f: unsafe extern "system" fn(*mut c_void, u32, *const c_void, *mut *mut c_void) -> HRESULT = std::mem::transmute(orig_fn(this, slot_of(this, "Map")));
         f(this, sub, range, data)
     } else {
@@ -1759,6 +1764,9 @@ unsafe extern "system" fn res_release(this: *mut c_void) -> u32 {
             s.remove(&(this as usize));
         }
         if let Some(s) = SPARSE_READBACK.lock().unwrap().as_mut() {
+            s.remove(&(this as usize));
+        }
+        if let Some(s) = RESERVED.lock().unwrap().as_mut() {
             s.remove(&(this as usize));
         }
         if let Some(m) = BUFFER_DELTA.lock().unwrap().as_mut() {
@@ -3200,8 +3208,33 @@ unsafe fn pc_allocation_size(device: *mut c_void, d: &[u8; 0x38]) -> u64 {
     r[0]
 }
 creator!(dev_create_placed_resource1, "CreatePlacedResource1", Kind::Resource, [a1, a2, a3, a4, a5]);
-creator!(dev_create_reserved_resource, "CreateReservedResource", Kind::Resource, [a1, a2, a3]);
-creator!(dev_create_reserved_resource1, "CreateReservedResource1", Kind::Resource, [a1, a2, a3, a4]);
+creator!(pc_create_reserved_resource, "CreateReservedResource", Kind::Resource, [a1, a2, a3]);
+creator!(pc_create_reserved_resource1, "CreateReservedResource1", Kind::Resource, [a1, a2, a3, a4]);
+
+/// Resources made with CreateReservedResource(1): they have no heap, so `res_map` asks none of
+/// them (GetHeapProperties on one is an invalid call too, debug layer 901).
+static RESERVED: Mutex<Option<HashSet<usize>>> = Mutex::new(None);
+
+unsafe fn note_reserved(hr: HRESULT, ppv: *mut *mut c_void) -> HRESULT {
+    if hr >= 0 && !ppv.is_null() && !(*ppv).is_null() {
+        RESERVED.lock().unwrap().get_or_insert_with(HashSet::new).insert(*ppv as usize);
+    }
+    hr
+}
+
+fn is_reserved(res: usize) -> bool {
+    RESERVED.lock().unwrap().as_ref().is_some_and(|s| s.contains(&res))
+}
+
+/// CreateReservedResource
+pub(super) unsafe extern "system" fn dev_create_reserved_resource(this: *mut c_void, a1: usize, a2: usize, a3: usize, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+    note_reserved(pc_create_reserved_resource(this, a1, a2, a3, riid, ppv), ppv)
+}
+
+/// CreateReservedResource1
+pub(super) unsafe extern "system" fn dev_create_reserved_resource1(this: *mut c_void, a1: usize, a2: usize, a3: usize, a4: usize, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+    note_reserved(pc_create_reserved_resource1(this, a1, a2, a3, a4, riid, ppv), ppv)
+}
 creator!(dev_create_heap_pc, "CreateHeap", Kind::Heap, [a1]);
 
 /// D3D12_HEAP_FLAGS the PC knows: SHARED 0x1, DENY_BUFFERS 0x4, ALLOW_DISPLAY 0x8,
@@ -7106,7 +7139,7 @@ mod map_tests {
                 r.unwrap()
             };
             let heap = |t| D3D12_HEAP_PROPERTIES { Type: t, ..Default::default() };
-            let mappable = |r: &ID3D12Resource| pc_mappable(heap_properties(r.as_raw()));
+            let mappable = |r: &ID3D12Resource| pc_can_map(r.as_raw());
 
             assert!(mappable(&buffer(heap(D3D12_HEAP_TYPE_UPLOAD), D3D12_RESOURCE_STATE_GENERIC_READ)));
             assert!(mappable(&buffer(heap(D3D12_HEAP_TYPE_READBACK), D3D12_RESOURCE_STATE_COPY_DEST)));
@@ -7135,8 +7168,12 @@ mod map_tests {
             let mut reserved: Option<ID3D12Resource> = None;
             if dev.CreateReservedResource(&desc, D3D12_RESOURCE_STATE_COMMON, None, &mut reserved).is_ok() {
                 let r = reserved.unwrap();
-                assert!(heap_properties(r.as_raw()).is_none());
-                assert!(!mappable(&r));
+                let mut raw = r.as_raw();
+                assert!(!is_reserved(raw as usize));
+                // what dev_create_reserved_resource does with what the PC made
+                note_reserved(S_OK, &mut raw);
+                assert!(is_reserved(raw as usize) && !pc_can_map(raw), "a reserved resource is not asked for its heap");
+                RESERVED.lock().unwrap().as_mut().unwrap().remove(&(raw as usize));
             }
         }
     }
