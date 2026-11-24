@@ -838,6 +838,16 @@ unsafe fn class_for(obj: *mut c_void, orig: usize, kind: Kind) -> usize {
             let pc = if newer < scanned { *ot.add(newer) } else { v[1 + newer] };
             v[1 + newer] = super::guard::make_layout_split(super::guard::LayoutTargets { older: v[1 + newer], newer: f, pc, newer_layout: &QUEUE_SHIFTED });
         }
+        // the newer layout's shading-rate methods (#126 / #127): PC methods on a PC-shaped
+        // call, a stub for anything else
+        for (newer, _pc) in NEWER_SHADING_RATE_SLOTS {
+            let Some(f) = newer_shading_rate_handler(newer) else { continue };
+            if newer >= total {
+                continue;
+            }
+            let pc = if newer < scanned { *ot.add(newer) } else { v[1 + newer] };
+            v[1 + newer] = super::guard::make_layout_split(super::guard::LayoutTargets { older: v[1 + newer], newer: f, pc, newer_layout: &QUEUE_SHIFTED });
+        }
     }
     // XCL_D3D12_TRACE: every public method called from console code is logged
     if std::env::var_os("XCL_D3D12_TRACE").is_some() {
@@ -1050,7 +1060,8 @@ fn console_slots(kind: Kind) -> Vec<(usize, usize)> {
                 (93, l::kickoff_x as usize),
                 (94, l::set_depth_bias_x as usize),
                 // DispatchMesh after RSSetShadingRate / RSSetShadingRateImage (#124 / #125) as on
-                // the PC – inferred, see `bind::dispatch_mesh`
+                // the PC – inferred, not seen in a title yet; on the newer layout this slot is
+                // RSSetShadingRate instead (`NEWER_SHADING_RATE_SLOTS`)
                 (126, b::dispatch_mesh as usize),
                 // console compute/BVH builder extensions (`XboxBvhBuilder.dll`)
                 (146, l::uav_barrier_x as usize),
@@ -5200,6 +5211,9 @@ unsafe extern "system" fn alloc_reset(this: *mut c_void) -> HRESULT {
 // So the shift starts at #59 or below; where is not known. The newer layout's #139 is a Reset with one argument more (the same
 // title: (allocator, NULL, 0) on each list it takes from its pool before recording – as a stub
 // the list stayed closed, the debug layer saw every call on it refused, and Close failed).
+// The newer layout's shading-rate methods sit at #126 / #127 (the older layout's #124 / #125):
+// a retail title calls #126 with a rate in edx and a combiner array in r8, about once a frame,
+// and #127 with one resource pointer (`NEWER_SHADING_RATE_SLOTS`).
 
 /// the title's runtime has the newer layouts (queue: two methods before Signal; command list:
 /// console methods from CopyTextureRegionX on two slots later)
@@ -5210,9 +5224,25 @@ pub(super) static QUEUE_SHIFTED: AtomicBool = AtomicBool::new(false);
 static QUEUE_OLDER: AtomicBool = AtomicBool::new(false);
 
 /// command list slots of the newer layout → the older layout's slot of the same method
-/// (128, 126): DispatchMesh, if the shift reaches it – not seen yet; `bind::dispatch_mesh` drops
-/// a call without a console mesh pipeline bound.
-const NEWER_LIST_SLOTS: [(usize, usize); 22] = [(61, 59), (62, 60), (63, 61), (64, 62), (65, 63), (70, 68), (71, 69), (72, 70), (73, 71), (74, 72), (80, 78), (83, 81), (85, 83), (86, 84), (87, 85), (90, 88), (91, 89), (92, 90), (95, 93), (96, 94), (128, 126), (139, 10)];
+/// (`bind::dispatch_mesh` drops a call without a console mesh pipeline bound). Slots #128 and
+/// #129 are not in here: no title call of either was seen (see `NEWER_SHADING_RATE_SLOTS`).
+const NEWER_LIST_SLOTS: [(usize, usize); 21] = [(61, 59), (62, 60), (63, 61), (64, 62), (65, 63), (70, 68), (71, 69), (72, 70), (73, 71), (74, 72), (80, 78), (83, 81), (85, 83), (86, 84), (87, 85), (90, 88), (91, 89), (92, 90), (95, 93), (96, 94), (139, 10)];
+
+/// The newer layout's two slots before DispatchMesh's PC position: (console slot, PC slot) of
+/// `RSSetShadingRate` / `RSSetShadingRateImage`. On that layout the title calls #126 about once
+/// per frame with a rate in edx and a combiner array in r8 (the older layout's #124); #127
+/// takes one resource pointer. Neither is routed to `bind::dispatch_mesh`: no title call at
+/// #128 or #129 sets three group counts, so the mesh work goes elsewhere.
+const NEWER_SHADING_RATE_SLOTS: [(usize, usize); 2] = [(126, 77), (127, 78)];
+
+/// The handler for the newer layout's console slot `newer` (`NEWER_SHADING_RATE_SLOTS`).
+fn newer_shading_rate_handler(newer: usize) -> Option<usize> {
+    Some(match newer {
+        126 => super::list_x::rsset_shading_rate_x as usize,
+        127 => super::list_x::rsset_shading_rate_image_x as usize,
+        _ => return None,
+    })
+}
 
 /// The title called device method `slot`, which only runtimes with the newer layouts have (a retail game
 /// records its first lists before any queue call could tell).
@@ -5897,6 +5927,89 @@ mod queue_tests {
             assert_eq!(out, [1, 2, 3, 4], "older layout: the whole description");
         }
         QUEUE_OLDER.store(false, Ordering::Release);
+    }
+}
+
+#[cfg(test)]
+mod newer_shading_rate_slot_tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    /// the tests share `QUEUE_SHIFTED`
+    static LOCK: Mutex<()> = Mutex::new(());
+
+    /// what the fake PC list received: RSSetShadingRate (this, rate, combiners) and
+    /// RSSetShadingRateImage (this, image)
+    static RATE: Mutex<Option<(usize, i32, usize)>> = Mutex::new(None);
+    static IMAGE: Mutex<Option<(usize, usize)>> = Mutex::new(None);
+
+    unsafe extern "system" fn rate_rec(this: *mut c_void, rate: i32, combiners: *const i32) {
+        *RATE.lock().unwrap() = Some((this as usize, rate, combiners as usize));
+    }
+    unsafe extern "system" fn image_rec(this: *mut c_void, image: usize) {
+        *IMAGE.lock().unwrap() = Some((this as usize, image));
+    }
+
+    /// A list object whose PC table has the two shading-rate methods at #77 / #78.
+    fn fake_list(pc: &[usize; 80]) -> *mut c_void {
+        static EXT: Mutex<Option<[usize; 2]>> = Mutex::new(None);
+        static OBJ: Mutex<Option<[usize; 2]>> = Mutex::new(None);
+        *EXT.lock().unwrap() = Some([pc.as_ptr() as usize, 0]);
+        let vtbl = EXT.lock().unwrap().as_ref().unwrap().as_ptr() as usize + 8;
+        *OBJ.lock().unwrap() = Some([vtbl, 0]);
+        OBJ.lock().unwrap().as_ref().unwrap().as_ptr() as *mut c_void
+    }
+
+    /// On the newer layout the title's #126 (rate in edx, combiner array in r8) becomes the PC's
+    /// RSSetShadingRate at #77 with the same arguments; #127 becomes #78 with its resource.
+    #[test]
+    fn the_newer_layouts_126_and_127_reach_the_pcs_shading_rate_methods() {
+        let _g = LOCK.lock().unwrap();
+        let mut pc = [0usize; 80];
+        pc[77] = rate_rec as usize;
+        pc[78] = image_rec as usize;
+        let obj = fake_list(&pc);
+        super::super::device_x::set_variable_shading_rate_for_test(Some(true));
+        let combiners = [1i32, 2];
+        assert_eq!(newer_shading_rate_handler(126), Some(super::super::list_x::rsset_shading_rate_x as usize), "#126 is routed to the PC shading-rate method");
+        assert_eq!(newer_shading_rate_handler(127), Some(super::super::list_x::rsset_shading_rate_image_x as usize), "#127 is routed to the PC shading-rate image method");
+        unsafe {
+            let f: unsafe extern "system" fn(*mut c_void, u32, *const i32) = std::mem::transmute(newer_shading_rate_handler(126).unwrap());
+            f(obj, 0x5, combiners.as_ptr());
+            assert_eq!(*RATE.lock().unwrap(), Some((obj as usize, 5, combiners.as_ptr() as usize)), "#126 is PC #77 with the title's rate and combiners");
+            let f: unsafe extern "system" fn(*mut c_void, usize) = std::mem::transmute(newer_shading_rate_handler(127).unwrap());
+            f(obj, 0x1234);
+            assert_eq!(*IMAGE.lock().unwrap(), Some((obj as usize, 0x1234)), "#127 is PC #78 with the title's resource");
+        }
+        super::super::device_x::set_variable_shading_rate_for_test(None);
+        assert!(newer_shading_rate_handler(128).is_none() && newer_shading_rate_handler(129).is_none(), "#128 and #129 stay stubs");
+        assert_eq!(NEWER_SHADING_RATE_SLOTS, [(126, 77), (127, 78)], "the newer slots are the PC's #77 / #78");
+    }
+
+    /// A device without variable-rate shading gets neither call.
+    #[test]
+    fn a_device_without_vrs_gets_no_shading_rate_call() {
+        let _g = LOCK.lock().unwrap();
+        let pc = [0usize; 80];
+        let obj = fake_list(&pc);
+        super::super::device_x::set_variable_shading_rate_for_test(Some(false));
+        *RATE.lock().unwrap() = None;
+        unsafe {
+            let f: unsafe extern "system" fn(*mut c_void, u32, *const i32) = std::mem::transmute(newer_shading_rate_handler(126).unwrap());
+            f(obj, 1, std::ptr::null());
+        }
+        assert!(RATE.lock().unwrap().is_none(), "nothing reaches the PC");
+        super::super::device_x::set_variable_shading_rate_for_test(None);
+    }
+
+    /// Neither `NEWER_LIST_SLOTS` nor the console slots send a mesh dispatch anywhere: #128 and
+    /// #129 are left to the stubs.
+    #[test]
+    fn no_slot_sends_128_or_129_to_dispatch_mesh() {
+        assert!(NEWER_LIST_SLOTS.iter().all(|&(newer, _)| newer != 128 && newer != 129));
+        let slots = console_slots(Kind::CommandList);
+        assert!(slots.iter().all(|&(s, _)| s != 128 && s != 129));
+        assert!(slots.iter().any(|&(s, _)| s == 126), "the older layout's #126 stays");
     }
 }
 
