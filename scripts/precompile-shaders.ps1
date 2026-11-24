@@ -9,7 +9,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)][string]$Package,
-    [string]$Xcl = (Join-Path $PSScriptRoot '..\target\release\xcl.exe'),
+    [string]$Xcl = (Join-Path $PSScriptRoot '..\target\release\bathyal.exe'),
     [ValidateSet('all', 'cs', 'vs', 'ps', 'ms')][string]$Only = 'cs',
     [ValidateRange(1, 32)][int]$MemoryWindows = 4,
     [ValidateSet('auto', 'on', 'off')][string]$SplitWave64 = 'auto',
