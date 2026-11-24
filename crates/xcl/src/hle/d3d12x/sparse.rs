@@ -1553,10 +1553,6 @@ mod tests {
     /// already watched adds nothing.
     #[test]
 
-    /// A span is covered while any object covers it: a heap placed inside an allocation, then the
-    /// allocation freed, keeps the heap's span; the last owner takes it out.
-    #[test]
-
     #[test]
     fn aligned_tile_addresses_spread_across_hash_buckets() {
         use std::hash::BuildHasher;

@@ -1285,8 +1285,6 @@ mod tests {
 
     /// A write in the gap between two watched ranges is still watched: a gap is walked, never a
     /// place a write hides.
-    #[test]
-
     /// Only the wanted parts of the watched regions are scanned, merged, one region each.
     #[test]
     fn watch_ranges_clip_and_merge() {

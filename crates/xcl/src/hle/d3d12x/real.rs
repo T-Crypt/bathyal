@@ -1814,7 +1814,10 @@ unsafe fn standin_target(res: *mut c_void, depth: bool) -> Option<ID3D12Resource
 /// no format has to name this one.
 static TITLE_FORMAT: Mutex<Option<HashMap<usize, u32>>> = Mutex::new(None);
 
-/// The format the title created a texture with (None: not one XCL recorded).
+/// The format the title created a texture with (None: not one XCL recorded). This tree's
+/// `pc_srv` takes no title format as our next4 line's does, so nothing reads it yet; the
+/// record is kept for the views that will name none.
+#[allow(dead_code)]
 pub(super) fn title_format(res: usize) -> Option<u32> {
     TITLE_FORMAT.lock().unwrap().as_ref().and_then(|m| m.get(&res).copied())
 }

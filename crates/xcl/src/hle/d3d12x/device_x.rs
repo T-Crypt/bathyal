@@ -809,6 +809,7 @@ pub(super) unsafe extern "system" fn get_resource_allocation_info_x(a: *mut c_vo
 /// The console's layout of a texture in a format that XG does not model, by a stand-in of the
 /// same bits per texel (`pc_standin_format`): a title's allocation queries must not fail on a
 /// format the PC has no layout for. None: no such format.
+#[allow(dead_code)]
 fn standin_texture(x: &[u8; 0x38]) -> Option<crate::hle::xg::Texture> {
     let mut s = *x;
     let f = u32::from_le_bytes(s[0x20..0x24].try_into().unwrap());
