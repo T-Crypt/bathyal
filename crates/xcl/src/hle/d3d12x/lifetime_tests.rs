@@ -92,7 +92,13 @@ fn a_resource_released_after_submit_outlives_its_submission() {
 
         let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() }).expect("queue");
         let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).expect("fence");
-        queue.ExecuteCommandLists(&[Some(list.cast().unwrap())]);
+        if std::env::var_os("XCL_TEST_RAWEXEC").is_some() {
+            let f: unsafe extern "system" fn(*mut c_void, u32, *const *mut c_void) = std::mem::transmute(real::orig_fn(queue.as_raw() as *mut c_void, 10));
+            let one = [list.as_raw() as *mut c_void];
+            f(queue.as_raw() as *mut c_void, 1, one.as_ptr());
+        } else {
+            queue.ExecuteCommandLists(&[Some(list.cast().unwrap())]);
+        }
 
         // the title's references go now, on a GPU that may still be running the copy
         if std::env::var_os("XCL_TEST_KEEP").is_none() {
