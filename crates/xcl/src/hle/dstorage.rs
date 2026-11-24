@@ -916,12 +916,7 @@ impl Request {
     }
 
     /// What a queue of `source_memory` refuses at enqueue.
-    #[cfg(test)]
     fn check(&self, source_memory: bool) -> Result<(), HRESULT> {
-        self.check_with_bc1(source_memory)
-    }
-
-    fn check_with_bc1(&self, source_memory: bool) -> Result<(), HRESULT> {
         if self.memory_source() != source_memory || (self.source_physical_pages() && !self.memory_source()) {
             return Err(E_SOURCE_TYPE);
         }
