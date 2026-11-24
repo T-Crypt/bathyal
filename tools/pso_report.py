@@ -249,9 +249,15 @@ def slope(samples, end_frame):
         mx, my = sum(xs) / n, sum(ys) / n
         var = sum((x - mx) ** 2 for x in xs)
         per_frame = sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / var
+        steps = [(x, y) for i, (x, y) in enumerate(zip(xs, ys))
+                 if i == 0 or x != xs[i - 1]]
         out[field] = {"per_1000_frames": round(per_frame * 1000, 1),
                       "first": ys[0], "last": ys[-1],
-                      "frames_covered": max(xs) - min(xs)}
+                      "frames_covered": max(xs) - min(xs),
+                      "distinct_frames": len(set(xs)),
+                      "last_step": {"from_frame": steps[-2][0], "from_value": steps[-2][1],
+                                    "to_frame": steps[-1][0], "to_value": steps[-1][1]}
+                      if len(steps) > 1 else None}
     return out
 
 
@@ -303,8 +309,14 @@ def render(report) -> str:
             return "no samples"
         if isinstance(v, dict) and v.get("per_1000_frames") is None:
             return f"{v['first']} -> {v['last']} (no frame span)"
+        last = ""
+        if v.get("last_step"):
+            st = v["last_step"]
+            last = (f"; last step at frame {st['to_frame']}: "
+                    f"{st['from_value']} -> {st['to_value']}")
         return (f"{v['per_1000_frames']:+.1f} per 1000 frames "
-                f"({v['first']} -> {v['last']} over {v['frames_covered']} frames)")
+                f"({v['first']} -> {v['last']} over {v['frames_covered']} frames, "
+                f"{v['distinct_frames']} distinct frame numbers{last})")
     out.append(f"skipped work, last 1000 frames ({s['from_frame']}-{s['to_frame']}, {s['samples']} samples):")
     out.append(f"  dispatches skipped: {rate('dispatches_skipped')}")
     out.append(f"  draws skipped:      {rate('draws_skipped')}")
