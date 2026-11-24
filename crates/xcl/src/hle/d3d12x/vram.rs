@@ -112,12 +112,34 @@ pub fn arena_bytes() -> (usize, usize) {
 }
 static PLACED_TEXTURES: Mutex<Option<HashSet<usize>>> = Mutex::new(None);
 
+/// Resources whose PC object was released under D3D12's own lock, forgotten by the next
+/// `drain_forgotten` (see `sparse::FORGET_QUEUE`).
+static FORGET_QUEUE: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+
 /// A texture backed by one of the aliasable D3D12 heaps.
 pub(super) fn is_placed_texture(resource: usize) -> bool {
     PLACED_TEXTURES.lock().unwrap().as_ref().is_some_and(|textures| textures.contains(&resource))
 }
 
 pub(super) fn forget(resource: usize) {
+    forget_deferred(resource);
+    drain_forgotten();
+}
+
+/// `forget` for a caller under D3D12's own lock (`real::res_release`): `PAGES` is held across
+/// D3D12 calls in `place_on_pages` and `ARENAS` across `arena_heap`'s `CreateHeap`, so this only
+/// queues the resource for the next `drain_forgotten` (see `sparse::FORGET_QUEUE`).
+pub(super) fn forget_deferred(resource: usize) {
+    FORGET_QUEUE.lock().unwrap().push(resource);
+}
+
+fn drain_forgotten() {
+    for resource in std::mem::take(&mut *FORGET_QUEUE.lock().unwrap()) {
+        forget_now(resource);
+    }
+}
+
+fn forget_now(resource: usize) {
     let placed = PLACED_TEXTURES.lock().unwrap().as_mut().is_some_and(|textures| textures.remove(&resource));
     if placed {
         forget_pages(resource);
@@ -705,6 +727,7 @@ pub unsafe fn place_pages(
     if !tier2(dev) || std::env::var_os("XCL_VRAM_ARENAS").is_some() {
         return None;
     }
+    drain_forgotten();
     place_on_pages(dev, this, va, desc, state, clear, console_bytes, false, riid, ppv)
 }
 
@@ -714,6 +737,7 @@ pub unsafe fn place_pages(
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn place(this: *mut c_void, va: usize, desc: &D3D12_RESOURCE_DESC, state: u32, clear: *const c_void, console_bytes: Option<u64>, riid: *const windows_sys::core::GUID, ppv: *mut *mut c_void) -> Option<HRESULT> {
     let dev = ID3D12Device::from_raw_borrowed(&this)?;
+    drain_forgotten();
     if !tier2(dev) {
         return None;
     }

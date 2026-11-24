@@ -403,9 +403,71 @@ unsafe impl Send for State {}
 
 static STATE: Mutex<Option<State>> = Mutex::new(None);
 
+/// Buffers whose PC resource was released while D3D12 held its own internal lock.
+///
+/// `real::res_release` runs inside a D3D12 destruction, under D3D12's own lock. Another thread
+/// may hold `STATE` while it is inside a D3D12 call that waits for that lock, so taking `STATE`
+/// from the callback inverts the lock order and both threads stop. With DRED on, D3D12 takes its
+/// lock on more calls and the inversion bites within the first 50,000 pipeline creations.
+/// Such releases are queued here and applied by the next `lock_state`, in the callback's name:
+/// buffer ids `forget_buffer_deferred` unpins, and unified-memory addresses
+/// `free_deferred` decommits and releases.
+///
+/// These mutexes are held only to push one id or to `mem::take` a queue, never across a `STATE`
+/// lock and never across a D3D12 call, so they cannot join that cycle.
+static FORGET_QUEUE: Forgets = Forgets::new();
+
+/// What `forget_buffer_deferred` / `free_deferred` queue and `lock_state` applies.
+struct Forgets {
+    buffers: Mutex<Vec<usize>>,
+    umas: Mutex<Vec<usize>>,
+}
+
+impl Forgets {
+    const fn new() -> Self {
+        Self { buffers: Mutex::new(Vec::new()), umas: Mutex::new(Vec::new()) }
+    }
+
+    fn push(&self, res: usize) {
+        self.buffers.lock().unwrap().push(res);
+    }
+
+    fn push_uma(&self, p: usize) {
+        self.umas.lock().unwrap().push(p);
+    }
+
+    /// Every buffer id queued so far, in order, taken in one step (no lock held while they are
+    /// applied).
+    fn take(&self) -> Vec<usize> {
+        std::mem::take(&mut *self.buffers.lock().unwrap())
+    }
+
+    fn take_umas(&self) -> Vec<usize> {
+        std::mem::take(&mut *self.umas.lock().unwrap())
+    }
+}
+
+/// `STATE`, locked the usual way, after applying what `forget_buffer_deferred` / `free_deferred`
+/// queued while D3D12 held its lock. Every ordinary sparse path locks through here, so a
+/// deferred release is applied at the next sparse call and never waits inside a D3D12 callback.
+fn lock_state() -> std::sync::MutexGuard<'static, Option<State>> {
+    let mut g = STATE.lock().unwrap();
+    let queued = FORGET_QUEUE.take();
+    let umas = FORGET_QUEUE.take_umas();
+    if let Some(s) = g.as_mut() {
+        for res in queued {
+            unpin_buffer(s, res);
+        }
+        for p in umas {
+            unsafe { free_uma_locked(s, p) };
+        }
+    }
+    g
+}
+
 /// (bytes of video memory in pool heaps, of those mapped) – `XCL_ACTIVITY`
 pub fn pool_bytes() -> (usize, usize) {
-    let g = STATE.lock().unwrap();
+    let g = lock_state();
     let Some(s) = g.as_ref() else { return (0, 0) };
     let pools = s.pools.iter().filter(|p| p.is_some()).count() * POOL_TILES as usize * TILE;
     (pools, pools.saturating_sub(s.free.len() * TILE))
@@ -561,7 +623,7 @@ pub unsafe fn init(dev: &ID3D12Device) -> Vec<(usize, usize, u64)> {
             crate::xlog_info!("D3D12.X: {} sparse window(s) for the title's own memory (tiled buffers on video memory)", out.len());
             // a state this replaces (the windows set up again) goes after the lock: the release of
             // its last buffers reaches `forget_buffer`, which takes the lock (#344)
-            let old = STATE.lock().unwrap().replace(s);
+            let old = lock_state().replace(s);
             drop(old);
             for (a, b) in std::mem::take(&mut *EARLY.lock().unwrap()) {
                 committed(a, b - a);
@@ -1242,7 +1304,7 @@ pub fn has_video_memory(va: usize, len: usize) -> bool {
     if len == 0 {
         return false;
     }
-    let g = STATE.lock().unwrap();
+    let g = lock_state();
     let Some(s) = g.as_ref() else { return false };
     if s.window_index(va).is_none() || va.checked_add(len - 1).is_none_or(|e| s.window_index(e).is_none()) {
         return false;
@@ -1264,7 +1326,7 @@ pub unsafe fn flush_written(va: usize, len: usize) {
     if len == 0 {
         return;
     }
-    let mut g = STATE.lock().unwrap();
+    let mut g = lock_state();
     let Some(s) = g.as_mut() else { return };
     let runs = video_runs(s, va, len);
     let Some(last) = runs.last() else { return };
@@ -1317,6 +1379,21 @@ pub unsafe fn free(p: usize) -> bool {
     u.sparse_release(p).is_some()
 }
 
+/// `free` for a caller that runs under D3D12's own lock (a destruction callback): the address is
+/// queued and freed by the next `lock_state` (see `FORGET_QUEUE`).
+pub fn free_deferred(p: usize) {
+    FORGET_QUEUE.push_uma(p);
+}
+
+/// `free` of a queued block, the sparse state already locked (`decommitted` would lock it again).
+unsafe fn free_uma_locked(s: &mut State, p: usize) {
+    let Some(u) = crate::gpu::uma::get() else { return };
+    let Some((start, len)) = u.sparse_reservation(p).filter(|&(start, _)| start == p) else { return };
+    s.decommit_range(start, len);
+    VirtualFree(p as *mut c_void, len, MEM_DECOMMIT);
+    u.sparse_release(p);
+}
+
 /// After `queue.ExecuteCommandLists`: copy GPU-written sparse ranges (e.g. `Write32/64`,
 /// `FillMemoryWith32BitValueX`, `CopyMemoryToMemoryX`) back to their CPU view so CPU reads
 /// and spin-waits see the GPU writes without clobbering `sent` hashes. The copy runs on `queue`
@@ -1327,7 +1404,7 @@ pub unsafe fn readback_after_execute(queue: &ID3D12CommandQueue, ranges: &[(usiz
     if ranges.is_empty() {
         return;
     }
-    readback_locked(queue, ranges, STATE.lock().unwrap());
+    readback_locked(queue, ranges, lock_state());
 }
 
 /// As `readback_after_execute`, but only when the sparse state is free at once. The queue gate
@@ -1441,7 +1518,7 @@ impl Readback {
         if self.fence.GetCompletedValue() == u64::MAX || self.buf.Map(0, None, Some(&mut p)).is_err() {
             return;
         }
-        if let Some(s) = STATE.lock().unwrap().as_mut() {
+        if let Some(s) = lock_state().as_mut() {
             s.copy_back(p as *const u8, &self.parts);
         }
         self.buf.Unmap(0, None);
@@ -1476,7 +1553,7 @@ pub unsafe fn readback_now(va: usize, len: usize) {
     if len == 0 {
         return;
     }
-    let mut g = STATE.lock().unwrap();
+    let mut g = lock_state();
     let Some(s) = g.as_mut() else { return };
     if s.window_index(va).is_none() {
         return;
@@ -1521,7 +1598,7 @@ pub unsafe fn committed(a: usize, n: usize) {
     if n == 0 {
         return;
     }
-    let mut g = STATE.lock().unwrap();
+    let mut g = lock_state();
     let Some(s) = g.as_mut() else {
         let (start, end) = page_span(a, n);
         early_add(&mut EARLY.lock().unwrap(), start, end);
@@ -1537,7 +1614,7 @@ pub unsafe fn decommitted(a: usize, n: usize) {
     if n == 0 {
         return;
     }
-    let mut g = STATE.lock().unwrap();
+    let mut g = lock_state();
     let Some(s) = g.as_mut() else {
         let (start, end) = page_span(a, n);
         early_remove(&mut EARLY.lock().unwrap(), start, end);
@@ -1655,7 +1732,7 @@ pub fn known_writable(p: usize, n: usize) -> bool {
         return false;
     }
     {
-        let g = STATE.lock().unwrap();
+        let g = lock_state();
         let Some(s) = g.as_ref() else { return false };
         if !recorded_committed(&s.mapped, p, end) {
             return false;
@@ -1714,7 +1791,7 @@ fn resident_pages_writable(p: usize, end: usize) -> bool {
 /// The sparse windows' tiles with video memory as sorted (start, end) runs: where a CPU write
 /// has to reach the GPU.
 pub fn mapped_ranges() -> Vec<(usize, usize)> {
-    let mut g = STATE.lock().unwrap();
+    let mut g = lock_state();
     let Some(s) = g.as_mut() else { return Vec::new() };
     if s.runs.is_none() {
         let mut tiles: Vec<usize> = s.mapped.keys().copied().collect();
@@ -1794,7 +1871,7 @@ pub fn note_budget(took: std::time::Duration, walked: usize, pages: usize, uploa
 /// memory, and `queue` GPU-waits for that and for new tile mappings.
 pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: usize) {
     let t0 = std::time::Instant::now();
-    let mut g = STATE.lock().unwrap();
+    let mut g = lock_state();
     let Some(s) = g.as_mut() else { return };
     // the title's work sees what was decommitted unmapped, as it was
     if s.flush_parked() {
@@ -1891,7 +1968,7 @@ pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: 
 /// description): a reserved resource over the window's tiles there, starting at the 64 KiB
 /// below `va` (returned: its distance from there).
 pub unsafe fn place_buffer(this: *mut c_void, va: usize, desc: &D3D12_RESOURCE_DESC, state: u32, riid: *const windows_sys::core::GUID, ppv: *mut *mut c_void) -> Option<(crate::util::HRESULT, usize)> {
-    let mut g = STATE.lock().unwrap();
+    let mut g = lock_state();
     let s = g.as_mut()?;
     let start = va & !(TILE - 1);
     let delta = va - start;
@@ -1931,8 +2008,19 @@ pub unsafe fn place_buffer(this: *mut c_void, va: usize, desc: &D3D12_RESOURCE_D
 
 /// A placed buffer is gone: its tiles are not pinned by it any more.
 pub fn forget_buffer(res: usize) {
-    let mut g = STATE.lock().unwrap();
-    let Some(s) = g.as_mut() else { return };
+    // queued, then applied by the lock this call takes: one path for both callers
+    forget_buffer_deferred(res);
+    drop(lock_state());
+}
+
+/// `forget_buffer` for a caller that runs under D3D12's own lock (a destruction callback): it
+/// only queues the buffer and returns, so it never waits on `STATE`.
+pub fn forget_buffer_deferred(res: usize) {
+    FORGET_QUEUE.push(res);
+}
+
+/// The tiles of `res` are not pinned by it any more (called under `STATE`).
+fn unpin_buffer(s: &mut State, res: usize) {
     let Some(tiles) = s.buffers.remove(&res) else { return };
     for tile in tiles {
         if let Some(c) = s.pinned.get_mut(&tile) {
@@ -1973,6 +2061,28 @@ mod tests {
         for t in threads {
             t.join().unwrap();
         }
+    }
+
+    /// A buffer released under D3D12's lock is only queued there; the next drain takes every id
+    /// once, in the order the releases came, from either thread (#344).
+    #[test]
+    fn a_deferred_forget_is_queued_from_another_thread_and_drained_once() {
+        let q = std::sync::Arc::new(Forgets::new());
+        q.push(0x1000);
+        let other = std::sync::Arc::clone(&q);
+        std::thread::spawn(move || {
+            // the callback's side: it only pushes, it never waits for the main lock
+            for i in 1..=64usize {
+                other.push(0x1000 * i);
+            }
+        })
+        .join()
+        .unwrap();
+        let first = q.take();
+        assert_eq!(first.len(), 65);
+        assert_eq!(first[0], 0x1000);
+        assert_eq!(first[64], 0x1000 * 64);
+        assert!(q.take().is_empty(), "a drained queue is empty");
     }
 
     /// The budget is a knob: a number of milliseconds, 4 unless set, and 0 turns it off.

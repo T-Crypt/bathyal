@@ -310,6 +310,9 @@ static TEXTURES: Mutex<Table> = Mutex::new(Table::new());
 // Keep the scan, pending-list update and GPU uploads together.
 static REFRESH: Mutex<()> = Mutex::new(());
 static TEXTURES_GEN: AtomicU64 = AtomicU64::new(0);
+/// Resources whose PC object was released under D3D12's own lock, forgotten by the next
+/// `drain_forgotten` (see `sparse::FORGET_QUEUE`).
+static FORGET_QUEUE: Mutex<Vec<usize>> = Mutex::new(Vec::new());
 static TEXTURES_LEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 /// cached `watch_ranges` keyed by `(sparse::mapped_gen, TEXTURES_GEN, graphics_reservations_gen)`
 static WATCH_CACHE: Mutex<Option<((u64, u64, u64), Arc<Vec<(usize, usize)>>)>> = Mutex::new(None);
@@ -462,6 +465,7 @@ fn recheck_source(e: &mut Entry) -> bool {
 /// by the GPU). The first upload, if still pending, stays: it runs before the title's submit
 /// that copies.
 pub fn note_gpu_write(res: usize) {
+    drain_forgotten();
     let mut t = TEXTURES.lock().unwrap();
     if let Some(e) = t.get_mut(res) {
         if !e.gpu_written {
@@ -503,6 +507,24 @@ pub(super) unsafe fn retire_overlapping(va: usize, len: usize) {
 
 /// The PC texture was released for good.
 pub fn forget(res: usize) {
+    forget_deferred(res);
+    drain_forgotten();
+}
+
+/// `forget` for a caller under D3D12's own lock (`real::res_release`): the remaps below reach
+/// `vram`'s `PAGES`, which another thread may hold inside a D3D12 call, so this only queues the
+/// texture for the next `drain_forgotten` (see `sparse::FORGET_QUEUE`).
+pub fn forget_deferred(res: usize) {
+    FORGET_QUEUE.lock().unwrap().push(res);
+}
+
+fn drain_forgotten() {
+    for res in std::mem::take(&mut *FORGET_QUEUE.lock().unwrap()) {
+        forget_now(res);
+    }
+}
+
+fn forget_now(res: usize) {
     LAST_CONTENT.lock().unwrap().remove(&res);
     let (removed, to_remap) = {
         let mut t = TEXTURES.lock().unwrap();
@@ -525,6 +547,7 @@ pub fn forget(res: usize) {
 
 /// The title-memory address of a texture kept in step with it.
 pub fn address(res: usize) -> Option<usize> {
+    drain_forgotten();
     let t = TEXTURES.lock().unwrap();
     t.by_res.get(&res).or_else(|| t.shadowed.get(&res)).map(|e| e.va)
 }
