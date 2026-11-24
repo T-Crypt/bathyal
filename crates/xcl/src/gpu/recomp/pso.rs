@@ -630,7 +630,7 @@ fn console_translation(blob: &[u8], stage: Stage, sampler_base: u32, windows: u3
     };
     let p = f.programs.first().ok_or("FSSM without a program")?;
     let code = &f.data[p.offset..p.offset + p.len];
-    let t = translate(code, &Options { mode, wave64: super::detect_wave64(code), split_wave64, static_sampler_base: sampler_base, mem_windows: windows, ..Default::default() })?;
+    let t = translate(code, &Options { mode, wave64: super::fssm_wave64(f, code), split_wave64, static_sampler_base: sampler_base, mem_windows: windows, ..Default::default() })?;
     if !t.complete() {
         let missing: Vec<&String> = t.unsupported.keys().collect();
         return Err(format!("incomplete translation, missing: {missing:?}"));
@@ -683,7 +683,7 @@ fn compile_console_mesh(blob: &[u8], ms: &super::MsInterface, windows: u32, spli
     let f = sh.fssm.iter().find(|f| f.stages.first().is_some_and(|s| s.hw == 7)).ok_or("no NGG hardware variant")?;
     let p = f.programs.first().ok_or("FSSM without a program")?;
     let code = &f.data[p.offset..p.offset + p.len];
-    let t = super::translate_mesh(code, ms.clone(), super::detect_wave64(code), split_wave64, windows)?;
+    let t = super::translate_mesh(code, ms.clone(), super::fssm_wave64(f, code), split_wave64, windows)?;
     if !t.complete() {
         let missing: Vec<&String> = t.unsupported.keys().collect();
         return Err(format!("incomplete translation, missing: {missing:?}"));
