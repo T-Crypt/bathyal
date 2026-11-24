@@ -2714,10 +2714,17 @@ pub(super) unsafe extern "system" fn dev_create_command_list_x(this: *mut c_void
 }
 
 unsafe extern "system" fn dev_create_compute_pso_x(this: *mut c_void, desc: *const c_void, a: usize, b: usize, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+    let start = std::time::Instant::now();
+    let hr = dev_create_compute_pso_x_inner(this, desc, a, b, riid, ppv);
+    note_pso_time(start.elapsed());
+    hr
+}
+
+unsafe fn dev_create_compute_pso_x_inner(this: *mut c_void, desc: *const c_void, a: usize, b: usize, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
     if a != 0 || b != 0 {
         crate::xlog_warn!("CreateComputePipelineState (console, slot 62): unknown parameters {a:#x} {b:#x} ignored");
     }
-    let hr = dev_create_compute_pso(this, desc, riid, ppv);
+    let hr = dev_create_compute_pso_inner(this, desc, riid, ppv);
     // console code writes into pipeline objects (D3D12.X inline code): give it a console-shaped one
     if hr >= 0 && super::console_list::enabled() && !ppv.is_null() && !(*ppv).is_null() {
         *ppv = super::console_list::wrap_pso(*ppv, LAST_COMPUTE_TRANSLATED.with(|c| c.get()), LAST_COMPUTE_RS.with(|c| c.replace(0)));
@@ -3625,6 +3632,49 @@ fn note_driver_cache(saved: bool) {
     }
 }
 
+/// Pipeline creation cost, always on: every PSO constructor is timed and the counters go out
+/// as one line per 2000 calls (see `pso_stats_line`). Nothing here changes a result.
+static PSO_CALLS: AtomicU64 = AtomicU64::new(0);
+static PSO_TOTAL_US: AtomicU64 = AtomicU64::new(0);
+static PSO_MAX_US: AtomicU64 = AtomicU64::new(0);
+static PSO_OVER_50MS: AtomicU64 = AtomicU64::new(0);
+static PSO_REPEATS: AtomicU64 = AtomicU64::new(0);
+/// The `pso_disk` keys created so far this run: a key seen again is a repeat.
+static PSO_KEYS: Mutex<HashSet<u64>> = Mutex::new(HashSet::new());
+
+/// The one line written every 2000 pipeline creations.
+fn pso_stats_line(calls: u64, total_us: u64, max_us: u64, over_50ms: u64, repeats: u64) -> String {
+    format!(
+        "D3D12.X: pipeline creation: {calls} calls, avg {:.2} ms, max {:.2} ms, {over_50ms} over 50 ms, {repeats} repeats of an identical pipeline",
+        total_us as f64 / calls.max(1) as f64 / 1000.0,
+        max_us as f64 / 1000.0
+    )
+}
+
+fn note_pso_time(elapsed: std::time::Duration) {
+    let us = elapsed.as_micros().min(u64::MAX as u128) as u64;
+    let n = PSO_CALLS.fetch_add(1, Ordering::Relaxed) + 1;
+    PSO_TOTAL_US.fetch_add(us, Ordering::Relaxed);
+    PSO_MAX_US.fetch_max(us, Ordering::Relaxed);
+    if us > 50_000 {
+        PSO_OVER_50MS.fetch_add(1, Ordering::Relaxed);
+    }
+    if n % 2000 == 0 {
+        let (total, max, over, repeats) = (PSO_TOTAL_US.load(Ordering::Relaxed), PSO_MAX_US.load(Ordering::Relaxed), PSO_OVER_50MS.load(Ordering::Relaxed), PSO_REPEATS.load(Ordering::Relaxed));
+        crate::xlog_info!("{}", pso_stats_line(n, total, max, over, repeats));
+    }
+}
+
+/// Note the `pso_disk` key of a pipeline that is being created; a key seen before counts as a
+/// repeat. `finish_pso_cached` and `finish_stream_cached` call this, so a two-pass pipeline
+/// (from `finish_two_pass`) counts one key per driver pipeline.
+fn note_pso_key(key: u64) {
+    let mut seen = PSO_KEYS.lock().unwrap_or_else(|e| e.into_inner());
+    if !seen.insert(key) {
+        PSO_REPEATS.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 static PSO_DEVICE_REMOVED: AtomicBool = AtomicBool::new(false);
 
 fn device_is_removed(_this: *mut c_void) -> bool {
@@ -3641,6 +3691,7 @@ fn note_device_removed() {
 /// first; the driver's own blob is written when this compile is new. A cache hit does not
 /// take a driver-compile slot. A miss does, so only a few new pipelines compile at once.
 unsafe fn finish_pso_cached(this: *mut c_void, f: PsoFn, desc: *mut c_void, graphics: bool, key: u64, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+    note_pso_key(key);
     let loaded = super::pso_disk::load(key);
     let apply = |blob: &[u8]| {
         let cached = cached_pso(blob);
@@ -3707,6 +3758,7 @@ unsafe fn finish_pso_cached(this: *mut c_void, f: PsoFn, desc: *mut c_void, grap
 /// under its `stream_key`: the blob goes in a CACHED_PSO subobject when one is saved, and the
 /// driver's blob is saved after a compile.
 unsafe fn finish_stream_cached(this: *mut c_void, f: PsoFn, stream: &[u8], key: u64, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+    note_pso_key(key);
     // the stream plus a CACHED_PSO subobject (type 19: 4-byte type, 4 of padding, then
     // D3D12_CACHED_PIPELINE_STATE { pCachedBlob, CachedBlobSizeInBytes })
     const CACHED_PSO: u32 = 19;
@@ -4394,6 +4446,13 @@ unsafe fn build_stream(dev: Dev, d: &OwnedDesc, out: *mut *mut c_void) -> bool {
 }
 
 pub(super) unsafe extern "system" fn dev_create_graphics_pso(this: *mut c_void, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+    let start = std::time::Instant::now();
+    let hr = dev_create_graphics_pso_inner(this, desc, riid, ppv);
+    note_pso_time(start.elapsed());
+    hr
+}
+
+unsafe fn dev_create_graphics_pso_inner(this: *mut c_void, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
     graphics_pso(this, desc, riid, ppv, false)
 }
 
@@ -4462,6 +4521,13 @@ unsafe fn note_translated_compute(hr: HRESULT, ppv: *mut *mut c_void) {
 }
 
 unsafe extern "system" fn dev_create_compute_pso(this: *mut c_void, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+    let start = std::time::Instant::now();
+    let hr = dev_create_compute_pso_inner(this, desc, riid, ppv);
+    note_pso_time(start.elapsed());
+    hr
+}
+
+unsafe fn dev_create_compute_pso_inner(this: *mut c_void, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
     super::null::capture_compute_desc(desc as *const u8);
     let f: PsoFn = std::mem::transmute(orig_fn(this, slot_of(this, "CreateComputePipelineState")));
     let (mut console, missed) = if super::pso_async::enabled() { attempt(|| translated_compute_pso(this, f, desc, riid, ppv)) } else { (translated_compute_pso(this, f, desc, riid, ppv), false) };
@@ -5264,6 +5330,13 @@ unsafe fn stream_has_console_shader(desc: *const c_void) -> bool {
 }
 
 pub(super) unsafe extern "system" fn dev_create_pipeline_state(this: *mut c_void, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+    let start = std::time::Instant::now();
+    let hr = dev_create_pipeline_state_inner(this, desc, riid, ppv);
+    note_pso_time(start.elapsed());
+    hr
+}
+
+unsafe fn dev_create_pipeline_state_inner(this: *mut c_void, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
     super::null::capture_stream_desc(desc as *const u8);
     let f: PsoFn = std::mem::transmute(orig_fn(this, slot_of(this, "CreatePipelineState")));
     let (translated, missed) = if super::pso_async::enabled() { attempt(|| translated_mesh_stream(this, desc, riid, ppv)) } else { (translated_mesh_stream(this, desc, riid, ppv), false) };
@@ -5279,7 +5352,7 @@ pub(super) unsafe extern "system" fn dev_create_pipeline_state(this: *mut c_void
     }
     match stream_pipeline(desc) {
         StreamPipeline::Graphics(d) => return graphics_pso(this, &*d as *const _ as *const c_void, riid, ppv, true),
-        StreamPipeline::Compute(d) => return dev_create_compute_pso(this, &*d as *const _ as *const c_void, riid, ppv),
+        StreamPipeline::Compute(d) => return dev_create_compute_pso_inner(this, &*d as *const _ as *const c_void, riid, ppv),
         StreamPipeline::Unknown => {}
     }
     // a console shader the recompiler could not take must not reach the driver: AMD's shader
@@ -6150,6 +6223,23 @@ mod cache_report_tests {
         assert_eq!(
             decoded.dxil_cache,
             crate::gpu::recomp::dxc::CacheStats::default()
+        );
+    }
+}
+
+#[cfg(test)]
+mod pso_stats_tests {
+    use super::pso_stats_line;
+
+    #[test]
+    fn the_pipeline_creation_line_has_its_counts_and_averages() {
+        assert_eq!(
+            pso_stats_line(2000, 12_345_678, 250_000, 3, 17),
+            "D3D12.X: pipeline creation: 2000 calls, avg 6.17 ms, max 250.00 ms, 3 over 50 ms, 17 repeats of an identical pipeline"
+        );
+        assert_eq!(
+            pso_stats_line(0, 0, 0, 0, 0),
+            "D3D12.X: pipeline creation: 0 calls, avg 0.00 ms, max 0.00 ms, 0 over 50 ms, 0 repeats of an identical pipeline"
         );
     }
 }
