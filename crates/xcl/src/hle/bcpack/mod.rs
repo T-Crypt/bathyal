@@ -19,23 +19,18 @@
 //!   stream ([`bc5::Tables`]). XCL has the index-pair table and the estimates
 //!   leonida-asset-pipeline made of the history (`bc5_tables.rs`), so its BC5 blocks are an
 //!   approximation wherever an estimate is off,
-//! * the rebuild of BC3 and BC4 blocks ([`bc3`], [`bc4`]), which need the same kind of
-//!   tables. XCL has no source for them it can take, so nothing calls it and those requests
-//!   are still refused.
-//!
-//! What is not: the rebuild of BC6H and BC7. Their lanes decode, but the block
-//! rebuild needs tables of constants that no stream carries. For BC7 those are the 256-slot
-//! endpoint history, the 256-slot index history and 10 of the 285 lane-15 mode signatures;
-//! the only sources that fitted them are GPL-3.0, which this GPL-2.0-only crate cannot take,
-//! and the clean-room decoder that XCL's BC5 tables come from ships them empty. Guessing them
-//! would make the output wrong, so those requests are still refused.
+//! * the rebuild of BC3, BC4, BC6H and BC7 blocks ([`victory`], with the format's constant
+//!   tables in `tables.rs`), ported from VIctory by ivall/xcl (PR #905). Its tables are the
+//!   format's own, so those modes need no fitting. This is the only source XCL can take them
+//!   from: the projects that fitted them are GPL-3.0, and VIctory's author allowed its use in
+//!   this GPL-2.0-only crate (see `THIRD_PARTY.md`).
 //!
 //! Nothing here was compared with what a console writes for the same input: the entropy stage
-//! follows Microsoft's published decoder sample and the block rules the public format notes of
-//! bcpack-decoder (Tim0219800) and bcpack-rs (Ahmet Dedeler), the clean-room decoder of
-//! leonida-asset-pipeline (wxrrry, MIT) and the format notes of SixNG, whose authors report them
-//! as matching retail streams. The tests check against streams built independently from those
-//! notes (`tests/data/bcpack`), not against hardware output.
+//! follows Microsoft's published decoder sample and the block rules of VIctory, bcpack-rs
+//! (Ahmet Dedeler), the clean-room decoder of leonida-asset-pipeline (wxrrry, MIT) and the
+//! format notes of SixNG, whose authors report them as matching retail streams. The tests
+//! check against streams built independently from those notes (`tests/data/bcpack`), not
+//! against hardware output.
 
 pub mod bc1;
 mod bc1_fitted;
@@ -45,6 +40,8 @@ pub mod bc5;
 mod bc5_tables;
 mod lanes;
 mod rans_tables;
+mod tables;
+mod victory;
 
 /// Why a stream was not unpacked.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -69,6 +66,8 @@ pub enum Error {
     Lane1 { block: usize },
     /// a block refers to an entry of the built-in history that is not known
     History { block: usize, slot: usize },
+    /// a block rebuild from `victory` refused the stream, with its reason
+    Decode(&'static str),
 }
 
 impl Error {
@@ -85,6 +84,7 @@ impl Error {
             Error::Trailing { .. } => "trailing data",
             Error::Lane1 { .. } => "lane 1",
             Error::History { .. } => "unknown history",
+            Error::Decode(_) => "decode",
         }
     }
 }
@@ -102,6 +102,7 @@ impl std::fmt::Display for Error {
             Error::Trailing { consumed } => write!(f, "data follows the stream's {consumed} bytes"),
             Error::Lane1 { block } => write!(f, "BC1 block {block} has a non-zero lane 1 symbol"),
             Error::History { block, slot } => write!(f, "block {block} refers to the unknown history entry {slot}"),
+            Error::Decode(why) => write!(f, "BCPack: {why}"),
         }
     }
 }
@@ -161,9 +162,24 @@ fn bc5_tables() -> &'static bc5::Tables {
     }
 }
 
+/// The bytes of one block of `mode`.
+pub fn block_size(mode: u8) -> Option<usize> {
+    Some(match mode {
+        1 | 4 => 8,
+        3 | 5 | 6 | 7 => 16,
+        _ => return None,
+    })
+}
+
 /// Whether [`decode`] has a block rebuild for `mode`.
 pub fn can_decode(mode: u8) -> bool {
-    mode == 5 || (mode == 1 && bc1_tables().is_some())
+    match mode {
+        1 => bc1_tables().is_some(),
+        5 => true,
+        // the format's own tables (VIctory) rebuild these
+        3 | 4 | 6 | 7 => true,
+        _ => false,
+    }
 }
 
 /// Unpack a stream of `mode` to its `out_len` bytes of BCn blocks.
@@ -175,6 +191,17 @@ pub fn decode(mode: u8, src: &[u8], out_len: usize) -> Result<Vec<u8>, Error> {
             Ok(blocks)
         }
         (5, _) => bc5::decode(src, out_len, bc5_tables()),
+        // BC3, BC4, BC6H and BC7: the port of VIctory's decoder and its tables
+        (3 | 4 | 6 | 7, _) => {
+            let block = block_size(mode).ok_or(Error::Unsupported)?;
+            if out_len == 0 || out_len % block != 0 {
+                return Err(Error::OutputSize);
+            }
+            let mut out = vec![0u8; out_len];
+            victory::decode(mode, src, &mut out, victory::Tables::builtin())
+                .map_err(|e| Error::Decode(e.0))?;
+            Ok(out)
+        }
         _ => Err(Error::Unsupported),
     }
 }
