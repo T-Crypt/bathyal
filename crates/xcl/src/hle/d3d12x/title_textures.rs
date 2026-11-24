@@ -1420,7 +1420,7 @@ mod tests {
         assert_eq!(watch_ranges(&regions, wanted), vec![(0x11000, 0xF000), (0x40000, 0x10000)]);
         // ranges a gap of under 16 MiB apart (`WATCH_GAP`) are one scan; further apart: two
         let wanted = vec![(0x1000_0000, 0x1000_1000), (0x1008_0000, 0x1008_1000), (0x1100_0000, 0x1100_1000)];
-        assert_eq!(watch_ranges(&regions, wanted), vec![(0x1000_0000, 0x1100_1000)]);
+        assert_eq!(watch_ranges(&regions, wanted), vec![(0x1000_0000, 0x100_1000)]);
         let wanted = vec![(0x1000_0000, 0x1000_1000), (0x1200_0000, 0x1200_1000)];
         assert_eq!(watch_ranges(&regions, wanted), vec![(0x1000_0000, 0x1000), (0x1200_0000, 0x1000)]);
     }
