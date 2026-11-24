@@ -1131,6 +1131,40 @@ mod tests {
         assert_eq!(rate.sample(start + Duration::from_secs(4), 70), 5.0);
     }
 
+    #[test]
+    fn frame_rate_uses_frame_and_time_deltas() {
+        let start = Instant::now();
+        let mut rate = FrameRate::new(start, 1_000);
+        assert_eq!(
+            rate.sample(start + Duration::from_millis(1_500), 1_030),
+            20.0
+        );
+        assert_eq!(
+            rate.sample(start + Duration::from_millis(2_750), 1_080),
+            40.0
+        );
+    }
+
+    #[test]
+    fn frame_rate_waits_for_a_full_sample() {
+        let start = Instant::now();
+        let mut rate = FrameRate::new(start, 0);
+        assert_eq!(rate.sample(start, 0), 0.0);
+        assert_eq!(rate.sample(start + Duration::from_millis(500), 15), 0.0);
+        assert_eq!(rate.sample(start + Duration::from_secs(1), 30), 30.0);
+        assert_eq!(rate.sample(start + Duration::from_millis(1_500), 35), 30.0);
+        assert_eq!(rate.sample(start + Duration::from_secs(2), 40), 10.0);
+    }
+
+    #[test]
+    fn frame_rate_reports_stalls_and_recovery() {
+        let start = Instant::now();
+        let mut rate = FrameRate::new(start, 0);
+        assert_eq!(rate.sample(start + Duration::from_secs(1), 60), 60.0);
+        assert_eq!(rate.sample(start + Duration::from_secs(2), 60), 0.0);
+        assert_eq!(rate.sample(start + Duration::from_secs(4), 70), 5.0);
+    }
+
     // XCL_WINDOW_POS is process-global; one test covers all modes in sequence.
     #[test]
     fn window_position_modes() {

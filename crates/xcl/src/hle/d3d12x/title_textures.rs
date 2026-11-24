@@ -1789,6 +1789,32 @@ mod tests {
         }
     }
 
+    /// The textures of a batch detiled on several threads come back as on one: complete and in
+    /// order (2D with mips and slices, 3D, BC7, a tiny one; more textures than threads).
+    #[test]
+    fn a_batch_detiled_on_several_threads_matches_one_thread() {
+        let descs = [
+            console_desc(3, 64, 64, 2, 3, 28, 0x105),
+            console_desc(3, 200, 72, 1, 5, 28, 0x105),
+            console_desc(4, 40, 24, 6, 3, 28, 0x105),
+            console_desc(3, 256, 256, 1, 9, 98, 0x10A),
+            console_desc(3, 4, 4, 1, 1, 28, 0x105),
+            console_desc(3, 128, 32, 3, 2, 28, 0x105),
+            console_desc(3, 64, 64, 1, 1, 28, 0x105),
+        ];
+        let textures: Vec<xg::Texture> = descs.iter().map(|d| xg::Texture::new(d).unwrap()).collect();
+        // each texture's console memory: distinct bytes per texture
+        let mems: Vec<Vec<u8>> = textures.iter().enumerate().map(|(t, x)| (0..x.size() as usize).map(|i| (i * 7 + t * 61) as u8).collect()).collect();
+        let picked: Vec<(usize, &xg::Texture)> = mems.iter().zip(&textures).map(|(m, x)| (m.as_ptr() as usize, x)).collect();
+        unsafe {
+            let one = subresources_on(&picked, 1);
+            assert!(one.iter().all(|s| !s.is_empty()), "a texture gave no subresources");
+            for threads in [2, 3, 8] {
+                assert!(subresources_on(&picked, threads) == one, "{threads} threads differ from one");
+            }
+        }
+    }
+
     fn console_desc(dim: u32, w: u64, h: u32, array_or_depth: u16, mips: u16, format: u32, layout: u32) -> [u8; 0x38] {
         let mut d = [0u8; 0x38];
         d[0..4].copy_from_slice(&dim.to_le_bytes());
