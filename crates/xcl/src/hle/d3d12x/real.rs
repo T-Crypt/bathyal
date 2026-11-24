@@ -3724,14 +3724,14 @@ impl PsoMemo {
         if obj == 0 {
             return false;
         }
-        // the map's own reference is not the caller's: AddRef for the request, ask for the
-        // interface, then drop the extra reference
-        com_add_ref(obj as *mut c_void);
-        let hr = com_qi(obj as *mut c_void, riid, ppv);
-        com_release(obj as *mut c_void);
-        if hr < 0 {
+        // the caller gets the very object a creation returned (side tables are keyed by that
+        // pointer; a stand-in's QueryInterface may answer with the driver object inside it):
+        // only for the pipeline-state interface, with a reference of its own
+        if riid.is_null() || *riid != MEMO_IID_PIPELINE_STATE {
             return false;
         }
+        com_add_ref(obj as *mut c_void);
+        *ppv = obj as *mut c_void;
         self.hits += 1;
         if self.hits % 2000 == 0 {
             crate::xlog_info!("D3D12.X: pipeline memo: {} hits, {} entries", self.hits, self.map.len());
@@ -3769,12 +3769,6 @@ unsafe fn com_release(p: *mut c_void) -> u32 {
     f(p)
 }
 
-unsafe fn com_qi(p: *mut c_void, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
-    let vt = *(p as *const *const usize);
-    let f: unsafe extern "system" fn(*mut c_void, *const GUID, *mut *mut c_void) -> HRESULT = std::mem::transmute(*vt);
-    f(p, riid, ppv)
-}
-
 static PSO_MEMO: Mutex<Option<PsoMemo>> = Mutex::new(None);
 
 /// `XCL_PSO_MEMO=0` turns the memo off.
@@ -3783,11 +3777,24 @@ fn memo_enabled() -> bool {
     *ON.get_or_init(|| std::env::var("XCL_PSO_MEMO").map_or(true, |v| v != "0"))
 }
 
+/// IID of ID3D12PipelineState
+const MEMO_IID_PIPELINE_STATE: GUID = GUID::from_u128(0x765a30f3_f624_4c6f_a828_ace948622445);
+
 unsafe fn memo_lookup(key: u64, riid: *const GUID, ppv: *mut *mut c_void) -> bool {
     if riid.is_null() || ppv.is_null() {
         return false;
     }
-    PSO_MEMO.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(PsoMemo::new).lookup(key, riid, ppv)
+    // only a pipeline whose build has finished is handed out again: a stand-in still being
+    // built goes the normal way, as it did before the memo (a second holder of a pending
+    // stand-in crashed the driver at startup)
+    let mut g = PSO_MEMO.lock().unwrap_or_else(|e| e.into_inner());
+    let memo = g.get_or_insert_with(PsoMemo::new);
+    if let Some(&obj) = memo.map.get(&key) {
+        if super::pso_async::is_pending(obj) || super::pso_async::is_pending_compute(obj) {
+            return false;
+        }
+    }
+    memo.lookup(key, riid, ppv)
 }
 
 unsafe fn memo_insert(key: u64, pso: *mut c_void) {
@@ -6517,7 +6524,7 @@ mod pso_memo_tests {
     fn a_memo_hit_is_the_same_object_and_its_own_reference() {
         let obj = object(1);
         let mut memo = PsoMemo::new();
-        let (key, iid) = (0x1234u64, std::ptr::null::<GUID>());
+        let (key, iid) = (0x1234u64, &MEMO_IID_PIPELINE_STATE as *const GUID);
         let mut out: *mut c_void = std::ptr::null_mut();
         unsafe {
             assert!(!memo.lookup(key, iid, &mut out), "nothing is known yet");
@@ -6526,6 +6533,11 @@ mod pso_memo_tests {
             assert!(memo.lookup(key, iid, &mut out));
             assert_eq!(out, obj);
             assert_eq!(count(obj), 3, "and the caller got one too");
+            let other_iid = GUID::from_u128(0x1234_5678_9abc_def0_1234_5678_9abc_def0);
+            let mut miss: *mut c_void = std::ptr::null_mut();
+            assert!(!memo.lookup(key, &other_iid, &mut miss), "another interface is created the normal way");
+            assert!(miss.is_null() && count(obj) == 3);
+            assert!(!memo.lookup(key, std::ptr::null(), &mut miss), "no interface asked: no hit");
             assert!(memo.lookup(key, iid, &mut out));
             assert_eq!(count(obj), 4);
             memo.insert(key, obj);
@@ -6551,9 +6563,10 @@ mod pso_memo_tests {
             memo.insert(1, b);
             assert_eq!(count(a), 1, "the displaced entry let go of its reference");
             assert_eq!(count(b), 2);
-            assert!(memo.lookup(1, std::ptr::null(), &mut out) && out == b);
+            let iid = &MEMO_IID_PIPELINE_STATE as *const GUID;
+            assert!(memo.lookup(1, iid, &mut out) && out == b);
             let mut other: *mut c_void = std::ptr::null_mut();
-            assert!(!memo.lookup(2, std::ptr::null(), &mut other), "another key is another pipeline");
+            assert!(!memo.lookup(2, iid, &mut other), "another key is another pipeline");
             com_release(b);
             com_release(b);
             assert_eq!(count(b), 1);
