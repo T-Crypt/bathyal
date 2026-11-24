@@ -623,7 +623,9 @@ unsafe fn dispatch_signature(dev: &ID3D12Device) -> ID3D12CommandSignature {
     let mut arg: D3D12_INDIRECT_ARGUMENT_DESC = std::mem::zeroed();
     arg.Type = D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH;
     let desc = D3D12_COMMAND_SIGNATURE_DESC { ByteStride: 12, NumArgumentDescs: 1, pArgumentDescs: &arg, NodeMask: 0 };
-    let sig = dev.CreateCommandSignature(&desc, None).unwrap();
+    let mut out: Option<ID3D12CommandSignature> = None;
+    dev.CreateCommandSignature(&desc, None, &mut out).unwrap();
+    let sig = out.unwrap();
     super::indirect::note_signature(sig.as_raw() as usize, super::indirect::Signature::from_args(12, &[[super::indirect::ARG_DISPATCH, 0, 0, 0]]).unwrap());
     sig
 }
