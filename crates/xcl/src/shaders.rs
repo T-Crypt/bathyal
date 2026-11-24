@@ -5,6 +5,7 @@
 //! translates every program to HLSL (kernel mode) and reports what is still missing;
 //! `--compile N` also compiles N of the complete translations with DXC.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -585,6 +586,7 @@ impl Agg {
 }
 
 enum Input {
+    Single { name: String, data: Vec<u8> },
     Pack { data: Vec<u8>, records: Vec<pack::Record> },
     Files(Vec<PathBuf>),
 }
@@ -592,16 +594,18 @@ enum Input {
 impl Input {
     fn len(&self) -> usize {
         match self {
+            Input::Single { .. } => 1,
             Input::Pack { records, .. } => records.len(),
             Input::Files(f) => f.len(),
         }
     }
 
     /// (name, blob); blob is None when a record does not inflate
-    fn get(&self, i: usize) -> (String, Option<Vec<u8>>) {
+    fn get(&self, i: usize) -> (String, Option<Cow<'_, [u8]>>) {
         match self {
-            Input::Pack { data, records } => (format!("{} @{:#x}", records[i].name, records[i].offset), pack::inflate(data, &records[i])),
-            Input::Files(f) => (f[i].display().to_string(), std::fs::read(&f[i]).ok()),
+            Input::Single { name, data } => (name.clone(), Some(Cow::Borrowed(data))),
+            Input::Pack { data, records } => (format!("{} @{:#x}", records[i].name, records[i].offset), pack::inflate(data, &records[i]).map(Cow::Owned)),
+            Input::Files(f) => (f[i].display().to_string(), std::fs::read(&f[i]).ok().map(Cow::Owned)),
         }
     }
 }
@@ -625,6 +629,11 @@ fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) {
 }
 
 fn analyze(input: &Input, recomp_on: bool, keep: usize, iface_on: bool) -> Agg {
+    if let Input::Single { name, data } = input {
+        let mut a = Agg { recomp_on, keep, iface_on, ..Default::default() };
+        a.add(name, data);
+        return a;
+    }
     let n = input.len();
     let next = AtomicUsize::new(0);
     let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).min(32);
@@ -707,9 +716,7 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
             let what = format!("RPF9 package {:.1} MB, {} shader records", data.len() as f64 / 1048576.0, records.len());
             (Input::Pack { data, records }, what)
         } else {
-            let mut a = Agg { recomp_on, keep: compile, iface_on, ..Default::default() };
-            a.add(&path.display().to_string(), &data);
-            return print(path, "single file", a, top, json, t0, compile);
+            (Input::Single { name: path.display().to_string(), data }, String::from("single file"))
         }
     };
     if args.iter().any(|a| a == "--precompile") {

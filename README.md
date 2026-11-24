@@ -137,6 +137,7 @@ bathyal inspect D:\Game\game.exe               # the game's imports and what Bat
 bathyal run D:\Game [-- game arguments]        # run
 bathyal disasm <shader.bin> [--hex]            # RDNA2 disassembler (console containers too)
 bathyal shaders D:\data\shaders.rpf --top 50   # pack statistics; --recomp / --compile N
+bathyal shaders D:\data\shader.dxbc --precompile   # warm the DXIL cache for one console shader
 bathyal rpf D:\data\shaders.rpf --extract NAME --out folder
 ```
 
