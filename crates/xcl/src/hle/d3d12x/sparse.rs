@@ -2083,8 +2083,11 @@ mod tests {
                 fence,
                 value: 0,
                 event,
-                rb_fence,
-                rb_value: 0,
+                rb_fences: {
+                    let mut m = FxHashMap::default();
+                    m.insert(0, (rb_fence, 0));
+                    m
+                },
                 windows: vec![(base, reserved)],
                 pools: Vec::new(),
                 free: Vec::new(),
