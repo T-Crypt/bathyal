@@ -33,12 +33,44 @@ struct Pending {
     orphan: std::sync::atomic::AtomicBool,
     /// its shaders are in the prewarm record (marked once)
     noted: std::sync::atomic::AtomicBool,
+    /// one of the title's threads waits for it: its build does not stand back for the title
+    demand: Mutex<Demand>,
 }
 
 impl Pending {
     fn is_active(&self) -> bool {
         self.sent.load(Ordering::Acquire) && !*self.done.lock().unwrap()
     }
+
+    /// One of the title's threads is about to wait for it: the build goes on without waiting
+    /// for its turn among the big driver compiles (`real::big_compile_turn`).
+    fn want(&self) {
+        self.demand.lock().unwrap().wanted = true;
+    }
+}
+
+/// Whether one of the title's threads waits for the pipeline.
+#[derive(Default)]
+struct Demand {
+    wanted: bool,
+}
+
+thread_local! {
+    /// what this worker is building
+    static BUILDING: std::cell::RefCell<Option<Arc<Pending>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// This thread is a worker and one of the title's threads waits for what it is building: the
+/// build must not stand back for the title's sake (`real::big_compile_turn`).
+pub(super) fn build_is_wanted() -> bool {
+    BUILDING.with(|b| b.borrow().as_ref().is_some_and(|p| p.demand.lock().unwrap().wanted))
+}
+
+/// A worker's build of `p`.
+fn build(p: &Arc<Pending>, job: Job) {
+    BUILDING.with(|b| *b.borrow_mut() = Some(p.clone()));
+    complete(p, job());
+    BUILDING.with(|b| *b.borrow_mut() = None);
 }
 
 /// stand-in handed to the title → its real pipeline
@@ -104,7 +136,7 @@ fn spawn_pool(prefix: &str, threads: usize) -> Mutex<mpsc::Sender<Arc<Pending>>>
             // (None: a bind took it and builds it itself)
             let job = p.job.lock().unwrap().take();
             if let Some(job) = job {
-                complete(&p, job());
+                build(&p, job);
             }
         });
     }
@@ -235,6 +267,7 @@ pub fn resolve_wait(pso: usize) -> usize {
     if let Some(job) = job {
         complete(&p, job());
     }
+    p.want();
     let mut done = p.done.lock().unwrap();
     while !*done {
         done = p.cv.wait(done).unwrap();
@@ -313,6 +346,7 @@ fn resolve_within(pso: usize, limit: Option<Duration>, epoch: u64, budget: &Mute
     let _ = enqueue(&p);
     let start = Instant::now();
     let deadline = start + left;
+    p.want();
     let mut done = p.done.lock().unwrap();
     while !*done {
         let now = Instant::now();
@@ -431,6 +465,7 @@ fn resolve_compute_within(pso: usize, limit: Option<std::time::Duration>, budget
     }
     let started = std::time::Instant::now();
     let deadline = started + rem_budget;
+    p.want();
     let mut done = p.done.lock().unwrap();
     while !*done {
         let rem = deadline.saturating_duration_since(std::time::Instant::now());

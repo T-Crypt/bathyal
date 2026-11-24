@@ -4064,17 +4064,6 @@ struct Slots {
 
 struct SlotGuard(&'static Slots);
 
-impl Slots {
-    fn acquire(&'static self) -> SlotGuard {
-        let mut n = self.n.lock().unwrap();
-        while *n >= self.most {
-            n = self.cv.wait(n).unwrap();
-        }
-        *n += 1;
-        SlotGuard(self)
-    }
-}
-
 impl Drop for SlotGuard {
     fn drop(&mut self) {
         *self.0.n.lock().unwrap() -= 1;
@@ -4123,7 +4112,9 @@ fn wait_for_commit_with(mut avail: impl FnMut() -> Option<u64>, reserve: u64, gr
 
 /// Before a big driver compile in the background: wait up to `BIG_COMMIT_GRACE` for 3 GB of
 /// free commit (each big compile takes ~1.5 GB), then proceed one at a time (`BIG_COMPILES`)
-/// rather than deadlocking against an unexpanded Windows dynamic pagefile.
+/// rather than deadlocking against an unexpanded Windows dynamic pagefile. (`big_compile_turn`
+/// now does this with the demand check; kept for its tests and as the documented fallback.)
+#[allow(dead_code)]
 fn wait_for_commit() {
     if !wait_for_commit_with(avail_pagefile_bytes, BIG_COMMIT_RESERVE, BIG_COMMIT_GRACE, std::time::Duration::from_millis(200)) {
         static LOGGED: std::sync::Once = std::sync::Once::new();
@@ -4135,6 +4126,56 @@ fn wait_for_commit() {
             );
         });
     }
+}
+
+/// Before a big driver compile in the background: its turn – one at a time, and 3 GB of commit
+/// free (each takes ~1.5 GB; the title loading next to it must not run out). Unless one of the
+/// title's threads waits for the pipeline (`wanted`): then at once and without a slot (None), as
+/// when that thread builds it itself. Holding such a build back holds the title back: on a
+/// machine with less than 3 GB of commit free throughout a retail title's world loading, the
+/// first one would not go on and keeps the slot, until the title's watchdog ends it.
+fn big_compile_turn(slots: &'static Slots, commit_free: impl Fn() -> bool, wanted: impl Fn() -> bool) -> Option<SlotGuard> {
+    const LOOK: std::time::Duration = std::time::Duration::from_millis(50);
+    let slot = {
+        let mut n = slots.n.lock().unwrap();
+        loop {
+            if wanted() {
+                return None;
+            }
+            if *n < slots.most {
+                break;
+            }
+            n = slots.cv.wait_timeout(n, LOOK).unwrap().0;
+        }
+        *n += 1;
+        SlotGuard(slots)
+    };
+    // our grace: a dynamic pagefile does not expand while threads only poll, so do not wait
+    // for commit forever (the reason `BIG_COMMIT_GRACE` exists)
+    let start = std::time::Instant::now();
+    while !commit_free() {
+        if wanted() {
+            return None;
+        }
+        if start.elapsed() >= BIG_COMMIT_GRACE {
+            static LOGGED: std::sync::Once = std::sync::Once::new();
+            LOGGED.call_once(|| {
+                crate::xlog_warn!(
+                    "D3D12.X: proceeding with a big compute PSO compile after {} s without {} GB of free commit",
+                    BIG_COMMIT_GRACE.as_secs(),
+                    BIG_COMMIT_RESERVE >> 30
+                );
+            });
+            break;
+        }
+        std::thread::sleep(LOOK);
+    }
+    Some(slot)
+}
+
+/// 3 GB of commit are free (true when that is not known).
+fn big_compile_commit_free() -> bool {
+    avail_pagefile_bytes().is_none_or(|free| free >= BIG_COMMIT_RESERVE)
 }
 
 unsafe fn translated_compute_pso(this: *mut c_void, f: PsoFn, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> Option<Result<HRESULT, ()>> {
@@ -4178,11 +4219,8 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
     copy.CachedPSO = D3D12_CACHED_PIPELINE_STATE::default();
     let key = super::pso_disk::compute_key(&copy, &compiled.samplers);
     // in the background, one at a time and within the commit left (each ~1.5 GB in the driver)
-    let _slot = (big && std::thread::current().name().is_some_and(|n| n.starts_with("xcl-pso"))).then(|| {
-        let slot = BIG_COMPILES.acquire();
-        wait_for_commit();
-        slot
-    });
+    let _slot = (big && std::thread::current().name().is_some_and(|n| n.starts_with("xcl-pso")))
+        .then(|| big_compile_turn(&BIG_COMPILES, big_compile_commit_free, super::pso_async::build_is_wanted));
     // a driver blob saved for this pipeline skips the driver's compile (`pso_disk`)
     let hr = finish_pso_cached(this, f, &mut copy as *mut _ as *mut c_void, false, key, riid, ppv);
     if hr < 0 {
@@ -7276,5 +7314,51 @@ mod map_tests {
                 RESERVED.lock().unwrap().as_mut().unwrap().remove(&(raw as usize));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod big_compile_tests {
+    use super::*;
+    use std::sync::atomic::AtomicBool;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn a_wanted_build_waits_for_neither_the_slot_nor_the_commit() {
+        static S: Slots = Slots { n: Mutex::new(0), cv: std::sync::Condvar::new(), most: 1 };
+        let held = big_compile_turn(&S, || true, || false).expect("a free slot");
+        assert_eq!(*S.n.lock().unwrap(), 1);
+        // the slot is taken: a wanted build goes on without one, at once
+        assert!(big_compile_turn(&S, || true, || true).is_none());
+        // … and one that becomes wanted while it waits for the slot goes on then
+        static WANTED: AtomicBool = AtomicBool::new(false);
+        let t = std::thread::spawn(|| big_compile_turn(&S, || true, || WANTED.load(Ordering::Acquire)).is_none());
+        std::thread::sleep(Duration::from_millis(120));
+        assert!(!t.is_finished(), "not wanted yet: it waits for its turn");
+        WANTED.store(true, Ordering::Release);
+        assert!(t.join().unwrap());
+        drop(held);
+        assert_eq!(*S.n.lock().unwrap(), 0);
+        // without the commit: not wanted, it waits; wanted, it goes on and gives the slot back
+        static WANTED2: AtomicBool = AtomicBool::new(false);
+        let t0 = Instant::now();
+        let t = std::thread::spawn(|| big_compile_turn(&S, || false, || WANTED2.load(Ordering::Acquire)).is_none());
+        std::thread::sleep(Duration::from_millis(120));
+        assert!(!t.is_finished(), "no commit free: it waits");
+        WANTED2.store(true, Ordering::Release);
+        assert!(t.join().unwrap() && t0.elapsed() < Duration::from_secs(5));
+        assert_eq!(*S.n.lock().unwrap(), 0, "the slot went back");
+    }
+
+    #[test]
+    fn unwanted_builds_go_one_at_a_time_when_the_commit_is_there() {
+        static S: Slots = Slots { n: Mutex::new(0), cv: std::sync::Condvar::new(), most: 1 };
+        let first = big_compile_turn(&S, || true, || false).expect("its turn");
+        let t = std::thread::spawn(|| big_compile_turn(&S, || true, || false).is_some());
+        std::thread::sleep(Duration::from_millis(120));
+        assert!(!t.is_finished(), "one at a time");
+        drop(first);
+        assert!(t.join().unwrap(), "the next one's turn");
+        assert_eq!(*S.n.lock().unwrap(), 0);
     }
 }
