@@ -637,13 +637,15 @@ fn nv_parallel_driver_compile() {
         .filter_map(|v| v.trim().parse().ok())
         .collect();
     let jobs = num("XCL_NV_JOBS", 8);
-    let blocks = num("XCL_NV_BLOCKS", 400);
+    let blocks = num("XCL_NV_BLOCKS", 1400);
     let program = |salt: u32| -> Vec<u8> {
         let mut v = Vec::new();
         let mut e = |n: &str, enc: &str, f: &[(&str, u64)], l: Option<u32>| v.extend(encode(n, enc, f, l).unwrap_or_else(|x| panic!("{n}: {x}")));
         e("S_MOV_B32", "ENC_SOP1", &[("SDST", 30), ("SSRC0", 255)], Some(salt));
         for i in 0..blocks as u64 {
-            e("S_LOAD_DWORDX4", "ENC_SMEM", &[("SDATA", 8), ("SBASE", 2), ("OFFSET", (i * 16) & 0xFFFF)], None);
+            // the run's salt in an address: the DXIL (and so the driver's cache key) differs
+            // per run, where a constant only in a register could be optimised away
+            e("S_LOAD_DWORDX4", "ENC_SMEM", &[("SDATA", 8), ("SBASE", 2), ("OFFSET", ((i * 16) ^ (salt as u64 & 0xF0)) & 0xFFFF)], None);
             e("BUFFER_LOAD_DWORD", "ENC_MUBUF", &[("VDATA", 1), ("VADDR", 0), ("SRSRC", 2), ("SOFFSET", 128), ("IDXEN", 1)], None);
             e("GLOBAL_LOAD_DWORD", "ENC_FLAT_GLBL", &[("VDST", 6), ("ADDR", 4), ("SADDR", 0x7D), ("OFFSET", (i * 4) & 0x7FF)], None);
             for k in 0..12u64 {
@@ -668,6 +670,10 @@ fn nv_parallel_driver_compile() {
             programs.push(super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap());
         }
         let dxil: usize = programs.iter().map(Vec::len).sum();
+        // a digest over the DXIL, so a run the driver's cache answered is visible as one
+        let digest = programs.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, p| {
+            p.iter().fold(h, |h, &b| (h ^ b as u64).wrapping_mul(0x100_0000_01b3))
+        });
         let next = std::sync::atomic::AtomicUsize::new(0);
         let per: std::sync::Mutex<Vec<f64>> = Default::default();
         let keep: std::sync::Mutex<Vec<usize>> = Default::default();
@@ -703,7 +709,7 @@ fn nv_parallel_driver_compile() {
         v.sort_by(|a, b| a.partial_cmp(b).unwrap());
         let sum: f64 = v.iter().sum();
         println!(
-            "{threads:>2} thread(s): {jobs} programs, DXIL {:.1} MB, wall {wall:6.2} s, sum {sum:6.2} s, speedup {:.2}, median {:6.2} s, max {:6.2} s",
+            "{threads:>2} thread(s): {jobs} programs, DXIL {:.1} MB (digest {digest:016x}), wall {wall:6.2} s, sum {sum:6.2} s, speedup {:.2}, median {:6.2} s, max {:6.2} s",
             dxil as f64 / 1048576.0,
             sum / wall,
             v[v.len() / 2],
