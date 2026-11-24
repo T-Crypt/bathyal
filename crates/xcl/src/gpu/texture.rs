@@ -208,6 +208,20 @@ pub unsafe fn upload_batch(dev: &ID3D12Device, queue: &ID3D12CommandQueue, items
     if items.is_empty() {
         return Ok(Vec::new());
     }
+    let (failed, in_flight) = submit_batch(dev, queue, items)?;
+    wait(dev, queue)?;
+    drop(in_flight);
+    Ok(failed)
+}
+
+pub struct InFlight {
+    _alloc: ID3D12CommandAllocator,
+    _list: ID3D12GraphicsCommandList,
+    _staging: Vec<ID3D12Resource>,
+    pub bytes: u64,
+}
+
+pub unsafe fn submit_batch(dev: &ID3D12Device, queue: &ID3D12CommandQueue, items: &[(ID3D12Resource, Vec<Subresource>, Vec<D3D12_RESOURCE_STATES>)]) -> Result<(Vec<(usize, String)>, InFlight), String> {
     let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).map_err(err)?;
     let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).map_err(err)?;
     let mut staging = Vec::with_capacity(items.len());
@@ -220,9 +234,8 @@ pub unsafe fn upload_batch(dev: &ID3D12Device, queue: &ID3D12CommandQueue, items
     }
     list.Close().map_err(err)?;
     queue.ExecuteCommandLists(&[Some(windows::core::Interface::cast(&list).map_err(err)?)]);
-    wait(dev, queue)?;
-    drop(staging);
-    Ok(failed)
+    let bytes = staging.iter().map(|b| b.GetDesc().Width).sum();
+    Ok((failed, InFlight { _alloc: alloc, _list: list, _staging: staging, bytes }))
 }
 
 /// Record the copy of `subs` into `res` on `list` (barriers from `before` and back to `after`);
