@@ -1912,26 +1912,41 @@ static MIRRORS: Mutex<Vec<(u64, usize, usize)>> = Mutex::new(Vec::new());
 static MIRROR_BYTES: AtomicU64 = AtomicU64::new(0);
 
 /// Where `[va, va + bytes)` is in a mirror, if it is in one.
-fn mirrored(va: u64, bytes: usize) -> Option<usize> {
+pub(super) fn mirrored(va: u64, bytes: usize) -> Option<usize> {
     MIRRORS.lock().unwrap().iter().find(|&&(s, l, _)| va >= s && va + bytes as u64 <= s + l as u64).map(|&(s, _, m)| m + (va - s) as usize)
 }
 
 /// The mirror address of the title's buffer at `va`; its range's mirror is made (and filled
 /// once) the first time.
-unsafe fn mirror_of(va: u64, bytes: usize, what: &str) -> Option<usize> {
+pub(super) unsafe fn mirror_of(va: u64, bytes: usize, what: &str) -> Option<usize> {
     if let Some(p) = mirrored(va, bytes) {
+        let src = crate::hle::kernelx::mirrors::source(va as usize).unwrap_or(va as usize);
+        if crate::gpu::shader::readable(src, bytes) {
+            std::ptr::copy_nonoverlapping(src as *const u8, p as *mut u8, bytes);
+        }
         return Some(p);
     }
     let mut g = MIRRORS.lock().unwrap();
     // again under the lock: two lists binding one new range at once must share a mirror (a
     // second one would never be synced – every later lookup finds the first)
     if let Some(&(s, _, m)) = g.iter().find(|&&(s, l, _)| va >= s && va + bytes as u64 <= s + l as u64) {
-        return Some(m + (va - s) as usize);
+        let p = m + (va - s) as usize;
+        let src = crate::hle::kernelx::mirrors::source(va as usize).unwrap_or(va as usize);
+        if crate::gpu::shader::readable(src, bytes) {
+            std::ptr::copy_nonoverlapping(src as *const u8, p as *mut u8, bytes);
+        }
+        return Some(p);
     }
     let start = va & !0xffff;
     let len = ((va + bytes as u64 + 0xffff) & !0xffff) - start;
+    let src_start = crate::hle::kernelx::mirrors::source(start as usize).unwrap_or(start as usize);
     // only as much as is the title's readable memory (the view itself is)
-    let (start, len) = if crate::gpu::shader::readable(start as usize, len as usize) { (start, len as usize) } else { (va, bytes) };
+    let (start, len, src) = if crate::gpu::shader::readable(src_start, len as usize) {
+        (start, len as usize, src_start)
+    } else {
+        let src_va = crate::hle::kernelx::mirrors::source(va as usize).unwrap_or(va as usize);
+        (va, bytes, src_va)
+    };
     if MIRROR_BYTES.load(Ordering::Relaxed) + len as u64 > 2 << 30 {
         static FULL: AtomicBool = AtomicBool::new(false);
         if !FULL.swap(true, Ordering::Relaxed) {
@@ -1944,7 +1959,7 @@ unsafe fn mirror_of(va: u64, bytes: usize, what: &str) -> Option<usize> {
         Some((p, _)) => p,
         None => u.alloc(len, 0x1_0000)? as usize,
     };
-    std::ptr::copy_nonoverlapping(start as *const u8, p as *mut u8, len);
+    std::ptr::copy_nonoverlapping(src as *const u8, p as *mut u8, len);
     g.push((start, len, p));
     let total = MIRROR_BYTES.fetch_add(len as u64, Ordering::Relaxed) + len as u64;
     if g.len() <= 8 || g.len().is_power_of_two() {
@@ -1975,8 +1990,9 @@ pub(super) unsafe fn sync_title_buffers(list: *mut c_void, indexed: Option<(u32,
     let copy = |va: u64, mirror: usize, bytes: u32, from: u64, len: u64| {
         let from = from.min(bytes as u64);
         let len = len.min(bytes as u64 - from) as usize;
-        if len > 0 && crate::gpu::shader::readable(va as usize + from as usize, len) {
-            std::ptr::copy_nonoverlapping((va + from) as *const u8, (mirror + from as usize) as *mut u8, len);
+        let src = crate::hle::kernelx::mirrors::source((va + from) as usize).unwrap_or((va + from) as usize);
+        if len > 0 && crate::gpu::shader::readable(src, len) {
+            std::ptr::copy_nonoverlapping(src as *const u8, (mirror + from as usize) as *mut u8, len);
         }
     };
     // the vertices read: [lo, hi)

@@ -1063,6 +1063,10 @@ unsafe fn create_placed_resource_inner(this: *mut c_void, va: u64, desc: *const 
     }
     if hr >= 0 && !(*ppv).is_null() {
         real::note_title_address(*ppv as usize, va as usize);
+        if buffer {
+            let pc = std::ptr::read_unaligned(d.as_ptr() as *const D3D12_RESOURCE_DESC);
+            real::note_title_buffer_bytes(*ppv as usize, pc.Width as usize);
+        }
     }
     if hr < 0 || once(&N, 4) {
         let w = |o: usize| u32::from_le_bytes(x[o..o + 4].try_into().unwrap());
