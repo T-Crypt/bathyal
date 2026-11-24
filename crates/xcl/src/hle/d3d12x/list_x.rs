@@ -2381,7 +2381,19 @@ pub(super) unsafe extern "system" fn copy_buffer_region_x(this: *mut c_void, dst
             note_gpu_write("CopyBufferRegion", a + dst_off as usize, n);
         }
     }
+    note_referenced(dst, dst_off, n);
+    note_referenced(src, src_off, n);
     pc::<unsafe extern "system" fn(*mut c_void, usize, u64, usize, u64, u64)>(this, PC_COPY_BUFFER_REGION)(this, dst, dst_off + real::buffer_delta(dst), src, src_off + real::buffer_delta(src), n)
+}
+
+/// A copy reads `[off, off + n)` of `res` (or writes it there): when that lies in the title's
+/// sparse windows, its video memory is lined up again after CPU writes before the copy runs.
+unsafe fn note_referenced(res: usize, off: u64, n: u64) {
+    if !crate::gpu::uma::get().is_some_and(|u| u.has_sparse()) {
+        return;
+    }
+    let Some(va) = real::title_address(res) else { return };
+    super::sparse::note_referenced(va + off as usize, n as usize);
 }
 
 /// `XCL_TRACE_FRAME` with a watched target (`present::watch_rt`): copies out of it – that
@@ -2479,6 +2491,17 @@ pub(super) unsafe extern "system" fn copy_texture_region_x(this: *mut c_void, ds
                 }
             }
         }
+    }
+    // what the copy reads and writes in the title's own memory is watched until its tiles go
+    for loc in [src.as_ref(), dst.as_ref()].into_iter().flatten() {
+        let r: usize = transmute_copy(&loc.pResource);
+        let (off, n) = if loc.Type == D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT {
+            let f = loc.Anonymous.PlacedFootprint;
+            (f.Offset as u64, f.Footprint.RowPitch as u64 * f.Footprint.Height.max(1) as u64)
+        } else {
+            (0, 0)
+        };
+        note_referenced(r, off, n);
     }
     let (Some(d), Some(s)) = (pc_location(dst), pc_location(src)) else { return };
     if no_resource("CopyTextureRegion", transmute_copy::<_, usize>(&d.pResource)) || no_resource("CopyTextureRegion source", transmute_copy::<_, usize>(&s.pResource)) {
