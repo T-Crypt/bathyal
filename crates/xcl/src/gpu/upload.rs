@@ -357,6 +357,13 @@ mod gpu_tests {
             let mut o = Options16::default();
             let queried = dev.CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS16, &mut o as *mut _ as *mut std::ffi::c_void, std::mem::size_of::<Options16>() as u32).is_ok();
             println!("OPTIONS16: queried {queried}, GPUUploadHeapSupported {}", o.gpu_upload_heap_supported != 0);
+            if std::env::var_os("XCL_GPU_UPLOAD_PROBE").is_some() {
+                for cap in [1usize << 20, 64 << 20, 1024 << 20] {
+                    if let Some(h) = create(&dev, cap) {
+                        println!("PROBE {cap:#x} bytes: CPU {:#x} (window index {}), GPU VA {:#x}", h.cpu, (h.cpu >> 32) & 3, h.gpu);
+                    }
+                }
+            }
             let Some(h) = create(&dev, 0x1_0000) else {
                 println!("no GPU_UPLOAD heap on this runtime/GPU – skipping");
                 return;
