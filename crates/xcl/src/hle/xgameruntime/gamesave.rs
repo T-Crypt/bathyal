@@ -4,7 +4,7 @@
 
 use std::ffi::{c_void, CString};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use super::xasync::*;
 use crate::util::{from_cstr_ptr, E_FAIL, E_INVALIDARG, HRESULT, S_OK};
@@ -21,6 +21,13 @@ const CONTAINER_NAME_FILE: &str = "container_name";
 /// for `/` → `%2F` expansion (`enc`) and for path nesting under the provider root.
 const MAX_CONTAINER_FOLDER_CHARS: usize = 200;
 static NEXT_TMP: AtomicU64 = AtomicU64::new(0);
+
+/// Test-only: after this many successful `stage_write` calls in an `apply`, the next one fails.
+/// `usize::MAX` disables the fault (production / normal tests).
+#[cfg(test)]
+static FAIL_STAGE_AFTER: AtomicUsize = AtomicUsize::new(usize::MAX);
+#[cfg(test)]
+static STAGE_WRITES: AtomicUsize = AtomicUsize::new(0);
 
 pub const E_GS_INVALID_CONTAINER_NAME: HRESULT = 0x8083_0001u32 as i32;
 pub const E_GS_PROVIDED_BUFFER_TOO_SMALL: HRESULT = 0x8083_0007u32 as i32;
@@ -196,9 +203,16 @@ fn replace_file(tmp: &Path, dest: &Path) -> std::io::Result<()> {
     }
 }
 
-/// Write `data` to a unique sibling temp file, flush to disk, and atomically replace `dest`.
-fn write_atomic(dest: &Path, data: &[u8]) -> std::io::Result<()> {
+/// Write `data` to a unique sibling temp file and flush it; does not touch `dest` yet (#324).
+fn stage_write(dest: &Path, data: &[u8]) -> std::io::Result<PathBuf> {
     use std::io::Write;
+    #[cfg(test)]
+    {
+        let n = STAGE_WRITES.fetch_add(1, Ordering::Relaxed);
+        if n >= FAIL_STAGE_AFTER.load(Ordering::Relaxed) {
+            return Err(std::io::Error::other("injected stage_write failure"));
+        }
+    }
     let parent = dest
         .parent()
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "missing parent directory"))?;
@@ -208,10 +222,19 @@ fn write_atomic(dest: &Path, data: &[u8]) -> std::io::Result<()> {
         let mut f = std::fs::File::create(&tmp)?;
         f.write_all(data)?;
         f.sync_all()?;
-        drop(f);
-        replace_file(&tmp, dest)?;
         Ok(())
     })();
+    if let Err(e) = res {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    Ok(tmp)
+}
+
+/// Write `data` to a unique sibling temp file, flush to disk, and atomically replace `dest`.
+fn write_atomic(dest: &Path, data: &[u8]) -> std::io::Result<()> {
+    let tmp = stage_write(dest, data)?;
+    let res = replace_file(&tmp, dest);
     if res.is_err() {
         let _ = std::fs::remove_file(&tmp);
     }
@@ -621,27 +644,57 @@ fn apply(dir: &Path, container_name: &str, display: Option<&str>, ops: &[(String
     if std::fs::create_dir_all(&blobs).is_err() {
         return crate::util::E_FAIL;
     }
-    if write_atomic(&dir.join(CONTAINER_NAME_FILE), container_name.as_bytes()).is_err() {
-        return crate::util::E_FAIL;
+
+    // Stage every write first; only rename into place after all stages succeed (#324).
+    // Deletes wait until after the renames so a failed stage leaves the container untouched.
+    let mut staged: Vec<(PathBuf, PathBuf)> = Vec::new();
+    let mut deletes: Vec<PathBuf> = Vec::new();
+    let mut stage_ok = true;
+
+    match stage_write(&dir.join(CONTAINER_NAME_FILE), container_name.as_bytes()) {
+        Ok(tmp) => staged.push((tmp, dir.join(CONTAINER_NAME_FILE))),
+        Err(_) => return crate::util::E_FAIL,
     }
     if let Some(d) = display {
-        if write_atomic(&dir.join("display"), d.as_bytes()).is_err() {
+        match stage_write(&dir.join("display"), d.as_bytes()) {
+            Ok(tmp) => staged.push((tmp, dir.join("display"))),
+            Err(_) => stage_ok = false,
+        }
+    }
+    if stage_ok {
+        for (name, data) in ops {
+            let path = blobs.join(enc(name));
+            match data {
+                Some(d) => match stage_write(&path, d) {
+                    Ok(tmp) => staged.push((tmp, path)),
+                    Err(_) => {
+                        stage_ok = false;
+                        break;
+                    }
+                },
+                None => deletes.push(path),
+            }
+        }
+    }
+
+    if !stage_ok {
+        for (tmp, _) in &staged {
+            let _ = std::fs::remove_file(tmp);
+        }
+        return crate::util::E_FAIL;
+    }
+
+    for (i, (tmp, dest)) in staged.iter().enumerate() {
+        if replace_file(tmp, dest).is_err() {
+            let _ = std::fs::remove_file(tmp);
+            for (left, _) in &staged[i + 1..] {
+                let _ = std::fs::remove_file(left);
+            }
             return crate::util::E_FAIL;
         }
     }
-    for (name, data) in ops {
-        let path = blobs.join(enc(name));
-        match data {
-            Some(d) => {
-                // write to a unique sibling temp file, sync, then replace atomically
-                if write_atomic(&path, d).is_err() {
-                    return crate::util::E_FAIL;
-                }
-            }
-            None => {
-                let _ = std::fs::remove_file(&path);
-            }
-        }
+    for path in deletes {
+        let _ = std::fs::remove_file(path);
     }
     S_OK
 }
@@ -1267,6 +1320,47 @@ mod tests {
             let mut after: Vec<(String, String, u32, u64)> = Vec::new();
             assert_eq!(XGameSaveEnumerateContainerInfo(p, &mut after as *mut _ as *mut c_void, Some(count_containers)), S_OK);
             assert!(after.is_empty());
+        }
+    }
+
+    /// #324: if a later blob cannot be staged, earlier blobs and the display name stay unchanged.
+    #[test]
+    fn failed_submit_leaves_container_untouched() {
+        let _g = crate::hle::xgameruntime::xasync::ASYNC_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            let cfg = format!("xcl-test-atomic-submit-{}\0", std::process::id());
+            let mut p = std::ptr::null_mut();
+            assert_eq!(XGameSaveInitializeProvider(std::ptr::null_mut(), cfg.as_ptr(), false, &mut p), S_OK);
+            let root = (*p).root.clone();
+            let mut c = std::ptr::null_mut();
+            assert_eq!(XGameSaveCreateContainer(p, b"slot\0".as_ptr(), &mut c), S_OK);
+
+            let mut u0 = std::ptr::null_mut();
+            assert_eq!(XGameSaveCreateUpdate(c, b"Old\0".as_ptr(), &mut u0), S_OK);
+            assert_eq!(XGameSaveSubmitBlobWrite(u0, b"a\0".as_ptr(), b"old".as_ptr(), 3), S_OK);
+            assert_eq!(XGameSaveSubmitUpdate(u0), S_OK);
+            XGameSaveCloseUpdate(u0);
+
+            // container name + display + blob "a" + blob "b" => 4 stage_writes; fail starting at
+            // the 4th (blob b).
+            FAIL_STAGE_AFTER.store(3, Ordering::Relaxed);
+            STAGE_WRITES.store(0, Ordering::Relaxed);
+            let mut u1 = std::ptr::null_mut();
+            assert_eq!(XGameSaveCreateUpdate(c, b"New\0".as_ptr(), &mut u1), S_OK);
+            assert_eq!(XGameSaveSubmitBlobWrite(u1, b"a\0".as_ptr(), b"new".as_ptr(), 3), S_OK);
+            assert_eq!(XGameSaveSubmitBlobWrite(u1, b"b\0".as_ptr(), b"extra".as_ptr(), 5), S_OK);
+            assert_eq!(XGameSaveSubmitUpdate(u1), crate::util::E_FAIL);
+            XGameSaveCloseUpdate(u1);
+            FAIL_STAGE_AFTER.store(usize::MAX, Ordering::Relaxed);
+
+            assert_eq!(std::fs::read_to_string((*c).dir.join("display")).unwrap(), "Old");
+            let names = [b"a\0".as_ptr()];
+            let mut n = 1u32;
+            let mut buf = vec![0u64; 32];
+            assert_eq!(XGameSaveReadBlobData(c, names.as_ptr(), &mut n, 256, buf.as_mut_ptr() as *mut Blob), S_OK);
+            let b0 = &*(buf.as_ptr() as *const Blob);
+            assert_eq!(std::slice::from_raw_parts(b0.data, 3), b"old");
+            assert!(!(*c).dir.join("b").join(enc("b")).exists());
 
             XGameSaveCloseContainer(c);
             XGameSaveCloseProvider(p);
