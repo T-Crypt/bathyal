@@ -3727,7 +3727,7 @@ impl PsoMemo {
         // the caller gets the very object a creation returned (side tables are keyed by that
         // pointer; a stand-in's QueryInterface may answer with the driver object inside it):
         // only for the pipeline-state interface, with a reference of its own
-        if riid.is_null() || *riid != MEMO_IID_PIPELINE_STATE {
+        if riid.is_null() || !same_guid(&*riid, &MEMO_IID_PIPELINE_STATE) {
             return false;
         }
         com_add_ref(obj as *mut c_void);
@@ -3775,6 +3775,10 @@ static PSO_MEMO: Mutex<Option<PsoMemo>> = Mutex::new(None);
 fn memo_enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var("XCL_PSO_MEMO").map_or(true, |v| v != "0"))
+}
+
+fn same_guid(a: &GUID, b: &GUID) -> bool {
+    a.data1 == b.data1 && a.data2 == b.data2 && a.data3 == b.data3 && a.data4 == b.data4
 }
 
 /// IID of ID3D12PipelineState
