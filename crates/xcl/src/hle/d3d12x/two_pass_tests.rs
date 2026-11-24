@@ -540,3 +540,205 @@ fn gpu_console_gs_pipeline_draws_through_draw_instanced() {
         u.free(vb);
     }
 }
+
+/// The synthetic console NGG program of the DispatchMesh test as a pipeline, for the indirect
+/// tests: one triangle per group, the group index added to x.
+unsafe fn mesh_pso(dev: &ID3D12Device) -> ID3D12PipelineState {
+    let exp = |tgt: u64, en: u64, v: [u64; 4], done: u64| ("EXP", "ENC_EXP", vec![("TGT", tgt), ("EN", en), ("VSRC0", v[0]), ("VSRC1", v[1]), ("VSRC2", v[2]), ("VSRC3", v[3]), ("DONE", done)], None);
+    let mut list: Vec<(&str, &str, Vec<(&str, u64)>, Option<u32>)> = vec![
+        ("S_BFE_U32", "ENC_SOP2", vec![("SDST", 0), ("SSRC0", 3), ("SSRC1", 255)], Some(0x40018)),
+        ("V_MBCNT_LO_U32_B32", "ENC_VOP3", vec![("VDST", 0), ("SRC0", 193), ("SRC1", 128)], None),
+        ("V_MBCNT_HI_U32_B32", "ENC_VOP3", vec![("VDST", 0), ("SRC0", 193), ("SRC1", V)], None),
+        ("V_LSHL_ADD_U32", "ENC_VOP3", vec![("VDST", 0), ("SRC0", 0), ("SRC1", 134), ("SRC2", V)], None),
+        ("V_READFIRSTLANE_B32", "ENC_VOP1", vec![("VDST", 1), ("SRC0", V + 5)], None),
+        ("S_LSHR_B32", "ENC_SOP2", vec![("SDST", 1), ("SSRC0", 1), ("SSRC1", 135)], None),
+        ("S_MOV_B32", "ENC_SOP1", vec![("SDST", 124), ("SSRC0", 255)], Some(1 << 12 | 3)),
+        ("S_SENDMSG", "ENC_SOPP", vec![("SIMM16", 9)], None),
+        ("S_BARRIER", "ENC_SOPP", vec![], None),
+        ("V_CMPX_GT_U32", "ENC_VOPC", vec![("SRC0", 131), ("VSRC1", 0)], None),
+        ("BUFFER_LOAD_DWORDX4", "ENC_MUBUF", vec![("VDATA", 10), ("VADDR", 0), ("SRSRC", 4), ("SOFFSET", 128), ("IDXEN", 1)], None),
+        ("V_CVT_F32_U32", "ENC_VOP1", vec![("VDST", 20), ("SRC0", 1)], None),
+        ("V_ADD_F32", "ENC_VOP2", vec![("VDST", 10), ("SRC0", V + 20), ("VSRC1", 10)], None),
+        ("V_MOV_B32", "ENC_VOP1", vec![("VDST", 14), ("SRC0", V + 20)], None),
+        ("V_CVT_F32_U32", "ENC_VOP1", vec![("VDST", 15), ("SRC0", V)], None),
+        ("V_MOV_B32", "ENC_VOP1", vec![("VDST", 16), ("SRC0", 128)], None),
+        ("V_MOV_B32", "ENC_VOP1", vec![("VDST", 17), ("SRC0", 242)], None),
+    ];
+    list.push(exp(12, 0xF, [10, 11, 12, 13], 1));
+    list.push(exp(32, 0xF, [14, 15, 16, 17], 0));
+    list.push(("S_MOV_B64", "ENC_SOP1", vec![("SDST", 126), ("SSRC0", 193)], None));
+    list.push(("V_CMPX_EQ_U32", "ENC_VOPC", vec![("SRC0", 128), ("VSRC1", 0)], None));
+    list.push(("V_MOV_B32", "ENC_VOP1", vec![("VDST", 21), ("SRC0", 255)], Some(1 << 10 | 2 << 20)));
+    list.push(exp(20, 1, [21, 0, 0, 0], 1));
+    let code = prog(&list, true);
+    let mut r = [0u8; 48];
+    r[12..14].copy_from_slice(&128u16.to_le_bytes());
+    r[14..16].copy_from_slice(&128u16.to_le_bytes());
+    r[24] = 13;
+    r[27] = 2;
+    r[36..40].copy_from_slice(&128u32.to_le_bytes());
+    r[40..44].copy_from_slice(&1u32.to_le_bytes());
+    r[44..48].copy_from_slice(&1u32.to_le_bytes());
+    let ms = console(13, 7, &code, &signature(&[]), &signature(&[("SV_Position", 0, 1, 3, 0), ("TEXCOORD", 0, 0, 3, 1)]), Some(psv0(&r)));
+    assert!(crate::gpu::recomp::pso::console_mesh(&ms, None, true).is_ok());
+    let ps = dxc::compile("struct V { float4 pos : SV_Position; float4 p0 : TEXCOORD0; };\nfloat4 main(V v) : SV_Target0 { return v.p0; }\n", "main", "ps_6_6", &[]).unwrap();
+    let game_rs: ID3D12RootSignature = {
+        let mut ser = None;
+        D3D12SerializeRootSignature(&D3D12_ROOT_SIGNATURE_DESC::default(), D3D_ROOT_SIGNATURE_VERSION_1, &mut ser, None).unwrap();
+        let ser = ser.unwrap();
+        dev.CreateRootSignature(0, std::slice::from_raw_parts(ser.GetBufferPointer() as *const u8, ser.GetBufferSize())).unwrap()
+    };
+    #[repr(C, align(8))]
+    struct Sub<T> {
+        ty: D3D12_PIPELINE_STATE_SUBOBJECT_TYPE,
+        v: T,
+    }
+    #[repr(C)]
+    struct Stream {
+        rs: Sub<*mut c_void>,
+        ms: Sub<D3D12_SHADER_BYTECODE>,
+        ps: Sub<D3D12_SHADER_BYTECODE>,
+        rast: Sub<D3D12_RASTERIZER_DESC>,
+        depth: Sub<D3D12_DEPTH_STENCIL_DESC>,
+        rt: Sub<D3D12_RT_FORMAT_ARRAY>,
+    }
+    let bcode = |b: &[u8]| D3D12_SHADER_BYTECODE { pShaderBytecode: b.as_ptr() as _, BytecodeLength: b.len() };
+    let mut rt = D3D12_RT_FORMAT_ARRAY { NumRenderTargets: 1, ..Default::default() };
+    rt.RTFormats[0] = DXGI_FORMAT_R32G32B32A32_FLOAT;
+    let st = Stream {
+        rs: Sub { ty: D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, v: game_rs.as_raw() },
+        ms: Sub { ty: D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, v: bcode(&ms) },
+        ps: Sub { ty: D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, v: bcode(&ps) },
+        rast: Sub { ty: D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, v: D3D12_RASTERIZER_DESC { FillMode: D3D12_FILL_MODE_SOLID, CullMode: D3D12_CULL_MODE_NONE, DepthClipEnable: true.into(), ..Default::default() } },
+        depth: Sub { ty: D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL, v: D3D12_DEPTH_STENCIL_DESC::default() },
+        rt: Sub { ty: D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS, v: rt },
+    };
+    let d2: ID3D12Device2 = dev.cast().unwrap();
+    let desc = D3D12_PIPELINE_STATE_STREAM_DESC { SizeInBytes: std::mem::size_of::<Stream>(), pPipelineStateSubobjectStream: &st as *const _ as *mut _ };
+    d2.CreatePipelineState(&desc).unwrap_or_else(|e| panic!("{e}: {:?}", real::stats().translation_errors))
+}
+
+/// A dispatch command signature XCL knows the layout of (one Dispatch argument, stride 12).
+unsafe fn dispatch_signature(dev: &ID3D12Device) -> ID3D12CommandSignature {
+    let mut arg: D3D12_INDIRECT_ARGUMENT_DESC = std::mem::zeroed();
+    arg.Type = D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH;
+    let desc = D3D12_COMMAND_SIGNATURE_DESC { ByteStride: 12, NumArgumentDescs: 1, pArgumentDescs: &arg, NodeMask: 0 };
+    let sig = dev.CreateCommandSignature(&desc, None).unwrap();
+    super::indirect::note_signature(sig.as_raw() as usize, super::indirect::Signature::from_args(12, &[[super::indirect::ARG_DISPATCH, 0, 0, 0]]).unwrap());
+    sig
+}
+
+/// The vertex table of the mesh program and the root constants that point at it.
+unsafe fn mesh_table(u: &crate::gpu::uma::Uma) -> (usize, [u32; 12]) {
+    let table = u.alloc(1 << 16, 1 << 16).unwrap() as usize;
+    for (i, (x, y)) in [(-1.0f32, -1.0f32), (-1.0, 1.0), (0.0, -1.0)].iter().enumerate() {
+        std::ptr::copy_nonoverlapping([f(*x), f(*y), f(0.0), f(1.0)].as_ptr(), (table as *mut u32).add(4 * i), 4);
+    }
+    let mut c = [0u32; 12];
+    c[8..12].copy_from_slice(&[table as u32, ((table >> 32) as u32 & 0xFFFF) | 16 << 16, 3, 0]);
+    (table, c)
+}
+
+/// A two-pass mesh pipeline drawn through ExecuteIndirect with two dispatch records: record 0
+/// one group, record 1 two. Both records produce their triangles and each counts as a draw.
+#[test]
+fn gpu_indirect_two_pass_mesh_runs_each_record() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(dev) = ready() else { return };
+    unsafe {
+        let u = crate::gpu::uma::get().unwrap();
+        let pso = mesh_pso(&dev);
+        let real_pso = super::pso_async::resolve_wait(pso.as_raw() as usize);
+        assert!(real::two_pass_of(real_pso).is_some(), "a two-pass mesh pipeline");
+        let (table, constants) = mesh_table(u);
+        let rs_key = 0x7400_0020usize;
+        super::console_list::note_root_signature(rs_key, &rts0_constants(12));
+        let sig = dispatch_signature(&dev);
+
+        // the argument records in title memory: dispatch (1,1,1) then (2,1,1)
+        let arg_bytes = 2 * 12usize;
+        let args = u.alloc(arg_bytes, 256).unwrap();
+        let words: [u32; 12] = [1, 1, 1, 0, 2, 1, 1, 0, 0, 0, 0, 0];
+        std::ptr::copy_nonoverlapping(words.as_ptr(), args as *mut u32, words.len());
+        let fake_res = 0x1C0_1000usize;
+        super::real::note_test_console_buffer(fake_res, args as usize, arg_bytes);
+
+        let t = Target::new(&dev);
+        bind::set_pipeline_state(t.backing, pso.as_raw());
+        bind::set_graphics_root_signature(t.backing, rs_key as *mut c_void);
+        bind::set_graphics_root_constants(t.backing, 0, 12, constants.as_ptr(), 0);
+        let before = bind::counts_snapshot();
+        bind::execute_indirect(t.backing, sig.as_raw() as usize, 2, fake_res, 0, 0, 0);
+        let after = bind::counts_snapshot();
+        assert_eq!(after[0] - before[0], 2, "both records ran as translated draws");
+        assert_eq!(super::indirect::last_clamped_for_test(), Some(vec![
+            super::indirect::Record { kind: super::indirect::Kind::Dispatch, counts: [1, 1, 1, 0, 0] },
+            super::indirect::Record { kind: super::indirect::Kind::Dispatch, counts: [2, 1, 1, 0, 0] },
+        ]));
+        let px = t.finish();
+        super::real::forget_test_console_buffer(fake_res);
+        u.free(table);
+        u.free(args as usize);
+
+        let (mut hit, mut clear) = ([0usize; 2], 0usize);
+        for y in 0..SIZE as usize {
+            for x in 0..SIZE as usize {
+                let p = px[y * SIZE as usize + x];
+                let mut covered = false;
+                for g in 0..2 {
+                    let gf = g as f32;
+                    if inside([[-1.0 + gf, -1.0], [-1.0 + gf, 1.0], [gf, -1.0]], x, y, 0.02) {
+                        assert_eq!((p[0], p[2], p[3]), (gf, 0.0, 1.0), "pixel ({x},{y}) in group {g}'s triangle: {p:?}");
+                        hit[g] += 1;
+                        covered = true;
+                    }
+                }
+                let near = (0..2).any(|g| inside([[-1.0 + g as f32, -1.0], [-1.0 + g as f32, 1.0], [g as f32, -1.0]], x, y, -0.05));
+                if !covered && !near {
+                    assert_eq!(p, CLEAR, "pixel ({x},{y}) outside both triangles");
+                    clear += 1;
+                }
+            }
+        }
+        println!("indirect two-pass: {hit:?} pixels, {clear} clear");
+        assert!(hit[0] > 80 && hit[1] > 80 && clear > 300, "{hit:?} / {clear}");
+    }
+}
+
+/// A record of all ones is clamped and charged to the list's budget; past the budget it runs
+/// empty, so the frame completes and the device stays up.
+#[test]
+fn gpu_indirect_record_all_ones_is_bounded() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(dev) = ready() else { return };
+    unsafe {
+        let u = crate::gpu::uma::get().unwrap();
+        let pso = mesh_pso(&dev);
+        let (table, constants) = mesh_table(u);
+        let rs_key = 0x7400_0021usize;
+        super::console_list::note_root_signature(rs_key, &rts0_constants(12));
+        let sig = dispatch_signature(&dev);
+
+        let args = u.alloc(12, 256).unwrap();
+        std::ptr::copy_nonoverlapping([u32::MAX; 3].as_ptr(), args as *mut u32, 3);
+        let fake_res = 0x1C0_2000usize;
+        super::real::note_test_console_buffer(fake_res, args as usize, 12);
+
+        let t = Target::new(&dev);
+        bind::set_pipeline_state(t.backing, pso.as_raw());
+        bind::set_graphics_root_signature(t.backing, rs_key as *mut c_void);
+        bind::set_graphics_root_constants(t.backing, 0, 12, constants.as_ptr(), 0);
+        let before = bind::counts_snapshot();
+        bind::execute_indirect(t.backing, sig.as_raw() as usize, 1, fake_res, 0, 0, 0);
+        let after = bind::counts_snapshot();
+        // the record was clamped to the maxima and then zeroed by the budget: nothing ran
+        assert_eq!(after[0], before[0], "no draw ran for the clamped record");
+        assert_eq!(super::indirect::last_clamped_for_test(), Some(vec![
+            super::indirect::Record { kind: super::indirect::Kind::Dispatch, counts: [0; 5] },
+        ]));
+        let _ = t.finish(); // the frame completes and the device is not removed
+        super::real::forget_test_console_buffer(fake_res);
+        u.free(table);
+        u.free(args as usize);
+    }
+}
