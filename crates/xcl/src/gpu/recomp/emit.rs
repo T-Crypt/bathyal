@@ -5827,7 +5827,8 @@ uint sat_i32(int64_t r) { return select(r > (int64_t)0x7FFFFFFF, 0x7FFFFFFFu, se
 // `& 0xFFFFu` mask after `SMin(SMax(r, -32768), 32767)`, leaking sign bits into the upper half
 uint sat_i16(int r) { return select(r > 32767, 0x7FFFu, select(r < -32768, 0x8000u, (uint)r & 0xFFFFu)); }
 float div_fixup(float q, float d, float n) { return select(or(or(isnan(d), isnan(n)), or(d == 0.0f, or(isinf(d), isinf(n)))), n / d, q); }
-float fma_legacy(float a, float b, float c) { return (a == 0.0f || b == 0.0f) ? c : mad(a, b, c); }
+// a zero product is +0 and is still added, so c = -0 gives +0; on the bits, as DXC folds select(c == 0, 0, c) to c
+float fma_legacy(float a, float b, float c) { return (a == 0.0f || b == 0.0f) ? asfloat(select(c == 0.0f, 0u, asuint(c))) : mad(a, b, c); }
 float mad_nf(float a, float b, float c) { precise float p = a * b; precise float r = p + c; return r; }
 // IEEE-754 binary32 -> binary16 under RDNA2 MODE[3:2]: 0 = RNE, 1 = +inf, 2 = -inf, 3 = RTZ.
 uint f32_to_f16_rm(float f, uint rm) {

@@ -1002,6 +1002,41 @@ fn gpu_valu_float_and_int() {
     }
 }
 
+/// The legacy FMA of a zero factor (inf and NaN included) is a +0 product plus c, so c = -0
+/// gives +0, not c (#679); a non-zero c comes back unchanged.
+#[test]
+fn gpu_fma_legacy_with_a_zero_factor_adds_plus_zero() {
+    if !gpu_ready() {
+        return;
+    }
+    let code = prog(&[
+        ("V_FMA_LEGACY_F32", "ENC_VOP3", &[("VDST", 4), ("SRC0", V + 1), ("SRC1", V + 2), ("SRC2", V + 3)], None),
+        ("V_FMAC_LEGACY_F32", "ENC_VOP2", &[("VDST", 5), ("SRC0", V + 1), ("VSRC1", 2)], None),
+    ]);
+    const NEG0: u32 = 0x8000_0000;
+    const CASES: [(u32, u32, u32, u32); 7] = [
+        (0x0000_0000, 0x40A0_0000, NEG0, 0),                     // +0 * 5 + -0
+        (NEG0, 0x40A0_0000, NEG0, 0),                            // -0 * 5 + -0
+        (0x40A0_0000, NEG0, NEG0, 0),                            // 5 * -0 + -0
+        (0x0000_0000, 0x7F80_0000, NEG0, 0),                     // +0 * inf + -0
+        (NEG0, 0x7FC0_0000, NEG0, 0),                            // -0 * NaN + -0
+        (0x0000_0000, 0x7F80_0000, 0xBFC0_0000, 0xBFC0_0000),    // +0 * inf + -1.5
+        (0x4000_0000, 0x4040_0000, 0x3F80_0000, 0x40E0_0000),    // 2 * 3 + 1
+    ];
+    let mut st = KernelState::default();
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        let (a, b, c, _) = CASES[l % CASES.len()];
+        (r[1], r[2], r[3], r[5]) = (a, b, c, c);
+    }
+    let r = runner::run_code(&code, &st, &[]).unwrap();
+    for l in 0..64 {
+        let (a, b, c, want) = CASES[l % CASES.len()];
+        let v = &r.vgpr[l];
+        assert_eq!(v[4], want, "lane {l} v_fma_legacy_f32({a:#010x}, {b:#010x}, {c:#010x}) = {:#010x}", v[4]);
+        assert_eq!(v[5], want, "lane {l} v_fmac_legacy_f32({a:#010x}, {b:#010x}, {c:#010x}) = {:#010x}", v[5]);
+    }
+}
+
 /// Output modifiers each instruction kind applies: omod on f64 (clamp stays in double
 /// precision) and on the f64 → f32 / f32 → f16 conversions, and the integer clamp (saturation) of the
 /// unsigned adds, the packed 16-bit adds and the integer dot products.
