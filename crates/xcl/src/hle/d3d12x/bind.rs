@@ -266,6 +266,14 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
     }
 }
 
+/// A skipped call into the log – the first 8 of each site.
+fn note_skipped(what: std::fmt::Arguments) {
+    static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
+        crate::xlog_warn!("D3D12.X: {what}");
+    }
+}
+
 /// Readable bytes at `offset` in the title buffer `res` (console memory: unified memory or a
 /// placed resource), or None when the CPU cannot see them.
 unsafe fn buffer_at(res: usize, offset: u64, len: usize) -> Option<usize> {
