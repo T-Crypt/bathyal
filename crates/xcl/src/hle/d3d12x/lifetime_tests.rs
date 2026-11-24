@@ -70,9 +70,7 @@ fn a_resource_released_after_submit_outlives_its_submission() {
         src.Unmap(0, None);
 
         let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).expect("allocator");
-        let mut made: Option<ID3D12GraphicsCommandList> = None;
-        dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None::<&ID3D12PipelineState>, &mut made).expect("CreateCommandList");
-        let list = made.expect("command list");
+        let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None::<&ID3D12PipelineState>).expect("CreateCommandList");
         let raw_list = list.as_raw() as *mut c_void;
 
         // the two copies name the source, the destination and the readback buffer
