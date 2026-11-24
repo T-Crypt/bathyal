@@ -1180,6 +1180,17 @@ unsafe fn two_pass(this: *mut c_void, list: &ID3D12GraphicsCommandList, real: us
     if groups == 0 {
         return Ok(());
     }
+    // `XCL_TWO_PASS=0`: a diagnostic switch; two-pass draws are counted and left out (nothing
+    // is recorded), to tell whether a device removal comes from this path
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *OFF.get_or_init(|| std::env::var("XCL_TWO_PASS").is_ok_and(|v| v == "0")) {
+        static LEFT_OUT: AtomicU64 = AtomicU64::new(0);
+        let n = LEFT_OUT.fetch_add(1, Ordering::Relaxed);
+        if n < 2 || (n + 1).is_power_of_two() {
+            crate::xlog_info!("D3D12.X: {} two-pass draws left out (XCL_TWO_PASS=0)", n + 1);
+        }
+        return Ok(());
+    }
     let mesh_groups = groups.saturating_mul(tp.mesh_groups_per_record.max(1));
     if groups > MAX_GROUPS || mesh_groups > MAX_GROUPS {
         return Err(format!("{groups} groups ({mesh_groups} mesh groups) – over D3D12's {MAX_GROUPS} in one dispatch"));
