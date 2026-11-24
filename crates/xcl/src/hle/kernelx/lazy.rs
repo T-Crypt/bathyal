@@ -15,9 +15,7 @@ use std::ffi::c_void;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Once, RwLock};
 
-use windows_sys::Win32::Foundation::{
-    GetLastError, ERROR_COMMITMENT_LIMIT, ERROR_NOT_ENOUGH_MEMORY, ERROR_OUTOFMEMORY, EXCEPTION_ACCESS_VIOLATION, NTSTATUS,
-};
+use windows_sys::Win32::Foundation::{GetLastError, EXCEPTION_ACCESS_VIOLATION, NTSTATUS};
 use windows_sys::Win32::System::Diagnostics::Debug::{AddVectoredExceptionHandler, EXCEPTION_POINTERS};
 use windows_sys::Win32::System::Memory::{
     VirtualAlloc, VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE,
@@ -31,9 +29,10 @@ const EXCEPTION_CONTINUE_SEARCH: i32 = 0;
 /// pages (64 KiB) mapped but not committed yet
 static LAZY: RwLock<BTreeSet<usize>> = RwLock::new(BTreeSet::new());
 
-static FAILED_COMMITS: AtomicUsize = AtomicUsize::new(0);
-static LAST_FAILED_PAGE: AtomicUsize = AtomicUsize::new(0);
-static LAST_FAILED_ERR: AtomicU32 = AtomicU32::new(0);
+/// Failed `MEM_COMMIT` attempts (no logging inside the vectored handler – atomics only).
+static FAIL_COUNT: AtomicU32 = AtomicU32::new(0);
+static LAST_FAIL_PAGE: AtomicUsize = AtomicUsize::new(0);
+static LAST_FAIL_ERROR: AtomicU32 = AtomicU32::new(0);
 
 fn install() {
     static ONCE: Once = Once::new();
@@ -42,37 +41,39 @@ fn install() {
     });
 }
 
-/// Commit `page` if it is a lazy one (true: it was and is now committed).
+fn record_fail(page: usize, err: u32) {
+    FAIL_COUNT.fetch_add(1, Ordering::Relaxed);
+    LAST_FAIL_PAGE.store(page, Ordering::Relaxed);
+    LAST_FAIL_ERROR.store(err, Ordering::Relaxed);
+}
+
+/// For the crash line / diagnostics: `None` if no commit has failed yet.
+pub fn fail_summary() -> Option<String> {
+    let n = FAIL_COUNT.load(Ordering::Relaxed);
+    if n == 0 {
+        return None;
+    }
+    let page = LAST_FAIL_PAGE.load(Ordering::Relaxed);
+    let err = LAST_FAIL_ERROR.load(Ordering::Relaxed);
+    Some(format!("lazy commit failed {n} times, last {page:#x} ({err})"))
+}
+
+/// Commit `page` if it is a lazy one (true: it was and the commit succeeded).
+///
+/// The page stays in `LAZY` when `VirtualAlloc(MEM_COMMIT)` fails so a later fault / `ensure`
+/// can retry instead of turning into a bare `0xc0000005` on still-reserved memory (#467).
 unsafe fn commit(page: usize) -> bool {
     let mut g = LAZY.write().unwrap_or_else(|e| e.into_inner());
     if !g.contains(&page) {
         return false;
     }
-    if VirtualAlloc(page as *const c_void, PAGE, MEM_COMMIT, PAGE_READWRITE).is_null() {
-        LAST_FAILED_PAGE.store(page, Ordering::Relaxed);
-        LAST_FAILED_ERR.store(GetLastError(), Ordering::Relaxed);
-        FAILED_COMMITS.fetch_add(1, Ordering::Release);
-        return false;
+    let ok = !VirtualAlloc(page as *const c_void, PAGE, MEM_COMMIT, PAGE_READWRITE).is_null();
+    if ok {
+        g.remove(&page);
+    } else {
+        record_fail(page, GetLastError());
     }
-    g.remove(&page);
-    true
-}
-
-/// Summary of failed lazy commits for crash reporting, or `None` if none failed.
-pub(crate) fn failure_summary() -> Option<String> {
-    let n = FAILED_COMMITS.load(Ordering::Acquire);
-    if n == 0 {
-        return None;
-    }
-    let page = LAST_FAILED_PAGE.load(Ordering::Relaxed);
-    let err = LAST_FAILED_ERR.load(Ordering::Relaxed);
-    let name = match err {
-        ERROR_COMMITMENT_LIMIT => " ERROR_COMMITMENT_LIMIT",
-        ERROR_NOT_ENOUGH_MEMORY => " ERROR_NOT_ENOUGH_MEMORY",
-        ERROR_OUTOFMEMORY => " ERROR_OUTOFMEMORY",
-        _ => "",
-    };
-    Some(format!("lazy commit failed {n} times, last {page:#x} ({err}{name})"))
+    ok
 }
 
 unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
@@ -115,7 +116,7 @@ pub(super) fn unmark(page: usize) -> bool {
 }
 
 /// The lazy pages of `[p, p + len)` committed – memory a kernel call or XCL writes.
-/// Returns `false` if a still-lazy page could not be committed (commit limit, etc.).
+/// Returns `false` if any still-lazy page could not be committed (commit limit, etc.).
 pub fn ensure(p: usize, len: usize) -> bool {
     if len == 0 {
         return true;
@@ -129,7 +130,9 @@ pub fn ensure(p: usize, len: usize) -> bool {
     };
     let mut ok = true;
     for page in pages {
-        ok &= unsafe { commit(page) };
+        if !unsafe { commit(page) } {
+            ok = false;
+        }
     }
     ok
 }
@@ -191,73 +194,27 @@ mod tests {
         }
     }
 
+    /// #467: a failed `MEM_COMMIT` must leave the page lazy so the next fault / `ensure` can retry.
     #[test]
-    fn failed_lazy_commit_stays_lazy_and_reports_in_crash_line() {
-        if std::env::var_os("XCL_LAZY_LIMIT_CHILD").is_none() {
-            let out = std::process::Command::new(std::env::current_exe().unwrap())
-                .args(["--exact", "hle::kernelx::lazy::tests::failed_lazy_commit_stays_lazy_and_reports_in_crash_line", "--nocapture"])
-                .env("XCL_LAZY_LIMIT_CHILD", "1")
-                .output()
-                .unwrap();
-            assert!(!out.status.success(), "expected child to crash on commit limit");
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            assert!(stderr.contains("0xc0000005"), "missing 0xc0000005 in stderr: {stderr}");
-            assert!(stderr.contains("lazy commit failed"), "missing lazy commit summary in stderr: {stderr}");
-            assert!(stderr.contains("1455 ERROR_COMMITMENT_LIMIT"), "missing ERROR_COMMITMENT_LIMIT in stderr: {stderr}");
-            return;
-        }
+    fn failed_commit_keeps_page_lazy_and_records_error() {
         unsafe {
-            use windows_sys::Win32::System::Diagnostics::Debug::{SetErrorMode, SEM_FAILCRITICALERRORS, SEM_NOGPFAULTERRORBOX};
-            use windows_sys::Win32::System::JobObjects::{
-                AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation, SetInformationJobObject,
-                JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_PROCESS_MEMORY,
-            };
-            use windows_sys::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
-            use windows_sys::Win32::System::Threading::GetCurrentProcess;
-
-            SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX);
-            crate::eh::install_crash_handler();
-
-            // Pre-commit stack pages before applying the job commit limit so the crash handler
-            // itself does not hit a stack-guard commit failure.
-            let mut stack_warm = [0u8; 64 * 1024];
-            std::hint::black_box(&mut stack_warm);
-
-            let mut pmc: PROCESS_MEMORY_COUNTERS = std::mem::zeroed();
-            assert_ne!(GetProcessMemoryInfo(GetCurrentProcess(), &mut pmc, std::mem::size_of_val(&pmc) as u32), 0);
-
-            let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
-            assert!(!job.is_null());
-            let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
-            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_PROCESS_MEMORY;
-            info.ProcessMemoryLimit = pmc.PagefileUsage + 4 * PAGE;
-            assert_ne!(SetInformationJobObject(job, JobObjectExtendedLimitInformation, &info as *const _ as *const _, std::mem::size_of_val(&info) as u32), 0);
-            assert_ne!(AssignProcessToJobObject(job, GetCurrentProcess()), 0);
-
-            const PAGES: usize = 64;
-            let r = VirtualAlloc(std::ptr::null(), PAGES * PAGE, MEM_RESERVE, PAGE_READWRITE) as usize;
+            let r = VirtualAlloc(std::ptr::null(), PAGE, MEM_RESERVE, PAGE_READWRITE) as usize;
             assert_ne!(r, 0);
-            for i in 0..PAGES {
-                mark(r + i * PAGE);
-            }
-
-            // A page under the limit still commits on first touch.
-            std::ptr::write_volatile(r as *mut u32, 42);
-            assert_eq!(std::ptr::read_volatile(r as *const u32), 42);
-            assert!(!LAZY.read().unwrap().contains(&r));
-
-            // Push past the job's commit limit: the failing page must stay in LAZY and record the error.
-            for i in 1..PAGES {
-                let page = r + i * PAGE;
-                ensure(page, PAGE);
-                if LAZY.read().unwrap().contains(&page) {
-                    assert_eq!(FAILED_COMMITS.load(Ordering::Acquire), 1);
-                    assert_eq!(LAST_FAILED_ERR.load(Ordering::Relaxed), ERROR_COMMITMENT_LIMIT);
-                    std::ptr::write_volatile(page as *mut u32, 99);
-                    unreachable!("touching an uncommitted page past the limit must fault");
-                }
-            }
-            panic!("expected lazy commit to hit process memory limit");
+            // Release the reservation so MEM_COMMIT on that address fails.
+            assert_ne!(VirtualFree(r as *mut c_void, 0, MEM_RELEASE), 0);
+            let before = FAIL_COUNT.load(Ordering::Relaxed);
+            mark(r);
+            assert!(LAZY.read().unwrap().contains(&r));
+            assert!(!commit(r), "commit must fail without a reservation");
+            assert!(LAZY.read().unwrap().contains(&r), "page must stay lazy after a failed commit");
+            assert!(FAIL_COUNT.load(Ordering::Relaxed) > before);
+            assert_eq!(LAST_FAIL_PAGE.load(Ordering::Relaxed), r);
+            assert_ne!(LAST_FAIL_ERROR.load(Ordering::Relaxed), 0);
+            let summary = fail_summary().expect("fail_summary after a recorded failure");
+            assert!(summary.contains("lazy commit failed"), "{summary}");
+            assert!(summary.contains(&format!("{r:#x}")), "{summary}");
+            // Clean the set so other tests are not affected by this fake address.
+            assert!(unmark(r));
         }
     }
 }

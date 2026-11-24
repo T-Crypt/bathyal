@@ -75,15 +75,16 @@ unsafe extern "system-unwind" fn unhandled_filter(info: *const EXCEPTION_POINTER
                 _ => "?",
             };
             extra = format!(" ({op} at address {:#x})", rec.ExceptionInformation[1]);
+            // #467: a lazy physical page whose MEM_COMMIT failed stays reserved; surface that
+            // honestly instead of a bare access violation on still-reserved memory.
+            if let Some(lazy) = crate::hle::kernelx::lazy::fail_summary() {
+                extra.push_str("; ");
+                extra.push_str(&lazy);
+            }
         }
         // the faulting instruction, for any exception: the registers alone rarely say what was
         // dereferenced (an access violation in a title's thread start-up: which field of what)
         extra.push_str(&format!(" (code bytes: {})", code_at(addr)));
-        // a lazy physical page whose MEM_COMMIT failed stays reserved; say so rather than a bare
-        // access violation on still-reserved memory
-        if let Some(lazy) = crate::hle::kernelx::lazy::failure_summary() {
-            extra.push_str(&format!("; {lazy}"));
-        }
         let ctx = (*info).ContextRecord;
         let regs = if ctx.is_null() {
             String::new()
