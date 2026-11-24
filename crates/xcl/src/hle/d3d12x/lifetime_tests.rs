@@ -68,6 +68,13 @@ fn a_resource_released_after_submit_outlives_its_submission() {
         src.Map(0, None, Some(&mut p)).expect("Map of the upload buffer");
         std::ptr::copy_nonoverlapping(pattern.as_ptr(), p as *mut u8, BYTES as usize);
         src.Unmap(0, None);
+        if std::env::var_os("XCL_TEST_KEEP").is_some() {
+            let mut c = std::ptr::null_mut();
+            src.Map(0, None, Some(&mut c)).expect("re-Map of the upload buffer");
+            let back = std::slice::from_raw_parts(c as *const u8, 8).to_vec();
+            src.Unmap(0, None);
+            eprintln!("src after fill: {back:?}");
+        }
 
         let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).expect("allocator");
         let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None::<&ID3D12PipelineState>).expect("CreateCommandList");
