@@ -526,8 +526,14 @@ fn pool() -> &'static std::sync::Mutex<std::sync::mpsc::Sender<Job>> {
 pub fn compile(src: &str, entry: &str, profile: &str, extra: &[&str]) -> Result<Vec<u8>, String> {
     let (reply, rx) = std::sync::mpsc::channel();
     let job = Job { src: src.into(), entry: entry.into(), profile: profile.into(), extra: extra.iter().map(|s| s.to_string()).collect(), reply };
+    // queued for a DXC worker: shown by the pending-work report until the reply arrives
+    let ticket = crate::pending::enabled().then(|| {
+        crate::pending::begin(crate::pending::Kind::ShaderCompile, crate::pending::Meta { size: src.len() as u64, ..Default::default() })
+    });
     pool().lock().unwrap().send(job).map_err(|_| "DXC: no compile threads".to_string())?;
-    rx.recv().map_err(|_| "DXC: the compile thread exited".to_string())?
+    let r = rx.recv().map_err(|_| "DXC: the compile thread exited".to_string());
+    drop(ticket);
+    r?
 }
 
 fn compile_here(src: &str, entry: &str, profile: &str, extra: &[&str]) -> Result<Vec<u8>, String> {

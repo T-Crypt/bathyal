@@ -71,6 +71,10 @@ pub(crate) unsafe fn wait(
         completed_value(fence, dev)?;
         return Err(api_error(dev, "SetEventOnCompletion", e));
     }
+    // shown by the pending-work report while this thread is blocked
+    let _ticket = crate::pending::enabled().then(|| {
+        crate::pending::begin(crate::pending::Kind::TitleWait, crate::pending::Meta { size: target, index: 1, extra: timeout_ms, ..Default::default() })
+    });
     let start = Instant::now();
     let mut remaining = timeout_ms;
     loop {

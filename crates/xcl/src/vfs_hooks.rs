@@ -534,7 +534,13 @@ unsafe extern "system" fn hk_read_file(h: *mut c_void, buf: *mut c_void, n: u32,
     if !buf.is_null() {
         crate::hle::kernelx::lazy::ensure(buf as usize, n as usize);
     }
-    orig(h, buf, n, read, ov)
+    // an overlapped read that blocks here is outstanding work worth showing when a load stalls
+    let ticket = (crate::pending::enabled() && !ov.is_null()).then(|| {
+        crate::pending::begin(crate::pending::Kind::FileRead, crate::pending::Meta { size: n as u64, extra: 1, ..Default::default() })
+    });
+    let r = orig(h, buf, n, read, ov);
+    drop(ticket);
+    r
 }
 
 unsafe extern "system" fn hk_delete_file_w(n: *const u16) -> i32 {

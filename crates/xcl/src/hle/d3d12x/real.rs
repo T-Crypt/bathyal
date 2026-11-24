@@ -3591,12 +3591,22 @@ fn avail_pagefile_bytes() -> Option<u64> {
 
 fn wait_for_commit_with(mut avail: impl FnMut() -> Option<u64>, reserve: u64, grace: std::time::Duration, poll: std::time::Duration) -> bool {
     let start = std::time::Instant::now();
+    // shown by the pending-work report while this thread waits for GPU memory to come back
+    let mut ticket: Option<crate::pending::Ticket> = None;
     loop {
         match avail() {
             None => return true,
             Some(free) if free >= reserve => return true,
             Some(_) if start.elapsed() >= grace => return false,
-            Some(_) => std::thread::sleep(poll),
+            Some(free) => {
+                if ticket.is_none() && crate::pending::enabled() {
+                    ticket = Some(crate::pending::begin(
+                        crate::pending::Kind::TitleWait,
+                        crate::pending::Meta { size: reserve.saturating_sub(free), index: 2, ..Default::default() },
+                    ));
+                }
+                std::thread::sleep(poll);
+            }
         }
     }
 }
