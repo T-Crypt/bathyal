@@ -5901,7 +5901,7 @@ mod readback_routing_tests {
             // Console-slot paths (`copy_console_slots` invoked from both Simple and Ranges)
             let heap_obj = 0x5555_DEADusize;
             if crate::gpu::uma::get().is_some()
-                && super::super::console_heap::register(heap_obj, 4, 0x10_0000, 0, 32, false, false, false)
+                && super::super::console_heap::register(heap_obj, 4, 4, 0x10_0000, 0, 32, false, false, false)
             {
                 let start = super::super::console_heap::start(heap_obj).unwrap();
                 let dst_h = start + super::super::console_heap::SLOT as u64;
@@ -6404,7 +6404,7 @@ mod null_view_tests {
         let d = complete_uav_desc(&depth_desc(), None);
         assert_ne!(d.Format.0, 0, "the description names a format");
         assert_eq!(d.ViewDimension, D3D12_UAV_DIMENSION_TEXTURE2D);
-        assert_ne!(d.Anonymous.Texture2D.MipSlice, u32::MAX, "the union member is initialized");
+        assert_ne!(unsafe { d.Anonymous.Texture2D.MipSlice }, u32::MAX, "the union member is initialized");
         // a caller's description with a format of its own is kept (as the PC's names)
         let named = D3D12_UNORDERED_ACCESS_VIEW_DESC {
             Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(46),
@@ -6421,7 +6421,7 @@ mod null_view_tests {
         let b = D3D12_RESOURCE_DESC { Dimension: D3D12_RESOURCE_DIMENSION_BUFFER, Width: 4096, Height: 1, DepthOrArraySize: 1, MipLevels: 1, ..Default::default() };
         let d = complete_uav_desc(&b, None);
         assert_eq!(d.ViewDimension, D3D12_UAV_DIMENSION_BUFFER);
-        assert!(d.Anonymous.Buffer.NumElements > 0);
+        assert!(unsafe { d.Anonymous.Buffer.NumElements } > 0);
     }
 
     /// A null SRV/UAV names the kind its description asks for, so the console slot it writes
