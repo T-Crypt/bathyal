@@ -86,9 +86,23 @@ unsafe fn hold(handle: usize) {
     add(handle as *mut c_void);
 }
 
+/// Whether XCL holds objects for their submissions: `XCL_LIFETIME=0` gives an object back at
+/// the title's last release, as before this module (a title that releases early then reads
+/// freed memory, so it is a diagnostic switch).
+fn enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var("XCL_LIFETIME").map_or(true, |v| v.trim() != "0");
+        if !on {
+            crate::xlog_warn!("D3D12.X: XCL_LIFETIME=0 – objects are freed at their last release, not after their submissions (a title that frees early may read freed memory)");
+        }
+        on
+    })
+}
+
 /// `list` records a command that names `handle`: hold the object until that submission is done.
 pub(super) fn note(list: usize, handle: usize) {
-    if list == 0 || handle == 0 {
+    if list == 0 || handle == 0 || !enabled() {
         return;
     }
     let known = STATE.lock().unwrap_or_else(|e| e.into_inner()).as_ref().is_some_and(|s| s.objects.contains_key(&handle));
@@ -171,6 +185,9 @@ pub(super) fn signal(queue: usize, fence: usize, value: u64) {
 /// is XCL's and must not be freed here (now or yet), so `free` runs from [`poll`] later.
 /// `false`: not an object a recorded list holds; the caller does what it did before.
 pub(super) fn released(handle: usize, remaining: u32) -> bool {
+    if !enabled() {
+        return false;
+    }
     poll();
     let mut g = STATE.lock().unwrap_or_else(|e| e.into_inner());
     let Some(st) = g.as_mut() else { return false };
