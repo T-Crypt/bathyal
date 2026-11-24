@@ -204,7 +204,7 @@ mod translated {
     use std::path::{Path, PathBuf};
     use std::sync::OnceLock;
 
-    const MAGIC: &[u8; 8] = b"XCLTRAN1";
+    const MAGIC: &[u8; 8] = b"XCLTRAN2";
 
     /// the running XCL binary's hash (0: unknown – the disk is not used)
     fn identity() -> u64 {

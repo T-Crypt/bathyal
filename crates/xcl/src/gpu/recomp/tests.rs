@@ -7979,6 +7979,67 @@ fn image_gather4h_is_unsupported() {
     }
 }
 
+/// `image_gather4_l` / `_l_o` names a mip level, which HLSL's `Gather*` cannot take: the four
+/// texels of the 2x2 footprint are read with `Load` at that level, in D3D/GCN gather order.
+#[test]
+fn gather_explicit_level_reads_that_level() {
+    let code = prog(&[("IMAGE_GATHER4_L", "ENC_MIMG", &[("VDATA", 10), ("VADDR", 0), ("SRSRC", 4), ("SSAMP", 6), ("DMASK", 0x1), ("DIM", 1)], None)]);
+    let t = translate(&code, &Options::default()).unwrap();
+    assert!(t.complete(), "{:?}\n{}", t.unsupported_why, t.hlsl);
+    assert!(!t.hlsl.contains("Gather"), "{}", t.hlsl);
+    // the level register (v2: after the two coordinates) decides the mip, clamped to the view's
+    assert!(t.hlsl.contains("_gl = min((uint)max(round(asfloat(v2)), 0.0f), max("), "{}", t.hlsl);
+    assert_eq!(t.hlsl.matches(".Load(int3(").count(), 4, "{}", t.hlsl);
+    // x = (0,1), y = (1,1), z = (1,0), w = (0,0) from the top-left texel after the -0.5 shift
+    let line = t.hlsl.lines().find(|l| l.contains("_g = float4(")).expect("the four reads");
+    let pos: Vec<usize> = ["_g01", "_g11", "_g10", "_g00"].iter().map(|s| line.find(s).unwrap_or_else(|| panic!("{s} not in {line}"))).collect();
+    assert!(pos.windows(2).all(|w| w[0] < w[1]), "{line}");
+}
+
+/// `image_gather4_l_o`: the offset moves the base texel in texels of the named level, and the
+/// gather's channel (`DMASK`) picks the component of each read.
+#[test]
+fn gather_explicit_level_applies_offset_and_channel() {
+    let code = prog(&[("IMAGE_GATHER4_L_O", "ENC_MIMG", &[("VDATA", 10), ("VADDR", 0), ("SRSRC", 4), ("SSAMP", 6), ("DMASK", 0x2), ("DIM", 1)], None)]);
+    let t = translate(&code, &Options::default()).unwrap();
+    assert!(t.complete(), "{:?}\n{}", t.unsupported_why, t.hlsl);
+    assert!(!t.hlsl.contains("Gather"), "{}", t.hlsl);
+    // v0 is the packed 6-bit offset (x at bits 5:0, y at 13:8): added to the base texel
+    assert!(t.hlsl.contains("int2(((int)(v0 << 26)) >> 26, ((int)(v0 << 18)) >> 26)"), "{}", t.hlsl);
+    assert_eq!(t.hlsl.matches(".Load(int3(").count(), 4, "{}", t.hlsl);
+    assert_eq!(t.hlsl.matches(".Green").count(), 4, "{}", t.hlsl);
+}
+
+/// `_lz` and an implicit level are level 0, which `Gather` already returns: keep it.
+#[test]
+fn gather_level_zero_keeps_gather() {
+    for name in ["IMAGE_GATHER4_LZ", "IMAGE_GATHER4_LZ_O", "IMAGE_GATHER4"] {
+        let code = prog(&[(name, "ENC_MIMG", &[("VDATA", 10), ("VADDR", 0), ("SRSRC", 4), ("SSAMP", 6), ("DMASK", 0x1), ("DIM", 1)], None)]);
+        let t = translate(&code, &Options::default()).unwrap();
+        assert!(t.complete(), "{name}: {:?}\n{}", t.unsupported_why, t.hlsl);
+        assert!(t.hlsl.contains(".GatherRed("), "{name}: {}", t.hlsl);
+        assert!(!t.hlsl.contains(".Load(int3("), "{name}: {}", t.hlsl);
+        if name == "IMAGE_GATHER4_LZ" {
+            assert!(!t.hlsl.contains("implicit-level"), "{name}: {}", t.hlsl);
+        }
+    }
+}
+
+/// `image_gather4` with an implicit level outside a pixel shader has no derivatives: level 0 is
+/// used and counted once per program, so the choice is visible in the generated shader.
+#[test]
+fn gather_implicit_level_outside_ps_is_noted_once() {
+    let code = prog(&[
+        ("IMAGE_GATHER4", "ENC_MIMG", &[("VDATA", 10), ("VADDR", 0), ("SRSRC", 4), ("SSAMP", 6), ("DMASK", 0x1), ("DIM", 1)], None),
+        ("IMAGE_GATHER4", "ENC_MIMG", &[("VDATA", 20), ("VADDR", 4), ("SRSRC", 4), ("SSAMP", 6), ("DMASK", 0x1), ("DIM", 1)], None),
+    ]);
+    let t = translate(&code, &Options::default()).unwrap();
+    assert!(t.complete(), "{:?}\n{}", t.unsupported_why, t.hlsl);
+    assert!(t.hlsl.contains("recomp: implicit-level gather outside a pixel shader, level 0 used (2 instruction(s))"), "{}", t.hlsl);
+    assert_eq!(t.hlsl.matches("implicit-level gather").count(), 1, "{}", t.hlsl);
+    assert_eq!(t.hlsl.matches(".GatherRed(").count(), 2, "{}", t.hlsl);
+}
+
 fn hwreg_imm(id: u64, offset: u64, width: u64) -> u64 {
     id | (offset << 6) | ((width - 1) << 11)
 }

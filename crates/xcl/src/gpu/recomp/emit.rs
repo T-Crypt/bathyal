@@ -27,6 +27,9 @@ pub(super) struct Em {
     /// "mnemonic: reason" → count
     pub unsupported_why: BTreeMap<String, usize>,
     pub ignored: BTreeMap<String, usize>,
+    /// `image_gather4` with an implicit level outside a pixel shader (no derivatives): level 0
+    /// was used. Counted once per program and noted in the HLSL header.
+    gather_implicit_level0: usize,
     tmp: usize,
     /// extra write enable of the current DPP16 instruction
     dpp_enable: Option<String>,
@@ -555,6 +558,7 @@ impl Em {
             unsupported: BTreeMap::new(),
             unsupported_why: BTreeMap::new(),
             ignored: BTreeMap::new(),
+            gather_implicit_level0: 0,
             tmp: 0,
             dpp_enable: None,
             ps_modes: BTreeMap::new(),
@@ -2119,6 +2123,29 @@ impl Em {
         format!("{t}_values[{t}_xy.x + 2 * {t}_xy.y].xxxx")
     }
 
+    /// The four texel reads of a level-aware gather's 2x2 footprint, in D3D/GCN gather order
+    /// (x = (0,1), y = (1,1), z = (1,0), w = (0,0) from the top-left texel after the -0.5 shift).
+    /// `layer` selects the array slice of a 2D array (None for a plain 2D texture).
+    fn gather_loads(&mut self, t: &str, ch: &str, u: &str, v: &str, go: &str, layer: Option<&str>) {
+        self.line(&format!("int2 {t}_gm = int2({t}_gw, {t}_gh) - 1;"));
+        self.line(&format!("int2 {t}_gb = int2(floor(float2({u}, {v}) * float2({t}_gw, {t}_gh) - 0.5)) + {go};"));
+        self.line(&format!("int2 {t}_g00 = clamp({t}_gb, int2(0, 0), {t}_gm);"));
+        self.line(&format!("int2 {t}_g01 = clamp({t}_gb + int2(0, 1), int2(0, 0), {t}_gm);"));
+        self.line(&format!("int2 {t}_g11 = clamp({t}_gb + int2(1, 1), int2(0, 0), {t}_gm);"));
+        self.line(&format!("int2 {t}_g10 = clamp({t}_gb + int2(1, 0), int2(0, 0), {t}_gm);"));
+        let at = |xy: &str| match layer {
+            Some(l) => format!("int3({xy}, {l})"),
+            None => format!("int3({xy}, 0)"),
+        };
+        self.line(&format!(
+            "float4 {t}_g = float4({t}_T.Load({}, {t}_gl).{ch}, {t}_T.Load({}, {t}_gl).{ch}, {t}_T.Load({}, {t}_gl).{ch}, {t}_T.Load({}, {t}_gl).{ch});",
+            at(&format!("{t}_g01")),
+            at(&format!("{t}_g11")),
+            at(&format!("{t}_g10")),
+            at(&format!("{t}_g00")),
+        ));
+    }
+
     /// MIMG → SM 6.6 dynamic resources. XCL image descriptors (T#, 8 dwords) keep the GFX10
     /// layout, but BASE_ADDRESS (word 0) holds the index of the SRV in the CBV/SRV/UAV heap
     /// (UAV at +1); FORMAT (word 1 [28:20]) selects the typed view (float/uint/sint).
@@ -2354,6 +2381,13 @@ impl Em {
                 }
             };
             let s3 = self.sreg(ssamp + 3);
+            let gather = base.starts_with("gather4");
+            // HLSL's Gather* takes no mip level. With an explicit level (`image_gather4_l` /
+            // `_l_o`) read the 2x2 footprint at that level with Load; `_lz` (and an implicit
+            // level) is level 0, which is what Gather returns.
+            let gather_level = if gather && !has_lz { lod.clone() } else { None };
+            // a comparison gather needs the sampler's compare function per texel: left on Gather
+            let load_gather = gather_level.is_some() && cmp.is_none() && matches!(dim, 1 | 5);
             // texel offsets come from a VGPR (6-bit fields); SM 6.6 takes only immediate offsets, so
             // the coordinates move by offset / size of the sampled mip (exact for lz / integer l /
             // gather; an implicit LOD with a linear mip filter is sampled per mip further down)
@@ -2368,7 +2402,7 @@ impl Em {
             };
             let coord0 = sample_coord(dim, &coords);
             let coords_unmoved = coords.clone();
-            let coords: Vec<String> = if offset.is_some() { moved_coords(dim, &coords, &format!("{t}_o")) } else { coords };
+            let coords: Vec<String> = if offset.is_some() && !load_gather { moved_coords(dim, &coords, &format!("{t}_o")) } else { coords };
             let (ty, coord) = match dim {
                 0 => ("Texture1D<float4>", coords[0].clone()),
                 1 => ("Texture2D<float4>", format!("float2({}, {})", coords[0], coords[1])),
@@ -2387,9 +2421,10 @@ impl Em {
             let sampler = self.sampler_ref(d.pc, has_c, &s3);
             self.line(&format!("{samp} {t}_S = {sampler};"));
             if let Some(o) = &offset {
+                if !load_gather {
                 // the mip the console reads: the given LOD, else that of the given gradients or the
                 // pixel's own (none outside PS), plus the bias
-                let level = if has_lz || base.starts_with("gather4") {
+                let level = if has_lz || gather {
                     "0u".to_string()
                 } else if let Some(l) = &lod {
                     format!("(uint)max(round({l}), 0.0f)")
@@ -2416,16 +2451,51 @@ impl Em {
                     format!("min((uint)max(round({l}), 0.0f), max({t}_n0, 1u) - 1u)")
                 };
                 self.texel_offset(&t, dim, o, &level, "");
+                }
             }
-            let gather = base.starts_with("gather4");
             let call = if gather {
                 if comps.len() != 1 {
                     return Err("gather4 dmask");
                 }
                 let ch = ["Red", "Green", "Blue", "Alpha"][comps[0] as usize];
-                match &cmp {
-                    Some(z) => format!("{t}_T.GatherCmp{ch}({t}_S, {coord}, {z})"),
-                    None => format!("{t}_T.Gather{ch}({t}_S, {coord})"),
+                if let (true, Some(l)) = (load_gather, &gather_level) {
+                    // the named level: four texel reads of the 2x2 footprint, in D3D/GCN gather
+                    // order (x = (0,1), y = (1,1), z = (1,0), w = (0,0) from the top-left texel
+                    // after the -0.5 shift). The base texel comes from the coordinate the console
+                    // samples; the offset moves it in texels of that level. Edges clamp: a wrap or
+                    // mirror address mode reads as clamp here (a known fidelity gap).
+                    let lv = format!("(uint)max(round({l}), 0.0f)");
+                    let go = match &offset {
+                        Some(o) => format!("int2(((int)({o} << 26)) >> 26, ((int)({o} << 18)) >> 26)"),
+                        None => "int2(0, 0)".to_string(),
+                    };
+                    let (u, v) = (&coords_unmoved[0], &coords_unmoved[1]);
+                    if dim == 5 {
+                        self.line(&format!("uint {t}_gw0, {t}_gh0, {t}_ge0, {t}_gn0;"));
+                        self.line(&format!("{t}_T.GetDimensions(0u, {t}_gw0, {t}_gh0, {t}_ge0, {t}_gn0);"));
+                        self.line(&format!("uint {t}_gl = min({lv}, max({t}_gn0, 1u) - 1u);"));
+                        self.line(&format!("uint {t}_gw, {t}_gh, {t}_ge, {t}_gn;"));
+                        self.line(&format!("{t}_T.GetDimensions({t}_gl, {t}_gw, {t}_gh, {t}_ge, {t}_gn);"));
+                        self.line(&format!("int {t}_glay = clamp((int)round({}), 0, (int){t}_ge - 1);", coords_unmoved[2]));
+                        self.gather_loads(&t, ch, u, v, &go, Some(&format!("{t}_glay")));
+                    } else {
+                        self.line(&format!("uint {t}_gw0, {t}_gh0, {t}_gn0;"));
+                        self.line(&format!("{t}_T.GetDimensions(0u, {t}_gw0, {t}_gh0, {t}_gn0);"));
+                        self.line(&format!("uint {t}_gl = min({lv}, max({t}_gn0, 1u) - 1u);"));
+                        self.line(&format!("uint {t}_gw, {t}_gh, {t}_gn;"));
+                        self.line(&format!("{t}_T.GetDimensions({t}_gl, {t}_gw, {t}_gh, {t}_gn);"));
+                        self.gather_loads(&t, ch, u, v, &go, None);
+                    }
+                    format!("{t}_g")
+                } else {
+                    if !has_lz && lod.is_none() && !ps {
+                        // no derivatives outside a pixel shader: level 0, which Gather returns
+                        self.gather_implicit_level0 += 1;
+                    }
+                    match &cmp {
+                        Some(z) => format!("{t}_T.GatherCmp{ch}({t}_S, {coord}, {z})"),
+                        None => format!("{t}_T.Gather{ch}({t}_S, {coord})"),
+                    }
                 }
             } else {
                 // outside PS there are no implicit derivatives: LOD 0 (bias = LOD), raised by the clamp
@@ -4415,6 +4485,9 @@ impl Em {
     pub fn finish(&self, body: &str) -> String {
         let mut h = String::new();
         h.push_str("// generated by XCL (RDNA2 -> HLSL), do not edit\n");
+        if self.gather_implicit_level0 != 0 {
+            let _ = writeln!(h, "// recomp: implicit-level gather outside a pixel shader, level 0 used ({} instruction(s))", self.gather_implicit_level0);
+        }
         if matches!(self.opt.mode, Mode::Pixel(_)) {
             // lane reads within a quad see helper lanes (`rla`)
             h.push_str("#define XCL_PIXEL 1\n");
