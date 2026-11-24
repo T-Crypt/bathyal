@@ -1852,3 +1852,34 @@ Little is left to do without the exe – the rest needs an actual run of the gam
 5. Smaller: whole-wave reductions in partial waves (325 PS with a min reduction, every GPU), `image_sample_o` with an offset from a VGPR,
    smaller HLSL, further XGameRuntime APIs (XGameUI, XNetworking…), GameInput → system GameInput.dll,
    mapping physical pages at the game's address.
+
+## GPU_UPLOAD window (2026-11-23, `bathyal/up-gpu-upload`)
+
+`XCL_GPU_UPLOAD_WINDOW=1` (off by default) makes one console window a `GPU_UPLOAD` heap, so
+title allocations there are written by the CPU into video memory: no write-watch page, no
+upload copy. Measured on galaxy (RTX 4090): a 1 GiB heap maps at e.g. `0x1c4ad7b0000` (window 0)
+or `0x20147a50000` (window 1) depending on the process, so the windows are laid out *after* the
+heap: `Uma::for_runtime_upload` picks the coherent window at 3 (1 when the mapping is window 3),
+gives up one sparse window (two remain, 8 GiB), and sets `base = block(M) - w·4 GiB`. Console
+addresses in the upload window are then the driver's CPU mapping `M + off` (the title's
+pointer and its GPU address are the same value); the window's shader base is `H - low32(M)`, so
+`base + low32(M + off) = H + off`, inside the heap's buffer. The heap is shrunk so
+`low32(M) + len ≤ 4 GiB` (the 32-bit offset must not wrap) and refuses window layouts it cannot
+reserve. When the title allocates before its D3D12 device exists (`upload::device()` is set in
+`open_uma`), or the heap cannot be made, the usual four windows are used and nothing changes.
+
+Routed: `XMemAlloc` graphics allocations and `VirtualAlloc(MEM_GRAPHICS, MEM_COMMIT)` up to
+`XCL_GPU_UPLOAD_WINDOW_MAX_KB` (default 8192) and while the window has room (window 0 keeps a
+quarter free for the console descriptor heaps, which then live there too – their 32-bit table
+addresses still land in window 0). `XMemFree`/`VirtualFree(MEM_RELEASE)` give blocks back. The
+window is not in `Uma::watch_regions`, so `GetWriteWatch`, `sparse::before_execute` and the
+upload ring never see it. Everything XCL knows is read back on the CPU (readback heaps, D3D12
+`READBACK` buffers, `CUSTOM + WRITE_BACK` copy destinations) stays in system RAM; an `XMemAlloc`
+block the title later reads by pointer is not detectable and would be slow (write-combined),
+not wrong.
+
+Log every 300 frames: `GPU_UPLOAD window: N MB of M MB used, write-watch X ms per submit`
+(`sparse::watch_ms_per_submit`: GetWriteWatch µs / submits since start). Tests:
+`gpu_upload_window_cpu_writes_reach_a_compute_shader` (CPU writes at the window address, a
+compute shader reads them through the shader base – no upload) and the io/res heap test; both
+pass on the 4090.
