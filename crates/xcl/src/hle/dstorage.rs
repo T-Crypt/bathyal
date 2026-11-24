@@ -1061,17 +1061,6 @@ unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[us
     if r.swizzle() != 0 || (bc != 0 && !super::bcpack::can_decode(bc)) {
         return Err(E_DECOMPRESSION);
     }
-    // No BCPack mode has a decoder on this branch: the queue routes such a request to
-    // `Entry::Placeholder`, and one that reaches here anyway completes with a placeholder
-    // block, or fails as before.
-    if r.bcpack() != 0 {
-        if !bcpack_placeholder_enabled() || !bcpack_placeholder_write(r, dest_pages) {
-            return Err(E_DECOMPRESSION);
-        }
-        log_bcpack_placeholder(r);
-        return Ok(());
-    }
-
     // the stages in the console's order: zlib, then BCPack
     let stage1: Vec<u8> = if r.zlib() {
         let stage1_len = if r.intermediate_size != 0 { r.intermediate_size as usize } else { n };
