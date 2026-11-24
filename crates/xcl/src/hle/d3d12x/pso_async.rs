@@ -498,7 +498,12 @@ fn resolve_compute_within(pso: usize, limit: Option<std::time::Duration>, budget
 
 fn resolve_compute_decided(pso: usize, limit: Option<std::time::Duration>, budget: &FrameBudget, never_skip: bool) -> usize {
     let Some(p) = entry(pso) else { return pso };
-    let (real_now, done_now) = (p.real.load(Ordering::Acquire), *p.done.lock().unwrap());
+    // `complete` stores `real` and sets `done` under this lock: read both together, so a
+    // build finishing now is seen as built (or as failed), never as neither
+    let (real_now, done_now) = {
+        let done = p.done.lock().unwrap();
+        (p.real.load(Ordering::Acquire), *done)
+    };
     match decide(real_now, done_now, never_skip) {
         PipelineWait::Ready => return real_now,
         PipelineWait::Failed => return pso,
