@@ -594,6 +594,21 @@ fn cache_allowed(stage: Stage, present: impl Fn(&str) -> bool) -> bool {
             .any(|name| present(name)))
 }
 
+/// Threads per group of a console compute shader (its PSV0 / FSPX `numthreads`), the count a
+/// dispatch's groups multiply by. None: not a console compute shader.
+pub fn compute_group_threads(blob: &[u8]) -> Option<u32> {
+    let product = |t: [u32; 3]| t.iter().product::<u32>().max(1);
+    if let Some(f) = fspx(blob) {
+        return Some(product(f.threads));
+    }
+    let sh = xbox::parse(blob)?;
+    let f = sh.fssm.iter().find(|f| f.stages.first().is_some_and(|s| s.hw == 6))?;
+    match interface(blob, &sh, f)? {
+        Mode::Compute(cs) => Some(product(cs.threads)),
+        _ => None,
+    }
+}
+
 /// User SGPRs of a console compute shader (COMPUTE_PGM_RSRC2 in FSPX or FSSM):
 /// s0…s3 are the driver's, so what is above 4 is the root arguments its compiler passed in
 /// registers. None: not a console compute shader.

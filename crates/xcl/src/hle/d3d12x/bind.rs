@@ -288,7 +288,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
         Ok(()) => {
             // every record is clamped on the CPU into a scratch copy before the driver sees
             // it; one that cannot be read is not run (see `clamp_for_gpu`)
-            let Some((args, args_off)) = clamp_for_gpu(this, sig, max, args, args_off, count_buf, count_off) else {
+            let Some((args, args_off)) = clamp_for_gpu(this, pso, sig, max, args, args_off, count_buf, count_off) else {
                 count(if gfx { DRAWS_SKIPPED } else { DISPATCHES_SKIPPED });
                 note_skipped(format_args!("ExecuteIndirect with a translated pipeline dropped: its argument records cannot be bounded"));
                 return;
@@ -335,7 +335,7 @@ unsafe fn record_count(max: u32, count_buf: usize, count_off: u64) -> Option<u32
 }
 
 /// Parse and clamp a signature's records from title memory, charging this list's budget.
-unsafe fn clamped_records(this: *mut c_void, sig: &super::indirect::Signature, max: u32, args: usize, args_off: u64, count_buf: usize, count_off: u64) -> Option<(Vec<super::indirect::Record>, usize)> {
+unsafe fn clamped_records(this: *mut c_void, pso: usize, sig: &super::indirect::Signature, max: u32, args: usize, args_off: u64, count_buf: usize, count_off: u64) -> Option<(Vec<super::indirect::Record>, usize)> {
     let n = record_count(max, count_buf, count_off)?;
     let len = (n as usize).checked_mul(sig.stride as usize)?;
     let base = buffer_at(args, args_off, len)?;
@@ -346,6 +346,19 @@ unsafe fn clamped_records(this: *mut c_void, sig: &super::indirect::Signature, m
         super::indirect::clamp_record(r, &mut budget);
     }
     with(this, |s| s.budget = Some(budget));
+    // the same thread budget as a plain Dispatch: each Dispatch record's group counts are
+    // scaled down, and written back into the scratch copy only (`clamp_for_gpu`)
+    let work = work_budget();
+    if work != 0 {
+        let threads = super::real::pso_group_threads(pso).unwrap_or(ASSUMED_GROUP_THREADS);
+        for r in records.iter_mut().filter(|r| r.kind == super::indirect::Kind::Dispatch) {
+            let g = [r.counts[0], r.counts[1], r.counts[2]];
+            if let Some(c) = clamp_groups(g, threads, work) {
+                r.counts[..3].copy_from_slice(&c);
+                note_clamped(pso, g, c);
+            }
+        }
+    }
     #[cfg(test)]
     super::indirect::remember_for_test(&records);
     Some((records, base))
@@ -354,12 +367,12 @@ unsafe fn clamped_records(this: *mut c_void, sig: &super::indirect::Signature, m
 /// Clamp the records of a translated (non-two-pass) indirect execution into a scratch buffer
 /// the driver runs. Returns the argument buffer and its offset, or None when the records
 /// cannot be read (they are then not run, rather than passed unbounded).
-unsafe fn clamp_for_gpu(this: *mut c_void, sig: usize, max: u32, args: usize, args_off: u64, count_buf: usize, count_off: u64) -> Option<(usize, u64)> {
+unsafe fn clamp_for_gpu(this: *mut c_void, pso: usize, sig: usize, max: u32, args: usize, args_off: u64, count_buf: usize, count_off: u64) -> Option<(usize, u64)> {
     let Some(sig) = super::indirect::signature_of(sig) else {
         // no layout: cannot bound it. Keep the old behaviour for a signature XCL did not make.
         return Some((args, args_off + super::real::buffer_delta(args)));
     };
-    let (records, base) = clamped_records(this, &sig, max, args, args_off, count_buf, count_off)?;
+    let (records, base) = clamped_records(this, pso, &sig, max, args, args_off, count_buf, count_off)?;
     if records.is_empty() {
         return Some((args, args_off + super::real::buffer_delta(args)));
     }
@@ -405,7 +418,7 @@ unsafe fn replay_root_args(this: *mut c_void, sig: &super::indirect::Signature, 
 /// ran.
 unsafe fn two_pass_indirect(this: *mut c_void, pso: usize, tp: &super::real::TwoPassPso, sig: usize, max: u32, args: usize, args_off: u64, count_buf: usize, count_off: u64) -> Result<u32, String> {
     let sig = super::indirect::signature_of(sig).ok_or("command signature layout unknown")?;
-    let (records, base) = clamped_records(this, &sig, max, args, args_off, count_buf, count_off).ok_or("argument records not readable on the CPU")?;
+    let (records, base) = clamped_records(this, pso, &sig, max, args, args_off, count_buf, count_off).ok_or("argument records not readable on the CPU")?;
     let Some(list) = ID3D12GraphicsCommandList::from_raw_borrowed(&this) else { return Err("no command list".into()) };
     let bytes = std::slice::from_raw_parts(base as *const u8, records.len() * sig.stride as usize);
     let mut ran = 0u32;
@@ -938,6 +951,79 @@ pub(super) unsafe extern "system" fn set_pipeline_state(this: *mut c_void, pso: 
     super::real::bind_pipeline(this, pso);
 }
 
+/// threads per group assumed when the bound compute pipeline's console shader is not known
+const ASSUMED_GROUP_THREADS: u32 = 64;
+
+/// `XCL_WORK_BUDGET`: threads one Dispatch may run (x·y·z·threads per group), read once.
+/// Default 2^27. 0 turns the clamp off; unset keeps the default on.
+pub(super) fn work_budget() -> u64 {
+    static B: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *B.get_or_init(|| std::env::var("XCL_WORK_BUDGET").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(1 << 27))
+}
+
+/// `XCL_SKIP_CS_OVER=<groups>`: a diagnostic. A Dispatch whose x·y·z is above the value is
+/// skipped whole, so a run can pass one oversized dispatch that hangs the device.
+/// Unset (or 0): no skipping.
+pub(super) fn skip_over() -> Option<u64> {
+    static S: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *S.get_or_init(|| std::env::var("XCL_SKIP_CS_OVER").ok().and_then(|v| v.trim().parse::<u64>().ok()).filter(|&n| n > 0))
+}
+
+/// Whether a dispatch of `groups` is above `limit` (strictly: equal runs).
+pub(super) fn skip_cs_over(groups: [u32; 3], limit: Option<u64>) -> bool {
+    let g = groups[0] as u64 * groups[1] as u64 * groups[2] as u64;
+    limit.is_some_and(|l| g > l)
+}
+
+/// `groups` scaled down by the smallest common divisor that brings the thread count
+/// (x·y·z·`threads_per_group`) within `budget`; each axis stays at least 1. None when the
+/// dispatch already fits, or when the budget is off (0).
+pub(super) fn clamp_groups(groups: [u32; 3], threads_per_group: u32, budget: u64) -> Option<[u32; 3]> {
+    let tpg = threads_per_group.max(1) as u128;
+    let driven = |g: &[u32; 3], k: u128| -> u128 { g.iter().map(|&a| (a as u128).div_euclid(k).max(1)).product::<u128>() * tpg };
+    if budget == 0 || driven(&groups, 1) <= budget as u128 {
+        return None;
+    }
+    // k = 1 never fits here; k = the largest axis brings every axis to 1
+    let (mut lo, mut hi) = (1u128, groups.iter().map(|&g| g as u128).max().unwrap_or(1).max(1));
+    while lo < hi {
+        let mid = (lo + hi) / 2;
+        if driven(&groups, mid) <= budget as u128 {
+            hi = mid;
+        } else {
+            lo = mid + 1;
+        }
+    }
+    Some(groups.map(|g| ((g as u128) / lo).max(1) as u32))
+}
+
+/// dispatches clamped to the work budget, and dispatches skipped by `XCL_SKIP_CS_OVER`
+static CLAMPED: AtomicU64 = AtomicU64::new(0);
+static SKIPPED_OVER: AtomicU64 = AtomicU64::new(0);
+
+fn note_clamped(pso: usize, from: [u32; 3], to: [u32; 3]) {
+    let n = CLAMPED.fetch_add(1, Ordering::Relaxed) + 1;
+    if n.is_power_of_two() {
+        crate::xlog_warn!(
+            "D3D12.X: Dispatch {pso:#x} {}x{}x{} groups over the work budget, clamped to {}x{}x{} ({n} so far)",
+            from[0], from[1], from[2], to[0], to[1], to[2]
+        );
+    }
+}
+
+fn note_skipped_over(pso: usize, groups: [u32; 3], threads: u32) {
+    let (n, limit) = (SKIPPED_OVER.fetch_add(1, Ordering::Relaxed) + 1, skip_over().unwrap_or(0));
+    if n.is_power_of_two() {
+        crate::xlog_warn!(
+            "D3D12.X: Dispatch {pso:#x} {}x{}x{} groups ({} threads) over XCL_SKIP_CS_OVER={limit}, skipped ({n} so far)",
+            groups[0],
+            groups[1],
+            groups[2],
+            groups[0] as u64 * groups[1] as u64 * groups[2] as u64 * threads as u64
+        );
+    }
+}
+
 /// #14 Dispatch: with a translated pipeline, on XCL's ABI with the kept root arguments
 pub(super) unsafe extern "system" fn dispatch(this: *mut c_void, x: u32, y: u32, z: u32) {
     let pso = super::pso_async::resolve_for_indirect(with(this, |s| s.pso));
@@ -952,6 +1038,21 @@ pub(super) unsafe extern "system" fn dispatch(this: *mut c_void, x: u32, y: u32,
         count(DISPATCHES_SKIPPED);
         return;
     }
+    let threads = super::real::pso_group_threads(pso).unwrap_or(ASSUMED_GROUP_THREADS);
+    // `XCL_SKIP_CS_OVER`: a diagnostic, before the clamp – a run can pass one oversized
+    // dispatch that hangs the device
+    if skip_cs_over([x, y, z], skip_over()) {
+        count(DISPATCHES_SKIPPED);
+        note_skipped_over(pso, [x, y, z], threads);
+        return;
+    }
+    let (x, y, z) = match clamp_groups([x, y, z], threads, work_budget()) {
+        Some(c) => {
+            note_clamped(pso, [x, y, z], c);
+            c
+        }
+        None => [x, y, z],
+    };
     match translated_dispatch(this, list, pso, x, y, z) {
         Ok(()) => count(DISPATCHES),
         Err(e) => {
@@ -1429,6 +1530,66 @@ mod tests {
     use super::super::{device_x, list_x, pso_async, real, title_list};
     use super::*;
     use std::sync::atomic::AtomicUsize;
+
+    /// 2^27 threads with 64-thread groups is 2^21 groups.
+    const FULL: u64 = 1 << 21;
+
+    #[test]
+    fn a_dispatch_within_the_work_budget_is_left_alone() {
+        let budget = 1 << 27;
+        assert_eq!(clamp_groups([64, 64, 1], 64, budget), None); // 2^18 groups, 2^24 threads
+        assert_eq!(clamp_groups([1024, 1024, 1], 64, budget), None); // exactly 2^27 threads
+        assert_eq!(clamp_groups([1, 1, 1], 64, budget), None);
+    }
+
+    #[test]
+    fn a_slightly_oversized_dispatch_is_scaled_down_proportionally() {
+        // just over 2^21 groups: k = 2 brings it back under, both axes halved
+        let c = clamp_groups([2048, 1025, 1], 64, 1 << 27).expect("clamped");
+        assert_eq!(c, [1024, 512, 1]);
+        assert!(c.iter().map(|&g| g as u64).product::<u64>() * 64 <= 1 << 27);
+        // k = 1 is just over: the next divisor is 2
+        let c = clamp_groups([FULL as u32 + 1, 1, 1], 64, 1 << 27).expect("clamped");
+        assert_eq!(c, [(FULL as u32 + 1) / 2, 1, 1]);
+    }
+
+    #[test]
+    fn a_thousand_times_oversized_dispatch_fits_the_budget() {
+        let (x, y, z) = (40_000u64, 40_000u64, 2u64);
+        assert!(x * y * z * 64 >= 1000 * (1 << 27), "the case is 1000x over");
+        let c = clamp_groups([x as u32, y as u32, z as u32], 64, 1 << 27).expect("clamped");
+        let threads = c.iter().map(|&g| g as u64).product::<u64>() * 64;
+        assert!(threads <= 1 << 27, "{c:?} is {threads} threads");
+        // proportional: both equal axes are divided by the same k
+        assert_eq!(c, [1000, 1000, 2]);
+        // k is the smallest divisor that fits: one less would be over
+        let k = 39u64;
+        assert!((x / k) * (y / k) * (z / k) * 64 > 1 << 27);
+    }
+
+    #[test]
+    fn every_axis_keeps_at_least_one_group() {
+        let c = clamp_groups([1_000_000, 7, 3], 1024, 1 << 20).expect("clamped");
+        assert!(c.iter().all(|&g| g >= 1), "{c:?}");
+        // tiny budget with a large group: one group of 1024 threads is already over, but it
+        // still runs (1,1,1), not zero
+        let c = clamp_groups([4, 4, 4], 1024, 100).expect("clamped");
+        assert_eq!(c, [1, 1, 1]);
+    }
+
+    #[test]
+    fn budget_zero_turns_the_clamp_off() {
+        assert_eq!(clamp_groups([u32::MAX, u32::MAX, u32::MAX], 64, 0), None);
+    }
+
+    #[test]
+    fn skip_cs_over_is_strict_and_needs_a_limit() {
+        assert!(skip_cs_over([64, 1, 1], Some(63)), "over");
+        assert!(!skip_cs_over([64, 1, 1], Some(64)), "equal runs");
+        assert!(!skip_cs_over([1 << 20, 1 << 20, 1], None), "unset: no skipping");
+        assert!(!skip_cs_over([u32::MAX, u32::MAX, u32::MAX], Some(u64::MAX)), "u64 product stays under");
+    }
+
 
     /// A pipeline with the rect list GS draws its rect lists whole: draw_rects leaves them alone.
     #[test]

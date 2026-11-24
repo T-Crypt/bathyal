@@ -1907,6 +1907,9 @@ fn forget_pso(pso: usize) {
     if let Some(m) = PSO_USER_SGPRS.lock().unwrap().as_mut() {
         m.remove(&pso);
     }
+    if let Some(m) = PSO_GROUP_THREADS.lock().unwrap().as_mut() {
+        m.remove(&pso);
+    }
     super::device_x::forget_base(pso);
     // the compute pass goes with the last user of its entry (`Drop for TwoPassPso`)
     let gone = TWO_PASS.lock().unwrap().as_mut().and_then(|m| m.remove(&pso));
@@ -3885,6 +3888,16 @@ fn note_pso_rs(pso: *mut c_void, rs: *mut c_void) {
 /// user SGPRs of the console CS of a translated compute pipeline
 static PSO_USER_SGPRS: Mutex<Option<HashMap<usize, u32>>> = Mutex::new(None);
 
+/// threads per group of the console CS of a translated compute pipeline
+static PSO_GROUP_THREADS: Mutex<Option<HashMap<usize, u32>>> = Mutex::new(None);
+
+/// How many threads one group of the console compute shader of a translated pipeline runs
+/// (None: not known; the dispatch budget then assumes 64).
+pub fn pso_group_threads(pso: usize) -> Option<u32> {
+    let pso = super::pso_async::resolve(pso);
+    PSO_GROUP_THREADS.lock().unwrap().as_ref()?.get(&pso).copied()
+}
+
 /// How many user SGPRs the console compute shader of a translated pipeline has (None: not
 /// known). What is above the driver's four holds root arguments (`console_list::inline_for`).
 pub fn pso_user_sgprs(pso: usize) -> Option<u32> {
@@ -4099,6 +4112,9 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
     super::pso_disk::note_pso_shader(*ppv as usize, super::pso_disk::shaders_sig(&[cs]));
     if let Some(n) = crate::gpu::recomp::pso::compute_user_sgprs(cs) {
         PSO_USER_SGPRS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, n);
+    }
+    if let Some(n) = crate::gpu::recomp::pso::compute_group_threads(cs) {
+        PSO_GROUP_THREADS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, n);
     }
     note_translated_compute(hr, ppv);
     crate::xlog_info!("D3D12.X: compute PSO with the translated console CS ({} B DXIL)", dxil.len());
