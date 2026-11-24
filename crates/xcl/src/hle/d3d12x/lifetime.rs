@@ -217,6 +217,13 @@ pub(super) fn poll() {
     }
 }
 
+/// Whether XCL still holds an object `handle` a recorded list named (it was released by the
+/// title and its submissions have not all completed).
+#[cfg(test)]
+pub(super) fn held(handle: usize) -> bool {
+    STATE.lock().unwrap_or_else(|e| e.into_inner()).as_ref().is_some_and(|s| s.objects.contains_key(&handle))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
