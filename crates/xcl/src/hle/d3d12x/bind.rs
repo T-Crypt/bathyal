@@ -276,6 +276,10 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
         }
         return pc(this, sig, max, args, args_off_pc, count_buf, count_off_pc);
     }
+    if compute && super::builder_gate::skip(pso) {
+        count(DISPATCHES_SKIPPED);
+        return;
+    }
     if ROOT_SIGNATURES.lock().unwrap().as_ref().is_some_and(|s| s.contains(&sig)) {
         static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         if N.fetch_add(1, Ordering::Relaxed) < 4 {
@@ -952,6 +956,12 @@ pub(super) unsafe extern "system" fn dispatch(this: *mut c_void, x: u32, y: u32,
         count(DISPATCHES_SKIPPED);
         return;
     }
+    // the ray-tracing structure builder's stages run only all or none, and not at all
+    // unless asked (`builder_gate`)
+    if super::builder_gate::skip(pso) {
+        count(DISPATCHES_SKIPPED);
+        return;
+    }
     match translated_dispatch(this, list, pso, x, y, z) {
         Ok(()) => count(DISPATCHES),
         Err(e) => {
@@ -1429,6 +1439,22 @@ mod tests {
     use super::super::{device_x, list_x, pso_async, real, title_list};
     use super::*;
     use std::sync::atomic::AtomicUsize;
+
+    /// The ray-tracing structure builder's dispatches: skipped unless `XCL_BVH_BUILDER=1`,
+    /// then run only while every builder pipeline so far is fully built (all or none); a
+    /// non-builder pipeline is untouched.
+    #[test]
+    fn builder_dispatches_run_only_all_or_none() {
+        use super::super::builder_gate::{decide, Step};
+        assert_eq!(decide(false, true, true, false), Step::Skip, "off by default: skip, even when all are built");
+        assert_eq!(decide(false, true, false, false), Step::Skip, "off by default: skip");
+        assert_eq!(decide(true, true, true, false), Step::Run, "asked for and all built: run");
+        assert_eq!(decide(true, true, false, false), Step::SkipAndOff, "asked for, one still building: skip and off");
+        assert_eq!(decide(true, true, true, true), Step::Skip, "off for the rest of the run stays off");
+        assert_eq!(decide(true, true, false, true), Step::Skip, "off for the rest of the run stays off");
+        assert_eq!(decide(false, false, false, false), Step::Run, "not a builder: unaffected");
+        assert_eq!(decide(true, false, false, true), Step::Run, "not a builder: unaffected");
+    }
 
     /// A pipeline with the rect list GS draws its rect lists whole: draw_rects leaves them alone.
     #[test]

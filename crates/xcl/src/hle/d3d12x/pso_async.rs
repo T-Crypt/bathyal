@@ -512,6 +512,15 @@ pub fn is_pending(pso: usize) -> bool {
     entry(pso).is_some_and(|p| !*p.done.lock().unwrap())
 }
 
+/// Whether `pso` is a real pipeline now: not a stand-in at all, or its build finished with
+/// one (a failed build leaves the stand-in).
+pub fn is_built(pso: usize) -> bool {
+    match entry(pso) {
+        Some(p) => *p.done.lock().unwrap() && p.real.load(Ordering::Acquire) != 0,
+        None => true,
+    }
+}
+
 /// How many `xcl-pso-N` workers build pipelines. A worker's cost is mostly the driver's
 /// compile (`Create*PipelineState`), so this is how many driver compiles run at once.
 ///

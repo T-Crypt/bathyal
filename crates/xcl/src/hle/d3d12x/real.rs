@@ -4042,6 +4042,18 @@ fn wait_for_commit() {
     }
 }
 
+/// A console compute program whose root arguments spill to the user-data table: the kind the
+/// ray-tracing structure builder's stages are (`builder_gate::spills`).
+fn compute_program_spills(d: &D3D12_COMPUTE_PIPELINE_STATE_DESC, cs: &[u8]) -> bool {
+    if !crate::gpu::recomp::pso::is_console(cs) {
+        return false;
+    }
+    let Some(l) = super::console_list::layout_of(d.pRootSignature as usize) else {
+        return false;
+    };
+    super::builder_gate::spills(&l, crate::gpu::recomp::pso::compute_user_sgprs(cs))
+}
+
 unsafe fn translated_compute_pso(this: *mut c_void, f: PsoFn, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> Option<Result<HRESULT, ()>> {
     with_switch_fallback(|| translated_compute_pso_once(this, f, desc, riid, ppv))
 }
@@ -4101,6 +4113,10 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
         PSO_USER_SGPRS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, n);
     }
     note_translated_compute(hr, ppv);
+    if compute_program_spills(d, cs) {
+        // the title's address is the stand-in; this is the real one a dispatch resolves to
+        super::builder_gate::note_built(*ppv as usize);
+    }
     crate::xlog_info!("D3D12.X: compute PSO with the translated console CS ({} B DXIL)", dxil.len());
     Some(Ok(hr))
 }
@@ -4551,7 +4567,14 @@ unsafe fn note_translated_compute(hr: HRESULT, ppv: *mut *mut c_void) {
 
 unsafe extern "system" fn dev_create_compute_pso(this: *mut c_void, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
     let start = std::time::Instant::now();
+    let builder = crate::gpu::shader::readable(desc as usize, std::mem::size_of::<D3D12_COMPUTE_PIPELINE_STATE_DESC>()) && {
+        let d = &*(desc as *const D3D12_COMPUTE_PIPELINE_STATE_DESC);
+        shader_bytes(&d.CS).is_some_and(|cs| compute_program_spills(d, cs))
+    };
     let hr = dev_create_compute_pso_inner(this, desc, riid, ppv);
+    if builder && hr >= 0 && !ppv.is_null() && !(*ppv).is_null() {
+        super::builder_gate::note_created(*ppv as usize);
+    }
     note_pso_time(start.elapsed());
     hr
 }

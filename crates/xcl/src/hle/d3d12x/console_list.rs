@@ -837,6 +837,11 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
                             out.skipped_dispatches += 1;
                             continue;
                         }
+                        // a builder stage runs only all or none, and not by default
+                        if super::builder_gate::skip(real) {
+                            out.skipped_dispatches += 1;
+                            continue;
+                        }
                         let user_sgprs = super::real::pso_user_sgprs(real);
                         let inline = layout.as_ref().map_or(0, |l| inline_for(l, user_sgprs) as usize).min(table.len());
                         let table_at = uma_copy(arena, uma, &table[inline..]).ok_or("UMA: argument table")?;
@@ -970,6 +975,25 @@ mod tests {
         assert_eq!(inline_for(&l, Some(0)), 0, "no user SGPR at all");
         assert_eq!(user_data_for(&l, Some(4), &args, 0x7_0000_0100), vec![0x100, 7, 0, 0]);
         assert_eq!(user_data_for(&l, Some(8), &args, 0x7_0000_0100), user_data(&l, &args, 0x7_0000_0100));
+    }
+
+    /// A compute program whose arguments spill to the user-data table is the ray-tracing
+    /// structure builder's kind (`builder_gate::spills`); one that fits inline is not, unless
+    /// the program's own user SGPRs are too few for it.
+    #[test]
+    fn a_spilled_user_data_table_marks_the_builder_kind() {
+        let spills = super::super::builder_gate::spills;
+        // 8 constants (32 bytes) fit the rule's 12 user SGPRs
+        let fit = layout_from_blob(&rts0(&[(1, 8)])).unwrap();
+        assert_eq!((fit.size, fit.inline), (32, 32));
+        assert!(!spills(&fit, None));
+        assert!(!spills(&fit, Some(12)));
+        assert!(spills(&fit, Some(4)), "four user SGPRs: every argument comes from the table");
+        // 19 constants (76 bytes) do not fit: everything is in the table
+        let spilled = layout_from_blob(&rts0(&[(1, 19)])).unwrap();
+        assert_eq!((spilled.size, spilled.inline), (76, 0));
+        assert!(spills(&spilled, None));
+        assert!(spills(&spilled, Some(16)));
     }
 
     /// RTS0 v2 of parameters (type: 0 table, 1 constants, 2–4 CBV / SRV / UAV; constant count)
