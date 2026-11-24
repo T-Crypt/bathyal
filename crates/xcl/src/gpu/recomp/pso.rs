@@ -284,12 +284,25 @@ mod translated {
     ) -> Result<Compiled, String> {
         let ident = identity();
         if ident == 0 {
+            // a cached-only probe (pipeline creation on the title's thread) never translates:
+            // the worker that builds the pipeline does
+            if super::dxc::defer() {
+                return Err("translation deferred to a pipeline worker".into());
+            }
             return translate();
         }
         let path = file(dir, blob, stage, sampler_base, windows, split);
         if let Some(c) = load_in(&path, ident, blob) {
             super::dxc::note_memory_hit();
             return Ok(c);
+        }
+        // A cached-only probe that misses here must not translate. Its DXC step would refuse
+        // anyway, so nothing would be stored, and the next probe of the same pipeline would
+        // translate the whole program again on the title's thread (a retail title's loading
+        // thread re-translated big mesh programs for over 30 minutes this way). The pipeline
+        // worker translates, compiles and stores; the next probe finds it here.
+        if super::dxc::defer() {
+            return Err("translation deferred to a pipeline worker".into());
         }
         let c = translate()?;
         store_in(&path, ident, blob, &c);
@@ -1007,6 +1020,23 @@ mod shader_cache_tests {
             assert!(cache_allowed(Stage::Compute, |v| v == name));
         }
         assert!(cache_allowed(Stage::Pixel, |_| false));
+    }
+
+    #[test]
+    fn a_cached_only_probe_does_not_translate_a_missing_program() {
+        let dir = std::env::temp_dir().join(format!("xcl-probe-translate-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let blob = [0x5au8; 64];
+        let ran = std::sync::atomic::AtomicUsize::new(0);
+        let translate = || {
+            ran.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err::<Compiled, String>("not a real program".into())
+        };
+        let (r, missed) = super::dxc::cached_only(|| translated::cached(&dir, &blob, CacheStage::Vertex, 0, 4, false, translate));
+        assert!(r.is_err(), "a probe of a program not on disk gives no result");
+        assert!(missed, "the probe reports the miss, so the pipeline goes to a worker");
+        assert_eq!(ran.load(std::sync::atomic::Ordering::SeqCst), 0, "the probe did not translate");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
