@@ -16,6 +16,11 @@ fn the_sparse_state_is_replaced_outside_its_lock() {
         xcl::gpu::recomp::runner::skip_test("no GPU");
         return;
     }
+    // no sparse windows on the GPU (WARP makes no reserved buffers that large): no state to replace
+    if real::uma_gpu_va() == 0 {
+        xcl::gpu::recomp::runner::skip_test("no GPU UMA");
+        return;
+    }
     unsafe {
         // the state in use: a block of the windows, written and read back (its readback buffer is
         // the state's own)
