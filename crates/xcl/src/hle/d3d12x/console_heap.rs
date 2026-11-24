@@ -418,6 +418,15 @@ pub fn note_resource(s: &Slot, res: usize) {
     }
 }
 
+/// `res` was released for good: the slots recorded as naming it forget it. The record is a raw
+/// pointer, and a later reader (`resource_at`, the frame trace) would dereference the freed
+/// object.
+pub fn forget_resource(res: usize) {
+    let mut g = RES.lock().unwrap();
+    let Some(m) = g.as_mut() else { return };
+    m.retain(|_, &mut r| r != res);
+}
+
 /// The resource of the view slot at UMA address `at`.
 pub fn resource_at(at: usize) -> Option<usize> {
     RES.lock().unwrap().as_ref()?.get(&at).copied()
@@ -521,6 +530,20 @@ pub fn words_at(addr32: u32) -> Option<[u32; 8]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A released resource is no longer named by any slot (`resource_at` would dereference the
+    /// freed object); slots that name another resource stay.
+    #[test]
+    fn a_released_resource_is_forgotten_by_the_slots_that_named_it() {
+        let prev = RES.lock().unwrap().take();
+        *RES.lock().unwrap() = Some([(0x100usize, 0xAAusize), (0x120, 0xBB), (0x140, 0xAA)].into_iter().collect());
+        forget_resource(0xAA);
+        let left: Vec<(usize, usize)> = RES.lock().unwrap().as_ref().unwrap().iter().map(|(&a, &b)| (a, b)).collect();
+        assert_eq!(left, vec![(0x120, 0xBB)]);
+        forget_resource(0xCC);
+        assert_eq!(RES.lock().unwrap().as_ref().unwrap().len(), 1, "another resource's release changes nothing");
+        *RES.lock().unwrap() = prev;
+    }
 
     /// Ranges of the shared heap: released ones first (first fit, split), then new ones, and
     /// none past its size.
