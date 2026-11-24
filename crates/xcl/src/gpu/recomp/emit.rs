@@ -2126,7 +2126,7 @@ impl Em {
     /// The four texel reads of a level-aware gather's 2x2 footprint, in D3D/GCN gather order
     /// (x = (0,1), y = (1,1), z = (1,0), w = (0,0) from the top-left texel after the -0.5 shift).
     /// `layer` selects the array slice of a 2D array (None for a plain 2D texture).
-    fn gather_loads(&mut self, t: &str, ch: &str, u: &str, v: &str, go: &str, layer: Option<&str>) {
+    fn gather_loads(&mut self, t: &str, comp: &str, u: &str, v: &str, go: &str, layer: Option<&str>) {
         self.line(&format!("int2 {t}_gm = int2({t}_gw, {t}_gh) - 1;"));
         self.line(&format!("int2 {t}_gb = int2(floor(float2({u}, {v}) * float2({t}_gw, {t}_gh) - 0.5)) + {go};"));
         self.line(&format!("int2 {t}_g00 = clamp({t}_gb, int2(0, 0), {t}_gm);"));
@@ -2138,7 +2138,7 @@ impl Em {
             None => format!("int3({xy}, 0)"),
         };
         self.line(&format!(
-            "float4 {t}_g = float4({t}_T.Load({}, {t}_gl).{ch}, {t}_T.Load({}, {t}_gl).{ch}, {t}_T.Load({}, {t}_gl).{ch}, {t}_T.Load({}, {t}_gl).{ch});",
+            "float4 {t}_g = float4({t}_T.Load({}, {t}_gl).{comp}, {t}_T.Load({}, {t}_gl).{comp}, {t}_T.Load({}, {t}_gl).{comp}, {t}_T.Load({}, {t}_gl).{comp});",
             at(&format!("{t}_g01")),
             at(&format!("{t}_g11")),
             at(&format!("{t}_g10")),
@@ -2458,6 +2458,7 @@ impl Em {
                     return Err("gather4 dmask");
                 }
                 let ch = ["Red", "Green", "Blue", "Alpha"][comps[0] as usize];
+                let comp = ["x", "y", "z", "w"][comps[0] as usize];
                 if let (true, Some(l)) = (load_gather, &gather_level) {
                     // the named level: four texel reads of the 2x2 footprint, in D3D/GCN gather
                     // order (x = (0,1), y = (1,1), z = (1,0), w = (0,0) from the top-left texel
@@ -2477,14 +2478,14 @@ impl Em {
                         self.line(&format!("uint {t}_gw, {t}_gh, {t}_ge, {t}_gn;"));
                         self.line(&format!("{t}_T.GetDimensions({t}_gl, {t}_gw, {t}_gh, {t}_ge, {t}_gn);"));
                         self.line(&format!("int {t}_glay = clamp((int)round({}), 0, (int){t}_ge - 1);", coords_unmoved[2]));
-                        self.gather_loads(&t, ch, u, v, &go, Some(&format!("{t}_glay")));
+                        self.gather_loads(&t, comp, u, v, &go, Some(&format!("{t}_glay")));
                     } else {
                         self.line(&format!("uint {t}_gw0, {t}_gh0, {t}_gn0;"));
                         self.line(&format!("{t}_T.GetDimensions(0u, {t}_gw0, {t}_gh0, {t}_gn0);"));
                         self.line(&format!("uint {t}_gl = min({lv}, max({t}_gn0, 1u) - 1u);"));
                         self.line(&format!("uint {t}_gw, {t}_gh, {t}_gn;"));
                         self.line(&format!("{t}_T.GetDimensions({t}_gl, {t}_gw, {t}_gh, {t}_gn);"));
-                        self.gather_loads(&t, ch, u, v, &go, None);
+                        self.gather_loads(&t, comp, u, v, &go, None);
                     }
                     format!("{t}_g")
                 } else {

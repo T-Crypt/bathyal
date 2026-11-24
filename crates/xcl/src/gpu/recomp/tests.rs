@@ -8010,7 +8010,8 @@ fn gather_explicit_level_applies_offset_and_channel() {
     // v0 is the packed 6-bit offset (x at bits 5:0, y at 13:8): added to the base texel
     assert!(t.hlsl.contains("int2(((int)(v0 << 26)) >> 26, ((int)(v0 << 18)) >> 26)"), "{}", t.hlsl);
     assert_eq!(t.hlsl.matches(".Load(int3(").count(), 4, "{}", t.hlsl);
-    assert_eq!(t.hlsl.matches(".Green").count(), 4, "{}", t.hlsl);
+    let line = t.hlsl.lines().find(|l| l.contains("_g = float4(")).expect("the four reads");
+    assert_eq!(line.matches(".y").count(), 4, "{line}");
     if super::dxc::location().is_ok() {
         super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).expect("DXC compiles the level-aware gather with the offset");
     }
