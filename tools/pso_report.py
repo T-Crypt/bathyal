@@ -123,12 +123,11 @@ def analyse(text: str, path: str = "<log>") -> dict:
 
         m = RE_DRIVER.search(line)
         if m:
-            what = m.group(2)
-            if what == "reused":
-                driver = {"reused": int(m.group(1)), "line": index, "frame": frame}
-            elif driver is None:
-                driver = {"reused": 0, "line": index, "frame": frame}
-            driver["saved"] = int(m.group(1)) if what == "saved" else driver.get("saved", 0)
+            what, n = m.group(2), int(m.group(1))
+            driver = driver or {"reused": 0, "saved": 0, "line": index, "frame": frame}
+            # A "reused" report must not clear the last "saved" count, and the reverse.
+            driver["reused" if what == "reused" else "saved"] = n
+            driver["line"], driver["frame"] = index, frame
 
         m = RE_ACTIVITY.search(line)
         if m:
