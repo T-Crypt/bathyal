@@ -1,0 +1,30 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 260" role="img" aria-label="Zenith-X banner: a bright point above a dark horizon of pixel rows">
+  <defs>
+    <linearGradient id="sky" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#0b1020"/>
+      <stop offset="0.65" stop-color="#111a33"/>
+      <stop offset="1" stop-color="#070a14"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0.5" cy="0.75" r="0.55">
+      <stop offset="0" stop-color="#7fd4ff" stop-opacity="0.55"/>
+      <stop offset="0.5" stop-color="#3f7fff" stop-opacity="0.18"/>
+      <stop offset="1" stop-color="#3f7fff" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+  <rect width="1200" height="260" fill="url(#sky)"/>
+  <rect width="1200" height="260" fill="url(#glow)"/>
+  <g fill="#6fb6ff" opacity="0.22">
+    <rect x="0" y="196" width="1200" height="2"/>
+    <rect x="0" y="212" width="1200" height="2"/>
+    <rect x="0" y="232" width="1200" height="2"/>
+    <rect x="0" y="256" width="1200" height="2"/>
+  </g>
+  <g fill="#bfe6ff">
+    <circle cx="600" cy="196" r="5"/>
+    <circle cx="600" cy="196" r="2"/>
+  </g>
+  <g font-family="Segoe UI, Helvetica, Arial, sans-serif" text-anchor="middle">
+    <text x="600" y="92" font-size="76" font-weight="600" letter-spacing="2" fill="#f2f7ff">Zenith-X</text>
+    <text x="600" y="134" font-size="24" letter-spacing="6" fill="#8fb4d9">XBOX SERIES X|S ON WINDOWS, X86-64</text>
+  </g>
+</svg>
