@@ -1434,7 +1434,7 @@ fn run_in_region(dxil: &[u8], state: &KernelState, arena: &Arena) -> Result<Kern
             split_halves_agree(&raw)?;
             Ok(KernelResult { sgpr: raw[..KERNEL_SGPRS].to_vec(), vgpr, scc: raw[KERNEL_SCC_SLOT], raw, mem: Vec::new(), textures: Vec::new() })
         }
-    })
+    } 
 }
 
 /// A raw UAV of a memory window of `bytes` (`Options::heap_windows`): at most 2^30 − 1 dwords,
