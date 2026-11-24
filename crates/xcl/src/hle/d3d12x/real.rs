@@ -620,6 +620,9 @@ unsafe fn vt(obj: *mut c_void) -> *const usize {
 /// Original function of `slot` for an adopted object.
 pub unsafe fn orig_fn(this: *mut c_void, slot: usize) -> usize {
     let ext = vt(this);
+    if !ext.is_null() && !is_ext(ext as usize) {
+        eprintln!("orig_fn: non-adopted this {this:p} vtable {ext:p} slot {slot}");
+    }
     let orig = *ext.sub(1) as *const usize;
     *orig.add(slot)
 }
