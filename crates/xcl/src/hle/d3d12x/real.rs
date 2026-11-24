@@ -2731,13 +2731,16 @@ unsafe fn create_committed_resource_inner(this: *mut c_void, props: usize, flags
     let desc = pc_full.as_ref().map_or(desc, |d| d.as_ptr() as usize);
     let mut clear_buf = [0u8; 24];
     let clear = super::device_x::pc_clear(clear as *const c_void, &mut clear_buf) as usize;
-    // console-only state bits (e.g. 0x100000 on a display target) are not the PC's
-    let mut hr = dev_create_committed_resource(this, props, flags, desc, state & PC_RESOURCE_STATES as usize, clear, riid, ppv);
+    // console-only state bits (e.g. 0x100000 on a display target) are not the PC's; a depth
+    // buffer the PC description took ALLOW_UNORDERED_ACCESS from does not start as a UAV
+    let st = pc_full.as_ref().map_or(state as u32 & PC_RESOURCE_STATES, |d| super::device_x::pc_initial_state(u32::from_le_bytes(d[0x30..0x34].try_into().unwrap()), state as u32));
+    let mut hr = dev_create_committed_resource(this, props, flags, desc, st as usize, clear, riid, ppv);
     if hr < 0 && desc != 0 && crate::gpu::shader::readable(desc, 0x38) {
         // a format whose support refuses a use the title asked for: the same texture without it
         let x: [u8; 0x38] = (desc as *const [u8; 0x38]).read_unaligned();
         if let Some((retry, _)) = create_without_refused_uses(this, &x) {
-            let st = state & PC_RESOURCE_STATES as usize;
+            let retry_flags = u32::from_le_bytes(retry[0x30..0x34].try_into().unwrap());
+            let st = super::device_x::pc_initial_state(retry_flags, state as u32) as usize;
             hr = dev_create_committed_resource(this, props, flags, retry.as_ptr() as usize, st, clear, riid, ppv);
             if hr < 0 {
                 // the initial state named a use the texture no longer has
@@ -3122,7 +3125,7 @@ pub(super) unsafe extern "system" fn dev_create_placed_resource_x(this: *mut c_v
     }
     let x: [u8; 0x38] = (desc as *const [u8; 0x38]).read_unaligned();
     let d = super::device_x::pc_resource_desc(&x);
-    let st = state as u32 & PC_RESOURCE_STATES;
+    let st = super::device_x::pc_initial_state(u32::from_le_bytes(x[0x30..0x34].try_into().unwrap()), state as u32);
     let hr2 = dev_create_placed_resource(this, heap, offset, d.as_ptr() as usize, st as usize, clear, riid, ppv);
     let heap_desc = pc_heap_desc(heap);
     let pc_size = pc_allocation_size(this, &d);
@@ -3176,7 +3179,7 @@ unsafe fn own_memory_if_larger_on_the_pc(this: *mut c_void, heap: usize, offset:
         return None;
     }
     let h = pc_heap_desc(heap)?;
-    let st = state as u32 & PC_RESOURCE_STATES;
+    let st = super::device_x::pc_initial_state(u32::from_le_bytes(x[0x30..0x34].try_into().unwrap()), state as u32);
     let mut hr = dev_create_committed_resource(this, &h.Properties as *const _ as usize, 0, d.as_ptr() as usize, st as usize, clear, riid, ppv);
     if hr < 0 && st != 0 {
         // as in the past-the-end fallback: a state the PC refuses for this desc (e.g. UAV
