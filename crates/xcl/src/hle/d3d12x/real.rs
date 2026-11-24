@@ -4048,7 +4048,8 @@ fn compute_program_spills(d: &D3D12_COMPUTE_PIPELINE_STATE_DESC, cs: &[u8]) -> b
     if !crate::gpu::recomp::pso::is_console(cs) {
         return false;
     }
-    let Some(l) = super::console_list::layout_of(d.pRootSignature as usize) else {
+    let rs = d.pRootSignature.as_ref().map_or(0, |r| r.as_raw() as usize);
+    let Some(l) = super::console_list::layout_of(rs) else {
         return false;
     };
     super::builder_gate::spills(&l, crate::gpu::recomp::pso::compute_user_sgprs(cs))
