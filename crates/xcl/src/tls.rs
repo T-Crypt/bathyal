@@ -87,8 +87,13 @@ pub fn build_carrier_dll(template_size: u32) -> Vec<u8> {
     build_carrier_dll_with(template_size, CarrierOpts::default())
 }
 
-/// Build a minimal x64 DLL whose TLS block is exactly `template_size` bytes.
 pub fn build_carrier_dll_with(template_size: u32, opts: CarrierOpts) -> Vec<u8> {
+    build_carrier_dll_holding(&[], template_size, opts)
+}
+
+/// Build a minimal x64 DLL whose TLS block is exactly `template_size` bytes and starts as
+/// `template` (zeros after it).
+pub fn build_carrier_dll_holding(template: &[u8], template_size: u32, opts: CarrierOpts) -> Vec<u8> {
     let align_ch = crate::pe::sanitize_tls_characteristics(opts.characteristics);
     let align = crate::pe::tls_alignment_from_characteristics(align_ch);
     // Align template start RVA to the requested TLS alignment. Because DLL load
@@ -98,10 +103,11 @@ pub fn build_carrier_dll_with(template_size: u32, opts: CarrierOpts) -> Vec<u8> 
     let template_rva = (min_rva + align - 1) & !(align - 1);
     let off_template = template_rva - DATA_RVA;
     let max_template = (u32::MAX - DATA_RVA - off_template - 0xFFF) & !15;
-    let template_size = template_size.clamp(16, max_template);
+    let template_size = template_size.clamp(16, max_template).max(template.len() as u32);
     let data_vsize = off_template + template_size;
     let size_of_image = (DATA_RVA + data_vsize + 0xFFF) & !0xFFF;
-    let mut f = vec![0u8; FILE_ALIGN * 4];
+    let data_raw = (off_template as usize + template.len()).next_multiple_of(FILE_ALIGN);
+    let mut f = vec![0u8; FILE_ALIGN * 3 + data_raw];
     // DOS header
     f[0] = b'M';
     f[1] = b'Z';
@@ -119,7 +125,7 @@ pub fn build_carrier_dll_with(template_size: u32, opts: CarrierOpts) -> Vec<u8> 
     put16(&mut f, opt, 0x20B);
     f[opt + 2] = 14;
     put32(&mut f, opt + 4, FILE_ALIGN as u32); // SizeOfCode
-    put32(&mut f, opt + 8, (FILE_ALIGN * 2) as u32); // SizeOfInitializedData
+    put32(&mut f, opt + 8, (FILE_ALIGN + data_raw) as u32); // SizeOfInitializedData
     put32(&mut f, opt + 16, if opts.entry_point { TEXT_RVA } else { 0 });
     put32(&mut f, opt + 20, TEXT_RVA); // BaseOfCode
     put64(&mut f, opt + 24, CARRIER_BASE);
@@ -150,18 +156,18 @@ pub fn build_carrier_dll_with(template_size: u32, opts: CarrierOpts) -> Vec<u8> 
     put32(&mut f, dirs + 9 * 8 + 4, 40);
     // Section table: .text, .reloc, .data (last – it grows with the template)
     let mut sec = opt + 240;
-    let mut section = |f: &mut Vec<u8>, name: &[u8], vsize: u32, rva: u32, raw: usize, ch: u32| {
+    let mut section = |f: &mut Vec<u8>, name: &[u8], vsize: u32, rva: u32, raw: usize, raw_size: usize, ch: u32| {
         f[sec..sec + name.len()].copy_from_slice(name);
         put32(f, sec + 8, vsize);
         put32(f, sec + 12, rva);
-        put32(f, sec + 16, FILE_ALIGN as u32);
+        put32(f, sec + 16, raw_size as u32);
         put32(f, sec + 20, raw as u32);
         put32(f, sec + 36, ch);
         sec += 40;
     };
-    section(&mut f, b".text", 6, TEXT_RVA, FILE_ALIGN, 0x0000_0020 | 0x2000_0000 | 0x4000_0000);
-    section(&mut f, b".reloc", reloc_size, RELOC_RVA, FILE_ALIGN * 2, 0x0000_0040 | 0x0200_0000 | 0x4000_0000);
-    section(&mut f, b".data", data_vsize, DATA_RVA, FILE_ALIGN * 3, 0x0000_0040 | 0x4000_0000 | 0x8000_0000);
+    section(&mut f, b".text", 6, TEXT_RVA, FILE_ALIGN, FILE_ALIGN, 0x0000_0020 | 0x2000_0000 | 0x4000_0000);
+    section(&mut f, b".reloc", reloc_size, RELOC_RVA, FILE_ALIGN * 2, FILE_ALIGN, 0x0000_0040 | 0x0200_0000 | 0x4000_0000);
+    section(&mut f, b".data", data_vsize, DATA_RVA, FILE_ALIGN * 3, data_raw, 0x0000_0040 | 0x4000_0000 | 0x8000_0000);
     // .text: DllMain = mov eax, 1 ; ret
     f[FILE_ALIGN..FILE_ALIGN + 6].copy_from_slice(&[0xB8, 0x01, 0x00, 0x00, 0x00, 0xC3]);
     // .reloc: four DIR64 entries for the TLS directory's VA fields
@@ -181,6 +187,8 @@ pub fn build_carrier_dll_with(template_size: u32, opts: CarrierOpts) -> Vec<u8> 
     // SizeOfZeroFill = 0; preserve valid IMAGE_SCN_ALIGN_* bits in Characteristics.
     put32(&mut f, d + OFF_TLS_DIR as usize + 36, align_ch);
     put32(&mut f, d + OFF_INDEX as usize, NO_INDEX); // sentinel: was a slot assigned?
+    let t = d + OFF_TEMPLATE as usize;
+    f[t..t + template.len()].copy_from_slice(template);
     if opts.with_import {
         let desc = d + OFF_IMPORT_DESC as usize;
         put32(&mut f, desc, DATA_RVA + OFF_INT);
@@ -413,53 +421,6 @@ pub unsafe fn on_thread_attach() {
     }
 }
 
-unsafe fn fill_existing_threads(img: &TlsImage, index: u32) -> usize {
-    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
-    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
-        CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32,
-    };
-    use windows_sys::Win32::System::Threading::{
-        GetCurrentProcessId, GetCurrentThreadId, OpenThread, THREAD_QUERY_INFORMATION,
-    };
-    let me_pid = GetCurrentProcessId();
-    let me_tid = GetCurrentThreadId();
-    fill_block(tls_block_of(current_teb(), index), img);
-    let mut filled = 1usize;
-    let snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
-    if snap == INVALID_HANDLE_VALUE {
-        return filled;
-    }
-    let mut te: THREADENTRY32 = std::mem::zeroed();
-    te.dwSize = std::mem::size_of::<THREADENTRY32>() as u32;
-    let mut ok = Thread32First(snap, &mut te) != 0;
-    while ok {
-        if te.th32OwnerProcessID == me_pid && te.th32ThreadID != me_tid {
-            let h = OpenThread(THREAD_QUERY_INFORMATION, 0, te.th32ThreadID);
-            if !h.is_null() {
-                let mut tbi: ThreadBasicInformation = std::mem::zeroed();
-                let st = NtQueryInformationThread(
-                    h,
-                    0,
-                    &mut tbi as *mut _ as *mut _,
-                    std::mem::size_of::<ThreadBasicInformation>() as u32,
-                    std::ptr::null_mut(),
-                );
-                if st >= 0 {
-                    let b = tls_block_of(tbi.teb, index);
-                    if !b.is_null() {
-                        fill_block(b, img);
-                        filled += 1;
-                    }
-                }
-                CloseHandle(h);
-            }
-        }
-        ok = Thread32Next(snap, &mut te) != 0;
-    }
-    CloseHandle(snap);
-    filled
-}
-
 static SEQ: AtomicU32 = AtomicU32::new(0);
 
 /// Create + load a carrier for `img_name` and wire the image's TLS to it.
@@ -487,10 +448,15 @@ pub unsafe fn install(
             "TLS block too large for {img_name}: template {template_len} B, total {total_len} B (carrier max {size} B)"
         ));
     }
-    let bytes = build_carrier_dll_with(
-        size,
-        CarrierOpts { characteristics: align_ch, ..CarrierOpts::default() },
-    );
+    // the carrier's own template is the image's: ntdll gives every thread – those running now
+    // under its own lock, later ones as they start – a block that starts as it. (Walking the
+    // threads from here raced with their exit: a TEB or TLS block freed under the access.)
+    let opts = CarrierOpts { characteristics: align_ch, ..CarrierOpts::default() };
+    let bytes = if template_len == 0 {
+        build_carrier_dll_with(size, opts)
+    } else {
+        build_carrier_dll_holding(std::slice::from_raw_parts(template as *const u8, template_len), size, opts)
+    };
     std::fs::create_dir_all(cache_dir).map_err(|e| format!("cache dir: {e}"))?;
     let safe: String = img_name
         .chars()
@@ -521,17 +487,16 @@ pub unsafe fn install(
         template_len,
         index: AtomicU32::new(index),
     });
-    // Publish after LoadLibraryW (never hold IMAGES across OS loader calls) and before
-    // fill_existing_threads so every thread is covered either by the snapshot below or by
-    // on_thread_attach().
+    // Publish after LoadLibraryW (never hold IMAGES across OS loader calls): the OS loader
+    // filled this image's slot for every thread from the carrier's template, and later threads
+    // get it from their on_thread_attach().
     IMAGES.write().map_err(|_| "TLS lock poisoned")?.push(img.clone());
     if !index_ptr.is_null() {
         *index_ptr = index;
     }
-
-    let n = fill_existing_threads(&img, index);
+    img.index.store(index, Ordering::Release);
     crate::xlog_info!(
-        "TLS: {img_name}: template {template_len} B, block {size} B, align {align} B, index {index}, threads initialized: {n}"
+        "TLS: {img_name}: template {template_len} B, block {size} B, align {align} B, index {index}"
     );
     Ok(index)
 }
@@ -570,6 +535,22 @@ mod tests {
         assert_eq!(imps.len(), 1);
         assert_eq!(imps[0].dll, "KERNEL32.dll");
         assert!(pe.size_of_image >= DATA_RVA + OFF_TEMPLATE + 0x3000);
+    }
+
+    #[test]
+    fn carrier_holds_the_template() {
+        let template: Vec<u8> = (1..=0x240u32).map(|i| i as u8).collect();
+        let bytes = build_carrier_dll_holding(&template, 0x400, CarrierOpts::default());
+        let pe = Pe::parse(&bytes, Layout::File).unwrap();
+        let tls = pe.tls().unwrap().unwrap();
+        assert_eq!(tls.template_len(), 0x400);
+        let rva = pe.va_to_rva(tls.start_raw).unwrap();
+        let data = pe.sections.iter().find(|s| s.name == ".data").unwrap();
+        let at = (data.raw_ptr + rva - data.va) as usize;
+        assert_eq!(&bytes[at..at + template.len()], &template[..]);
+        // the rest of the block: zeros, then past the raw data (zero when mapped)
+        assert_eq!(bytes.len(), (data.raw_ptr + data.raw_size) as usize);
+        assert!(bytes[at + template.len()..].iter().all(|&b| b == 0));
     }
 
     #[test]
@@ -731,6 +712,41 @@ mod tests {
         assert!(ok);
     }
 
+    /// A thread that runs while the image is installed gets its block as the image's template:
+    /// from ntdll, which fills every thread's new slot from the carrier's own template.
+    #[test]
+    fn a_thread_running_during_install_gets_the_template() {
+        let dir = std::env::temp_dir().join(format!("xcl_tls_test_running_{}", std::process::id()));
+        let template: &'static [u8; 48] = Box::leak(Box::new(std::array::from_fn(|i| i as u8 ^ 0xC3)));
+        let (go, wait) = std::sync::mpsc::channel::<u32>();
+        let running = std::thread::spawn(move || {
+            let idx = wait.recv().unwrap();
+            let b = unsafe { tls_block_of(current_teb(), idx) };
+            !b.is_null() && unsafe { std::slice::from_raw_parts(b, 0x100) } == [&template[..], &[0; 0x100 - 48]].concat()
+        });
+        let idx = unsafe { install("unit-running", template.as_ptr() as usize, 48, 0x100, std::ptr::null_mut(), &dir).unwrap() };
+        go.send(idx).unwrap();
+        assert!(running.join().unwrap());
+    }
+
+    /// install while threads start and end around it (its own walk of the threads read the TEB of
+    /// a thread that had just exited: an access violation in about 1 of 3 runs)
+    #[test]
+    fn install_while_threads_exit() {
+        use std::sync::atomic::AtomicBool;
+        static STOP: AtomicBool = AtomicBool::new(false);
+        let dir = std::env::temp_dir().join(format!("xcl_tls_test_churn_{}", std::process::id()));
+        let template: &'static [u8; 16] = Box::leak(Box::new([0x3Cu8; 16]));
+        let churn: Vec<_> = (0..8)
+            .map(|_| std::thread::spawn(|| while !STOP.load(Ordering::Relaxed) { std::thread::spawn(|| ()).join().unwrap(); }))
+            .collect();
+        for _ in 0..200 {
+            unsafe { install("churn", template.as_ptr() as usize, 16, 16, std::ptr::null_mut(), &dir).unwrap() };
+        }
+        STOP.store(true, Ordering::Relaxed);
+        churn.into_iter().for_each(|t| t.join().unwrap());
+    }
+
     #[test]
     fn install_without_an_index_variable() {
         let dir = std::env::temp_dir().join(format!("xcl_tls_test_noidx_{}", std::process::id()));
@@ -829,8 +845,8 @@ mod tests {
             let _ = std::fs::remove_file(&mapped_path);
 
             // Install via tls::install() and verify TLS block initialization and alignment
-            // on a pre-existing thread (populated by fill_existing_threads()), the calling
-            // thread, and newly spawned threads (populated by on_thread_attach()).
+            // on the calling thread, and newly spawned threads (populated by
+            // on_thread_attach()).
             let tpl_len = align.min(256).max(64);
             let mut template = vec![0u8; tpl_len];
             for (i, b) in template.iter_mut().enumerate() {
@@ -952,8 +968,8 @@ mod tests {
 
         // 2. Concurrent install() + thread spawning stress test: verify every thread sees
         //    both the base image and every dynamically installed image whose install() completed.
-        //    Keep all spawned workers alive until installer.join() completes so no thread exits
-        //    and unmaps its TEB while fill_existing_threads() walks process threads.
+        //    Keep all spawned workers alive until installer.join() completes so every worker
+        //    sees each installed image.
         let installed: Arc<Vec<(AtomicU32, &'static [u8; 32])>> = Arc::new(
             (0..3u8)
                 .map(|i| (AtomicU32::new(NO_INDEX), Box::leak(Box::new([i + 1; 32])) as &'static [u8; 32]))
