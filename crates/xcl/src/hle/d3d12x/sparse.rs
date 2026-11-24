@@ -1744,51 +1744,6 @@ pub fn note_watch(t: std::time::Duration, pages: usize, ranges: usize, bytes: us
     WATCH[3].fetch_add(bytes as u64, Ordering::Relaxed);
 }
 
-/// The write-watch's time budget for one submission: `XCL_WATCH_BUDGET_MS` (0: no budget),
-/// 4 ms unless set.
-const WATCH_BUDGET_MS: u64 = 4;
-
-/// The budget `XCL_WATCH_BUDGET_MS` names (None: no budget – 0, or a value that is not a number).
-fn budget_from(v: Option<&str>) -> Option<std::time::Duration> {
-    let ms = match v {
-        None => WATCH_BUDGET_MS,
-        Some(s) => match s.trim().parse::<u64>() {
-            Ok(n) => n.min(60_000),
-            Err(_) => return Some(std::time::Duration::from_millis(WATCH_BUDGET_MS)),
-        },
-    };
-    (ms > 0).then(|| std::time::Duration::from_millis(ms))
-}
-
-pub fn watch_budget() -> Option<std::time::Duration> {
-    static B: std::sync::OnceLock<Option<std::time::Duration>> = std::sync::OnceLock::new();
-    *B.get_or_init(|| budget_from(std::env::var("XCL_WATCH_BUDGET_MS").ok().as_deref()))
-}
-
-/// `took` of this submission's write-watch work against the budget: the megabytes walked, the
-/// dirty pages and the megabytes uploaded, when it ran over. Logged for the first 8 submissions
-/// over and then every 1024th, so a title that is over on every frame costs a short line now and
-/// then.
-pub fn note_budget(took: std::time::Duration, walked: usize, pages: usize, uploaded: usize) {
-    let Some(budget) = watch_budget() else { return };
-    if took <= budget {
-        return;
-    }
-    static OVER: AtomicU64 = AtomicU64::new(0);
-    let n = OVER.fetch_add(1, Ordering::Relaxed) + 1;
-    if n > 8 && n % 1024 != 0 {
-        return;
-    }
-    crate::xlog_info!(
-        "write-watch: submission {n} over its {} ms budget: {} ms, {} MB walked, {} dirty pages, {} MB uploaded (XCL_WATCH_BUDGET_MS=0 turns the check off)",
-        budget.as_millis(),
-        took.as_millis(),
-        walked >> 20,
-        pages,
-        uploaded >> 20
-    );
-}
-
 /// Before the title's ExecuteCommandLists on `queue`: the pages the CPU wrote (`dirty`, 4 KiB
 /// pages from the write-watch, sorted) and the reused tiles are copied asynchronously into video
 /// memory, and `queue` GPU-waits for that and for new tile mappings.
@@ -1809,8 +1764,6 @@ pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: 
     }
     let mut dirty_runs = std::mem::take(&mut s.scratch_runs);
     dirty_runs.clear();
-    // bytes this submission's scan looked at (a page in a hole is skipped, not walked)
-    let mut walked = 0usize;
     let mut i = 0;
     while i < dirty.len() {
         let a = dirty[i];
@@ -1832,7 +1785,6 @@ pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: 
                     if entry.holes & (1u16 << idx) == 0 {
                         let bytes = std::slice::from_raw_parts(pg as *const u8, PAGE);
                         scan_page(bytes, pg, &mut entry.sent[idx], &mut dirty_runs);
-                        walked += PAGE;
                     }
                     pg += PAGE;
                 }
@@ -1850,15 +1802,12 @@ pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: 
     if !dirty_runs.is_empty() {
         s.upload_dirty(&dirty_runs);
     }
-    let took = t_scanned.elapsed();
-    PHASES[2].fetch_add(took.as_micros() as u64, Ordering::Relaxed);
-    let uploaded: usize = zero_runs.iter().chain(dirty_runs.iter()).map(|r| r.1).sum();
-    note_budget(took, walked, dirty.len(), uploaded);
+    PHASES[2].fetch_add(t_scanned.elapsed().as_micros() as u64, Ordering::Relaxed);
     {
         static CALLS: AtomicU64 = AtomicU64::new(0);
         static BYTES: AtomicU64 = AtomicU64::new(0);
         static MICROS: AtomicU64 = AtomicU64::new(0);
-        let bytes = uploaded;
+        let bytes: usize = zero_runs.iter().chain(dirty_runs.iter()).map(|r| r.1).sum();
         let n = CALLS.fetch_add(1, Ordering::Relaxed) + 1;
         let b = BYTES.fetch_add(bytes as u64, Ordering::Relaxed) + bytes as u64;
         let us = MICROS.fetch_add(t0.elapsed().as_micros() as u64, Ordering::Relaxed) + t0.elapsed().as_micros() as u64;
@@ -1973,32 +1922,6 @@ mod tests {
         for t in threads {
             t.join().unwrap();
         }
-    }
-
-    /// The budget is a knob: a number of milliseconds, 4 unless set, and 0 turns it off.
-    #[test]
-    fn the_watch_budget_is_a_knob_and_zero_turns_it_off() {
-        assert_eq!(budget_from(None), Some(std::time::Duration::from_millis(WATCH_BUDGET_MS)));
-        assert_eq!(budget_from(Some("0")), None);
-        assert_eq!(budget_from(Some("12")), Some(std::time::Duration::from_millis(12)));
-        assert_eq!(budget_from(Some(" 250 ")), Some(std::time::Duration::from_millis(250)));
-        assert_eq!(budget_from(Some("nonsense")), Some(std::time::Duration::from_millis(WATCH_BUDGET_MS)), "a value that is not a number: the default");
-    }
-
-    /// The GPU-visible spans keep only the mapped tiles, merged, and a span inside one that is
-    /// already watched adds nothing.
-    #[test]
-    fn visible_spans_are_clipped_to_mapped_tiles() {
-        let mapped = [(0x2_0000, 0x4_0000), (0xA_0000, 0xB_0000), (0x14_0000, 0x16_0000)];
-        // a span across a mapped run and a gap, one before it, one inside a watched run, one
-        // that only touches its start
-        let spans = [(0x2_0000, 0x9_0000), (0x0, 0x2_0000), (0xA_0800, 0x1_0000), (0xA_0000, 0x100)];
-        assert_eq!(clip_to_mapped(&spans, &mapped), vec![(0x2_0000, 0x4_0000), (0xA_0000, 0xB_0000)]);
-        // nothing mapped under a span: nothing watched; an empty input stays empty
-        assert_eq!(clip_to_mapped(&[(0x5_0000, 0x1_0000)], &mapped), vec![]);
-        assert_eq!(clip_to_mapped(&[], &mapped), vec![]);
-        // two adjacent mapped runs under one span are one run
-        assert_eq!(clip_to_mapped(&[(0x2_0000, 0x2_0000)], &[(0x2_0000, 0x3_0000), (0x3_0000, 0x4_0000)]), vec![(0x2_0000, 0x4_0000)]);
     }
 
     #[test]
