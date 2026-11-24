@@ -1064,12 +1064,13 @@ impl State {
     }
 
     /// Asynchronously copy `runs` (address, bytes) from the CPU view into sparse VRAM tiles via
-    /// the 64 MiB ring staging buffer (zero CPU stall on the common path).
-    unsafe fn upload_dirty(&mut self, runs: &[(usize, usize)]) {
+    /// the 64 MiB ring staging buffer (zero CPU stall on the common path). Returns whether the
+    /// copies were submitted (false: no staging buffer, so the CPU view was not sent).
+    unsafe fn upload_dirty(&mut self, runs: &[(usize, usize)]) -> bool {
         if runs.is_empty() {
-            return;
+            return false;
         }
-        let Some(p) = self.staging_ptr() else { return };
+        let Some(p) = self.staging_ptr() else { return false };
         let mut open_slot: Option<usize> = None;
         let mut last_wi: Option<usize> = None;
         for &(a, n) in runs {
@@ -1122,6 +1123,78 @@ impl State {
         if let Some(slot_idx) = open_slot {
             self.submit_slot(slot_idx);
         }
+        true
+    }
+}
+
+/// The runs of `[va, va + len)` a sparse window has video memory for (mapped tiles, no hole
+/// pages), rounded out to whole 64-byte chunks inside each page so that the hashes recorded for
+/// them match what an upload of them sends.
+fn video_runs(s: &State, va: usize, len: usize) -> Vec<(usize, usize)> {
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    let end = va.saturating_add(len);
+    let mut at = va;
+    while at < end {
+        let t = at & !(TILE - 1);
+        let tile_end = (t + TILE).min(end);
+        if !s.mapped.contains_key(&t) {
+            at = tile_end;
+            continue;
+        }
+        let mut pg = at & !(PAGE - 1);
+        while pg < tile_end {
+            let idx = (pg - t) / PAGE;
+            if s.mapped.get(&t).is_some_and(|e| e.holes & (1u16 << idx) == 0) {
+                let lo = at.max(pg) & !(CHUNK - 1);
+                let hi = (tile_end.min(pg + PAGE) + CHUNK - 1) & !(CHUNK - 1);
+                if hi > lo {
+                    push_run(&mut runs, lo, hi - lo);
+                }
+            }
+            pg += PAGE;
+        }
+        at = tile_end;
+    }
+    runs
+}
+
+/// Whether every page of `[va, va + len)` in a sparse window has video memory, so that a GPU
+/// copy reaches it.
+pub fn has_video_memory(va: usize, len: usize) -> bool {
+    if len == 0 {
+        return false;
+    }
+    let g = STATE.lock().unwrap();
+    let Some(s) = g.as_ref() else { return false };
+    if s.window_index(va).is_none() || va.checked_add(len - 1).is_none_or(|e| s.window_index(e).is_none()) {
+        return false;
+    }
+    let mut covered = 0usize;
+    for &(a, n) in &video_runs(s, va, len) {
+        let lo = a.max(va);
+        let hi = (a + n).min(va + len);
+        covered += hi.saturating_sub(lo);
+    }
+    covered >= len
+}
+
+/// After the CPU wrote `[va, va + len)` there (a copy ordered after the queue's earlier work):
+/// send the bytes to the video memory of the sparse window's committed tiles now, and make the
+/// title queues wait for them before their next work (`before_execute` waits on the uploads).
+/// Hole pages and tiles without video memory are skipped: there is nothing there to reach.
+pub unsafe fn flush_written(va: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
+    let mut g = STATE.lock().unwrap();
+    let Some(s) = g.as_mut() else { return };
+    let runs = video_runs(s, va, len);
+    let Some(last) = runs.last() else { return };
+    let sent_to = last.0 + last.1;
+    // the bytes that go now must not look unwritten to the next `before_execute`
+    if s.upload_dirty(&runs) {
+        s.sync_sent_range(va, sent_to.saturating_sub(va));
+        s.signal();
     }
 }
 

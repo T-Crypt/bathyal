@@ -788,6 +788,41 @@ unsafe fn snapshot_page_array(ptr: u64, offset: u16, byte_len: u32) -> Result<Ve
     Ok(std::slice::from_raw_parts(ptr as *const usize, count).to_vec())
 }
 
+/// How long a destination page array that still holds a 0 entry at its request's turn waits
+/// for the title to fill it.
+const LATE_PAGE_WAIT_MS: u64 = 5;
+
+/// The page numbers of a destination page array at its request's turn.
+///
+/// A retail title keeps its page arrays in its own tables and fills an entry after
+/// `EnqueueRequest`, sometimes after `Submit` and from another thread; the console's copy
+/// engine starts later than XCL's worker, so a request that reads the table once, right after
+/// `Submit`, still sees page 0 and was refused with `E_ACCESS_VIOLATION` – its world streaming
+/// (a handful per file: the tail of that race). Entries that were 0 at enqueue are read again
+/// here, and a table still holding 0 is given a moment. An array that had all its pages at
+/// enqueue stays as it was snapshotted (titles also pass arrays on the stack).
+unsafe fn destination_pages_at_turn(r: &Request, snapshot: &[usize]) -> Vec<usize> {
+    let mut pages = snapshot.to_vec();
+    if !pages.contains(&0) {
+        return pages;
+    }
+    let bytes = pages.len() * std::mem::size_of::<usize>();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(LATE_PAGE_WAIT_MS);
+    loop {
+        if crate::gpu::shader::readable(r.destination as usize, bytes) {
+            for (k, page) in pages.iter_mut().enumerate() {
+                if *page == 0 {
+                    *page = (r.destination as *const usize).add(k).read_unaligned();
+                }
+            }
+        }
+        if !pages.contains(&0) || std::time::Instant::now() >= deadline {
+            return pages;
+        }
+        std::thread::sleep(std::time::Duration::from_micros(100));
+    }
+}
+
 /// Whether `n` bytes at `p` are committed, writable memory.
 fn writable(p: usize, n: usize) -> bool {
     let Some(end) = p.checked_add(n) else { return false };
@@ -908,20 +943,9 @@ unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[us
     let payload = if bc != 0 { bcpack_unpack(r, &stage1, n)? } else { stage1 };
 
     if r.dest_physical_pages() {
-        let pages = dest_pages.ok_or(E_ACCESS_VIOLATION)?;
-        // A page number of 0 in the snapshot taken at enqueue (no page has it): the entry is
-        // read again now. A retail title keeps its page arrays in its own tables and fills an
-        // entry after EnqueueRequest – its streaming requests were refused by the thousand
-        // with page 0. An array that had its pages at enqueue stays as it was snapshotted
-        // (titles also pass arrays on the stack).
-        let late: Vec<usize>;
-        let pages = if pages.contains(&0) && crate::gpu::shader::readable(r.destination as usize, std::mem::size_of_val(pages)) {
-            late = (0..pages.len()).map(|k| if pages[k] != 0 { pages[k] } else { (r.destination as *const usize).add(k).read_unaligned() }).collect();
-            &late[..]
-        } else {
-            pages
-        };
-        if !crate::hle::kernelx::write_physical_pages(pages, r.destination_page_offset as usize, &payload[..n]) {
+        let snapshot = dest_pages.ok_or(E_ACCESS_VIOLATION)?;
+        let pages = destination_pages_at_turn(r, snapshot);
+        if !crate::hle::kernelx::write_physical_pages(&pages, r.destination_page_offset as usize, &payload[..n]) {
             return Err(E_ACCESS_VIOLATION);
         }
     } else if n > 0 {
@@ -2038,6 +2062,82 @@ mod tests {
         }
     }
 
+    /// A destination page array whose entry is still 0 when the request is submitted, filled a
+    /// moment later from the title's own thread: the request waits for the page instead of
+    /// failing (a retail title's streaming table).
+    #[test]
+    fn a_destination_page_filled_in_after_submit() {
+        use crate::hle::kernelx::{AllocateTitlePhysicalPages, FreeTitlePhysicalPages, MapTitlePhysicalPages, PHYS_PAGE_SIZE};
+        if crate::gpu::uma::get().is_none() {
+            return;
+        }
+        unsafe {
+            let mut count = 1usize;
+            let mut pages = [0usize; 1];
+            assert_eq!(AllocateTitlePhysicalPages(std::ptr::null_mut(), 0, &mut count, pages.as_mut_ptr()), 1);
+
+            let mut f = std::ptr::null_mut();
+            assert_eq!(DStorageGetFactory(&IID_FACTORY, &mut f), S_OK);
+            let vt = *(f as *const *const usize);
+            let create_queue: unsafe extern "system" fn(*mut c_void, *const u8, *const GUID, *mut *mut c_void) -> HRESULT = std::mem::transmute(*vt.add(3));
+            let create_status: unsafe extern "system" fn(*mut c_void, u32, *const u8, *const GUID, *mut *mut c_void) -> HRESULT = std::mem::transmute(*vt.add(5));
+            let mut desc = [0u8; 0x18];
+            desc[0..4].copy_from_slice(&1u32.to_le_bytes());
+            desc[8..10].copy_from_slice(&16u16.to_le_bytes());
+            desc[10] = 2;
+            let mut q = std::ptr::null_mut();
+            assert_eq!(create_queue(f, desc.as_ptr(), &IID_QUEUE, &mut q), S_OK);
+            let mut s = std::ptr::null_mut();
+            assert_eq!(create_status(f, 2, std::ptr::null(), &IID_STATUS_ARRAY, &mut s), S_OK);
+            let qv = *(q as *const *const usize);
+            let enqueue: unsafe extern "system" fn(*mut c_void, *const u8) = std::mem::transmute(*qv.add(3));
+            let status: unsafe extern "system" fn(*mut c_void, *mut c_void, u32) = std::mem::transmute(*qv.add(4));
+            let submit: unsafe extern "system" fn(*mut c_void) = std::mem::transmute(*qv.add(6));
+            let sv = *(s as *const *const usize);
+            let complete: unsafe extern "system" fn(*mut c_void, u32) -> bool = std::mem::transmute(*sv.add(3));
+            let hresult: unsafe extern "system" fn(*mut c_void, u32) -> HRESULT = std::mem::transmute(*sv.add(4));
+
+            // where the page can be read back: mapped into a reservation
+            let reserved = windows_sys::Win32::System::Memory::VirtualAlloc(
+                std::ptr::null(),
+                PHYS_PAGE_SIZE,
+                windows_sys::Win32::System::Memory::MEM_RESERVE,
+                windows_sys::Win32::System::Memory::PAGE_READWRITE,
+            );
+            assert!(!reserved.is_null());
+            assert_eq!(MapTitlePhysicalPages(reserved, 1, 0, 4, pages.as_mut_ptr()), reserved);
+
+            let data: Vec<u8> = (0..0x800u32).map(|i| (i * 29 + 11) as u8).collect();
+            let table = Box::new([0usize]);
+            let cell = table.as_ptr() as usize;
+            enqueue(q, request_ex(SOURCE_MEMORY_BIT | DEST_PHYS_PAGES_BIT, cell as u64, 0, data.len() as u32, data.as_ptr() as u64, 0, data.len() as u32, 0, 0).as_ptr());
+            status(q, s, 0);
+            submit(q);
+            // the title's own thread fills the entry a moment after Submit (its table was 0 here)
+            let page = pages[0];
+            let filler = std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+                unsafe { std::ptr::write_volatile(cell as *mut usize, page) };
+            });
+
+            let t = std::time::Instant::now();
+            while !complete(s, 0) && t.elapsed().as_secs() < 5 {
+                std::thread::yield_now();
+            }
+            filler.join().unwrap();
+            assert_eq!(hresult(s, 0), S_OK, "the request waits for the page instead of failing");
+            let got = std::slice::from_raw_parts(reserved as *const u8, data.len());
+            assert_eq!(got, &data[..], "the bytes land in the page filled in after Submit");
+
+            MapTitlePhysicalPages(reserved, 1, 0, 4, std::ptr::null_mut());
+            windows_sys::Win32::System::Memory::VirtualFree(reserved, 0, windows_sys::Win32::System::Memory::MEM_RELEASE);
+            assert_eq!(FreeTitlePhysicalPages(std::ptr::null_mut(), 1, pages.as_mut_ptr()), 1);
+            queue_close(q);
+            queue_release(q);
+            status_release(s);
+        }
+    }
+
     #[test]
     fn physical_page_destinations_and_sources() {
         use crate::hle::kernelx::{AllocateTitlePhysicalPages, FreeTitlePhysicalPages, MapTitlePhysicalPages, PHYS_PAGE_SIZE};
@@ -2306,10 +2406,11 @@ mod tests {
         assert_eq!((s["BC7"].requests, s["BC7"].with_zlib, s["BC7"].destination_bytes), (3, 1, 0x30000));
         assert_eq!((s["BC3"].requests, s["BC3"].with_zlib, s["BC3"].destination_bytes), (1, 0, 0x8000));
         assert_eq!(counts.summary(), "BC3 1 (32768 bytes), BC7 3 (196608 bytes)");
-        // every mode without a block rebuild; BC1 has one (in the tests, with their tables)
+        // every mode without a block rebuild; BC1 and BC5 have one (in the tests, with their
+        // tables)
         for m in 1..=15u64 {
             let r = Request::parse(&request(SOURCE_MEMORY_BIT | m << BCPACK_SHIFT, 0x1000, 64, 0x2000, 0, 20));
-            assert_eq!(r.check(true), if m == 1 { Ok(()) } else { Err(E_DECOMPRESSION) }, "mode {m}");
+            assert_eq!(r.check(true), if m == 1 || m == 5 { Ok(()) } else { Err(E_DECOMPRESSION) }, "mode {m}");
         }
     }
 
@@ -2386,6 +2487,25 @@ mod tests {
             let after = stats().bcpack_unpacked["BC1"].clone();
             assert!(after.requests >= before.requests + 3 && after.destination_bytes >= before.destination_bytes + 0x20000 + small_blocks.len() as u64);
             assert!(after.failed >= before.failed + 2);
+
+            // BC5 takes the same path: the fixture to the blocks the decoder builds from it
+            let bc5 = SOURCE_MEMORY_BIT | 5 << BCPACK_SHIFT;
+            let packed5 = fx::data("bc5-16-1.bin").unwrap();
+            let blocks5 = crate::hle::bcpack::decode(5, &packed5, 8 * 16).unwrap();
+            let before5 = stats().bcpack_unpacked.get("BC5").cloned().unwrap_or_default();
+            let mut dst5 = vec![0xCDu8; blocks5.len() + 32];
+            enqueue(q, request_ex(bc5, dst5.as_mut_ptr() as u64, 0, blocks5.len() as u32, packed5.as_ptr() as u64, 0, packed5.len() as u32, 0, 0).as_ptr());
+            status(q, s, 7);
+            submit(q);
+            while !complete(s, 7) && t.elapsed().as_secs() < 10 {
+                std::thread::yield_now();
+            }
+            assert_eq!(hresult(s, 7), S_OK, "BC5 request");
+            assert_eq!(&dst5[..blocks5.len()], &blocks5[..], "BC5: the destination has the blocks");
+            assert!(dst5[blocks5.len()..].iter().all(|&b| b == 0xCD), "BC5: nothing past the destination size");
+            let after5 = stats().bcpack_unpacked["BC5"].clone();
+            assert!(after5.requests > before5.requests && after5.destination_bytes >= before5.destination_bytes + blocks5.len() as u64);
+
             queue_close(q);
             queue_release(q);
             status_release(s);
