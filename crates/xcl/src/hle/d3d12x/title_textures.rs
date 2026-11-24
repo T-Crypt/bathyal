@@ -331,6 +331,31 @@ fn cached_watch_ranges(u: &crate::gpu::uma::Uma) -> Arc<Vec<(usize, usize)>> {
     let mut wanted: Vec<(usize, usize)> = TEXTURES.lock().unwrap().values().map(|e| (e.src & !0xFFF, (e.src + e.tex.size() as usize + 0xFFF) & !0xFFF)).collect();
     wanted.extend(super::sparse::mapped_ranges());
     let computed = Arc::new(watch_ranges(&regions, wanted));
+    if std::env::var_os("XCL_WATCH_TRACE").is_some() {
+        static N: AtomicU64 = AtomicU64::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed) + 1;
+        if n <= 8 || n.is_power_of_two() {
+            let tex = TEXTURES.lock().unwrap();
+            let tbytes: usize = tex.values().map(|e| e.tex.size() as usize).sum();
+            drop(tex);
+            let mapped = super::sparse::mapped_ranges();
+            let res = crate::hle::kernelx::graphics_reservations();
+            let mb = |v: usize| v >> 20;
+            crate::xlog_info!(
+                "watch trace #{n}: {} ranges {} MB watched | regions {} ({} MB), reservations {} ({} MB) | textures {} ({} MB wanted), mapped {} ({} MB)",
+                computed.len(),
+                mb(computed.iter().map(|r| r.1).sum()),
+                regions.len(),
+                mb(regions.iter().map(|r| r.1).sum()),
+                res.len(),
+                mb(res.iter().map(|r| r.1).sum()),
+                TEXTURES_LEN.load(Ordering::Relaxed),
+                mb(tbytes),
+                mapped.len(),
+                mb(mapped.iter().map(|r| r.1).sum()),
+            );
+        }
+    }
     *WATCH_CACHE.lock().unwrap() = Some((key, Arc::clone(&computed)));
     computed
 }
