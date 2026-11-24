@@ -528,7 +528,20 @@ pub fn init() -> Result<String, String> {
         // `XCL_DRED=1`: auto-breadcrumbs with context strings and page-fault data, logged on
         // a device removal by `log_device_removed`; no debug layer needed. Opt-in: with it
         // XDefiant stalled in its first seconds twice.
-        if std::env::var("XCL_DRED").is_ok_and(|v| v != "0" && !v.is_empty()) {
+        // `XCL_DRED=pf`: page-fault data only. Auto-breadcrumbs instrument every command
+        // list and make D3D12 take its device lock on more calls; with them a title stalls at
+        // startup, while a page fault on a device removal is still reported.
+        let dred = std::env::var("XCL_DRED").unwrap_or_default();
+        if dred == "pf" {
+            match crate::gpu::agility::configuration_interface::<ID3D12DeviceRemovedExtendedDataSettings>(&CLSID_D3D12DeviceRemovedExtendedData) {
+                Ok(d) => {
+                    d.SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_OFF);
+                    d.SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+                    crate::xlog_info!("D3D12: DRED on: page-fault data only");
+                }
+                Err(e) => crate::xlog_warn!("D3D12: DRED requested but unavailable: {e}"),
+            }
+        } else if dred != "0" && !dred.is_empty() {
             match crate::gpu::agility::configuration_interface::<ID3D12DeviceRemovedExtendedDataSettings1>(
                 &CLSID_D3D12DeviceRemovedExtendedData,
             ) {
