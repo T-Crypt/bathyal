@@ -1546,6 +1546,24 @@ pub(super) fn set_test_buffer_delta(res: usize, delta: Option<u64>) {
     }
 }
 
+/// The heap `res` lives in (None: none to ask – a reserved resource).
+unsafe fn heap_properties(res: *mut c_void) -> Option<D3D12_HEAP_PROPERTIES> {
+    let r = ID3D12Resource::from_raw_borrowed(&res)?;
+    let mut p = D3D12_HEAP_PROPERTIES::default();
+    r.GetHeapProperties(Some(&mut p), None).ok().map(|_| p)
+}
+
+/// Whether the PC can map a resource in a heap with `props`: not a reserved one (no heap), not
+/// one in a DEFAULT heap, not one in a custom heap without CPU pages.
+fn pc_mappable(props: Option<D3D12_HEAP_PROPERTIES>) -> bool {
+    match props {
+        None => false,
+        Some(p) if p.Type == D3D12_HEAP_TYPE_DEFAULT => false,
+        Some(p) if p.Type == D3D12_HEAP_TYPE_CUSTOM => p.CPUPageProperty != D3D12_CPU_PAGE_PROPERTY_NOT_AVAILABLE,
+        Some(_) => true,
+    }
+}
+
 /// resource Release (every caller): a console buffer's unified memory goes with it
 /// Map: on the console every resource is CPU-visible memory. One in unified memory that the
 /// PC cannot map (a texture XCL keeps in step with it) gives its unified-memory address – what
@@ -1574,8 +1592,14 @@ unsafe extern "system" fn res_map(this: *mut c_void, sub: u32, range: *const c_v
         UNMAPPABLE.lock().unwrap().get_or_insert_with(HashSet::new).insert(this as usize);
         return S_OK;
     }
-    let f: unsafe extern "system" fn(*mut c_void, u32, *const c_void, *mut *mut c_void) -> HRESULT = std::mem::transmute(orig_fn(this, slot_of(this, "Map")));
-    let hr = f(this, sub, range, data);
+    // the PC's Map only on a resource it can map: on a reserved one or one without CPU pages it is
+    // an invalid call (debug layer 824 / 822) that the runtime answers with E_INVALIDARG
+    let hr = if pc_mappable(heap_properties(this)) {
+        let f: unsafe extern "system" fn(*mut c_void, u32, *const c_void, *mut *mut c_void) -> HRESULT = std::mem::transmute(orig_fn(this, slot_of(this, "Map")));
+        f(this, sub, range, data)
+    } else {
+        E_INVALIDARG
+    };
     if hr >= 0 {
         return hr;
     }
@@ -7047,6 +7071,73 @@ mod refused_rt_gpu_tests {
                 }
             }
             rb.Unmap(0, None);
+        }
+    }
+}
+
+#[cfg(test)]
+mod map_tests {
+    use super::*;
+
+    /// A title's Map reaches the PC's only for a resource the PC can map: a buffer in an upload,
+    /// readback or CPU-visible custom heap. One in a DEFAULT heap, a custom heap without CPU pages
+    /// or a reserved one gets its title address instead (the PC's Map on it is an invalid call).
+    #[test]
+    fn only_resources_with_cpu_pages_go_to_the_pc_map() {
+        unsafe {
+            let mut dev: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                return; // no D3D12 adapter
+            }
+            let dev = dev.unwrap();
+            let buffer = |props: D3D12_HEAP_PROPERTIES, state: D3D12_RESOURCE_STATES| -> ID3D12Resource {
+                let desc = D3D12_RESOURCE_DESC {
+                    Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                    Width: 0x1_0000,
+                    Height: 1,
+                    DepthOrArraySize: 1,
+                    MipLevels: 1,
+                    SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                    Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                    ..Default::default()
+                };
+                let mut r: Option<ID3D12Resource> = None;
+                dev.CreateCommittedResource(&props, D3D12_HEAP_FLAG_NONE, &desc, state, None, &mut r).expect("buffer");
+                r.unwrap()
+            };
+            let heap = |t| D3D12_HEAP_PROPERTIES { Type: t, ..Default::default() };
+            let mappable = |r: &ID3D12Resource| pc_mappable(heap_properties(r.as_raw()));
+
+            assert!(mappable(&buffer(heap(D3D12_HEAP_TYPE_UPLOAD), D3D12_RESOURCE_STATE_GENERIC_READ)));
+            assert!(mappable(&buffer(heap(D3D12_HEAP_TYPE_READBACK), D3D12_RESOURCE_STATE_COPY_DEST)));
+            let default = buffer(heap(D3D12_HEAP_TYPE_DEFAULT), D3D12_RESOURCE_STATE_COMMON);
+            assert!(!mappable(&default));
+            // (what the PC answers there – the call this keeps from being made)
+            let mut p = std::ptr::null_mut();
+            assert!(default.Map(0, None, Some(&mut p)).is_err(), "a DEFAULT-heap buffer is not mappable on the PC");
+
+            let custom = |page| D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_CUSTOM, CPUPageProperty: page, MemoryPoolPreference: D3D12_MEMORY_POOL_L0, ..Default::default() };
+            assert!(mappable(&buffer(custom(D3D12_CPU_PAGE_PROPERTY_WRITE_BACK), D3D12_RESOURCE_STATE_COMMON)));
+            assert!(!mappable(&buffer(custom(D3D12_CPU_PAGE_PROPERTY_NOT_AVAILABLE), D3D12_RESOURCE_STATE_COMMON)));
+
+            // a reserved resource has no heap
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                Width: 256,
+                Height: 256,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM,
+                SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Layout: D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE,
+                ..Default::default()
+            };
+            let mut reserved: Option<ID3D12Resource> = None;
+            if dev.CreateReservedResource(&desc, D3D12_RESOURCE_STATE_COMMON, None, &mut reserved).is_ok() {
+                let r = reserved.unwrap();
+                assert!(heap_properties(r.as_raw()).is_none());
+                assert!(!mappable(&r));
+            }
         }
     }
 }
