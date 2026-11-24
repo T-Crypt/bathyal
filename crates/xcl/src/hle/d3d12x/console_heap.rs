@@ -473,7 +473,7 @@ pub fn retire_resource(res: usize) {
             }
             if s.shared_srv != 0 {
                 dev.CreateShaderResourceView(None::<&ID3D12Resource>, None::<*const D3D12_SHADER_RESOURCE_VIEW_DESC>, D3D12_CPU_DESCRIPTOR_HANDLE { ptr: s.shared_srv as usize });
-                dev.CreateUnorderedAccessView(None::<&ID3D12Resource>, None::<&ID3D12Resource>, None::<*const D3D12_UNORDERED_ACCESS_VIEW_DESC>, D3D12_CPU_DESCRIPTOR_HANDLE { ptr: s.shared_srv + inc as u64 });
+                dev.CreateUnorderedAccessView(None::<&ID3D12Resource>, None::<&ID3D12Resource>, None::<*const D3D12_UNORDERED_ACCESS_VIEW_DESC>, D3D12_CPU_DESCRIPTOR_HANDLE { ptr: (s.shared_srv + inc as u64) as usize });
             }
         }
     }
