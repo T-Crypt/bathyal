@@ -309,10 +309,8 @@ fn resolve_within(pso: usize, limit: Option<Duration>, epoch: u64, budget: &Mute
         limit.saturating_sub(b.spent)
     };
     // to the workers (a lazy one has not gone yet)
-    if !p.sent.swap(true, Ordering::AcqRel) {
-        note_building(&p);
-        let _ = enqueue(&p);
-    }
+    note_building(&p);
+    let _ = enqueue(&p);
     let start = Instant::now();
     let deadline = start + left;
     let mut done = p.done.lock().unwrap();
