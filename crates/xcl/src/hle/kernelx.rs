@@ -289,7 +289,7 @@ unsafe fn coherent_graphics(size: usize, t: u32, p: u32) -> Option<*mut c_void> 
     // of their own)
     const KEEP: usize = 96 << 20;
     let fits = u.size().saturating_sub(u.used()) >= size + KEEP;
-    u.committed_window().filter(|_| fits).and_then(|k| u.alloc_in(k, size, align))
+    u.committed_window().filter(|_| fits).and_then(|k| u.alloc_in(k, size, align)).map(|q| q as *mut c_void)
 }
 
 pub unsafe extern "system" fn VirtualAlloc(addr: *const c_void, size: usize, t: u32, p: u32) -> *mut c_void {
