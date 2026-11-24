@@ -1565,19 +1565,19 @@ pub(super) fn note_title_address(res: usize, va: usize) {
     TITLE_ADDRESS.lock().unwrap().get_or_insert_with(HashMap::new).insert(res, va);
 }
 
-/// RTV and DSV descriptor slots whose texture has no render-target (or depth) use: its
-/// `CreateRenderTargetView` made no PC view, so the slot keeps its position with a null view
-/// (`null_view`). Keyed by the CPU descriptor handle, which a new view at it replaces.
+/// RTV and DSV descriptor slots whose texture has no render-target (or depth) use: the slot
+/// keeps its position with a stand-in view (`standin_target`). Keyed by the CPU descriptor
+/// handle, which a new view at it replaces.
 static NULL_RTVS: Mutex<Option<HashSet<usize>>> = Mutex::new(None);
 static NULL_DSVS: Mutex<Option<HashSet<usize>>> = Mutex::new(None);
 
-/// The slot at `handle` binds a null view (`null_render_targets`; a clear of it is skipped).
+/// The slot at `handle` holds a stand-in view (`standin_target`): a clear of it is skipped.
 pub(super) fn null_view(handle: usize, dsv: bool) -> bool {
     let m = if dsv { &NULL_DSVS } else { &NULL_RTVS };
     m.lock().unwrap().as_ref().is_some_and(|s| s.contains(&handle))
 }
 
-/// The slot at `handle` binds a null view (`null_view`), or a view again.
+/// The slot at `handle` holds a stand-in view (`null_view`), or a view again.
 fn note_null_view(handle: usize, dsv: bool, null: bool) {
     let m = if dsv { &NULL_DSVS } else { &NULL_RTVS };
     let mut g = m.lock().unwrap();
@@ -1587,6 +1587,48 @@ fn note_null_view(handle: usize, dsv: bool, null: bool) {
     } else {
         s.remove(&handle);
     }
+}
+
+/// Stand-in targets for the render-target and depth slots of textures that have no such use on
+/// the PC, by (width, height, samples, array size, depth): the driver faults on a null descriptor
+/// beside a real one, so the slot holds a view of a target of the same shape. Its own texels go
+/// nowhere the title reads, and clears of the slot are skipped.
+static STANDINS: Mutex<Option<HashMap<(u64, u32, u32, u16, bool), Option<ID3D12Resource>>>> = Mutex::new(None);
+
+/// A stand-in render target (or depth buffer) of the shape of `res`: the same width, height,
+/// samples and array size, R8G8B8A8_UNORM (D32_FLOAT for depth). None: not a texture 2D, or the
+/// PC refused it.
+unsafe fn standin_target(res: *mut c_void, depth: bool) -> Option<ID3D12Resource> {
+    let d = ID3D12Resource::from_raw_borrowed(&res)?.GetDesc();
+    if d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D {
+        return None;
+    }
+    let key = (d.Width, d.Height, d.SampleDesc.Count, d.DepthOrArraySize.max(1), depth);
+    let mut g = STANDINS.lock().unwrap();
+    let m = g.get_or_insert_with(HashMap::new);
+    if let Some(e) = m.get(&key) {
+        return e.clone();
+    }
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
+    let (format, flags) = if depth { (40, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) } else { (28, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) };
+    let desc = D3D12_RESOURCE_DESC {
+        Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+        Width: key.0,
+        Height: key.1,
+        DepthOrArraySize: key.3,
+        MipLevels: 1,
+        Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(format),
+        SampleDesc: DXGI_SAMPLE_DESC { Count: key.2, Quality: 0 },
+        Flags: flags,
+        ..Default::default()
+    };
+    let made = ID3D12Device::from_raw_borrowed(&device_raw()).and_then(|dev| {
+        let mut r: Option<ID3D12Resource> = None;
+        let hr = dev.CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() }, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut r);
+        hr.ok().and(r)
+    });
+    m.insert(key, made.clone());
+    made
 }
 
 /// The format each texture was created with, in the title's own name: `device_x::pc_resource_desc`
@@ -1948,15 +1990,25 @@ unsafe extern "system" fn heap_release(this: *mut c_void) -> u32 {
 
 /// #21 CreateDepthStencilView: the console's view formats as the PC's (`pc_view_format`).
 unsafe extern "system" fn dev_create_dsv_x(this: *mut c_void, res: *mut c_void, desc: *const D3D12_DEPTH_STENCIL_VIEW_DESC, cpu: u64) {
-    // a depth buffer the PC made without depth use (`create_without_refused_uses`): a null view
-    // keeps the slot
+    let f: unsafe extern "system" fn(*mut c_void, *mut c_void, *const D3D12_DEPTH_STENCIL_VIEW_DESC, u64) = std::mem::transmute(orig_fn(this, 21));
+    // a depth buffer the PC made without depth use (`create_without_refused_uses`): a stand-in
+    // depth buffer keeps the slot
     if !res.is_null() && ID3D12Resource::from_raw_borrowed(&res).is_some_and(|r| r.GetDesc().Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL.0 == 0) {
         note_null_view(cpu as usize, true, true);
-        crate::xlog_warn!("D3D12.X: a depth view of a resource without depth use on the PC – a null view");
+        static N: AtomicU64 = AtomicU64::new(0);
+        if N.fetch_add(1, Ordering::Relaxed) < 4 {
+            crate::xlog_warn!("D3D12.X: a depth view of a resource without depth use on the PC – a stand-in depth buffer keeps the slot");
+        }
+        if let Some(t) = standin_target(res, true) {
+            let mut copy = desc.as_ref().copied();
+            if let Some(c) = copy.as_mut() {
+                c.Format = windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(40);
+            }
+            f(this, t.as_raw(), copy.as_ref().map_or(desc, |c| c as *const _), cpu);
+        }
         return;
     }
     note_null_view(cpu as usize, true, false);
-    let f: unsafe extern "system" fn(*mut c_void, *mut c_void, *const D3D12_DEPTH_STENCIL_VIEW_DESC, u64) = std::mem::transmute(orig_fn(this, 21));
     let mut copy = desc.as_ref().copied();
     if let Some(c) = copy.as_mut() {
         c.Format = windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(super::device_x::pc_target_format(c.Format.0 as u32) as i32);
@@ -5049,16 +5101,26 @@ fn default_rtv(d: &D3D12_RESOURCE_DESC) -> Option<D3D12_RENDER_TARGET_VIEW_DESC>
 }
 
 unsafe extern "system" fn dev_create_rtv(this: *mut c_void, res: *mut c_void, desc: *const c_void, handle: usize) {
-    // a texture the PC made without render-target use (`create_without_refused_uses`): a null
-    // view at its slot, so every later slot keeps its index
+    type F = unsafe extern "system" fn(*mut c_void, *mut c_void, *const c_void, usize);
+    let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "CreateRenderTargetView")));
+    // a texture the PC made without render-target use (`create_without_refused_uses`): the slot
+    // holds a stand-in view, so it keeps its position and every later slot its index
     if !res.is_null() && ID3D12Resource::from_raw_borrowed(&res).is_some_and(|r| r.GetDesc().Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET.0 == 0) {
         note_null_view(handle, false, true);
-        crate::xlog_warn!("D3D12.X: a render-target view of a resource without render-target use on the PC – a null view");
+        static N: AtomicU64 = AtomicU64::new(0);
+        if N.fetch_add(1, Ordering::Relaxed) < 4 {
+            crate::xlog_warn!("D3D12.X: a render-target view of a resource without render-target use on the PC – a stand-in target keeps the slot");
+        }
+        if let Some(t) = standin_target(res, false) {
+            let mut copy = (!desc.is_null()).then(|| (desc as *const D3D12_RENDER_TARGET_VIEW_DESC).read_unaligned());
+            if let Some(c) = copy.as_mut() {
+                c.Format = windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(28);
+            }
+            f(this, t.as_raw(), copy.as_ref().map_or(desc, |c| c as *const _ as *const c_void), handle);
+        }
         return;
     }
     note_null_view(handle, false, false);
-    type F = unsafe extern "system" fn(*mut c_void, *mut c_void, *const c_void, usize);
-    let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "CreateRenderTargetView")));
     // a view in a console-only format, or of a target made R8G8B8A8 (`device_x::pc_resource_desc`)
     let mut copy = (!desc.is_null()).then(|| (desc as *const D3D12_RENDER_TARGET_VIEW_DESC).read_unaligned());
     if let Some(c) = copy.as_mut() {
@@ -5102,51 +5164,9 @@ unsafe extern "system" fn cl_clear_rtv(this: *mut c_void, rtv: usize, color: *co
     f(this, rtv, color, n, rects)
 }
 
-/// The PC's RTV descriptor size (0: unknown), for an `RTsSingleHandleToDescriptorRange` array.
-fn rtv_increment() -> usize {
-    static INC: AtomicUsize = AtomicUsize::new(0);
-    let n = INC.load(Ordering::Relaxed);
-    if n != 0 {
-        return n;
-    }
-    let dev = device_raw();
-    let Some(d) = (unsafe { ID3D12Device::from_raw_borrowed(&dev) }) else { return 0 };
-    let n = unsafe { d.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV) } as usize;
-    INC.store(n, Ordering::Relaxed);
-    n
-}
-
-/// The handles of `n` render targets with a null (0) where `null` says the slot holds a null view:
-/// every other slot keeps its index. None: no slot is null (the title's own arguments stand).
-fn null_render_targets(n: u32, rtvs: *const usize, single: i32, inc: usize, null: impl Fn(usize) -> bool) -> Option<Vec<usize>> {
-    if n == 0 || rtvs.is_null() {
-        return None;
-    }
-    let at = |k: usize| unsafe {
-        if single != 0 {
-            *rtvs + k * inc
-        } else {
-            *rtvs.add(k)
-        }
-    };
-    let n = n as usize;
-    if !(0..n).any(|k| null(at(k))) {
-        return None;
-    }
-    Some((0..n).map(|k| if null(at(k)) { 0 } else { at(k) }).collect())
-}
-
 unsafe extern "system" fn cl_om_set_render_targets(this: *mut c_void, n: u32, rtvs: *const usize, single: i32, dsv: *const usize) {
     type F = unsafe extern "system" fn(*mut c_void, u32, *const usize, i32, *const usize);
     let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "OMSetRenderTargets")));
-    let substituted = null_render_targets(n, rtvs, single, rtv_increment(), |h| null_view(h, false));
-    let no_dsv = !dsv.is_null() && null_view(*dsv, true);
-    // (the Vec stays alive to the end of the call: the PC list reads its handles there)
-    let (rtvs, single, dsv) = match &substituted {
-        Some(v) => (v.as_ptr(), 0, if no_dsv { std::ptr::null() } else { dsv }),
-        None if no_dsv => (rtvs, single, std::ptr::null()),
-        None => (rtvs, single, dsv),
-    };
     f(this, n, rtvs, single, dsv);
     super::list_x::note_render_targets(this, n, rtvs, single, dsv);
     if super::present::trace_frame() {
@@ -6155,22 +6175,15 @@ mod typeless_uav_view_tests {
 mod refused_use_tests {
     use super::*;
 
-    /// A render-target slot whose texture lost render-target use binds a null view at its own
-    /// index: the slots after it keep theirs. A title's single-handle array expands the same way.
+    /// A render-target slot whose texture lost render-target use keeps its own index with a
+    /// stand-in view: the slots after it are the title's own, untouched.
     #[test]
-    fn a_null_slot_keeps_its_index() {
+    fn a_stand_in_slot_keeps_its_index() {
         let h = [0x1000usize, 0x1020, 0x1040];
-        let none = |_: usize| false;
-        assert!(null_render_targets(3, h.as_ptr(), 0, 32, none).is_none(), "no null slot: the title's own array");
-        let first = |x: usize| x == 0x1000;
-        assert_eq!(null_render_targets(3, h.as_ptr(), 0, 32, first), Some(vec![0, 0x1020, 0x1040]));
-        let middle = |x: usize| x == 0x1020;
-        assert_eq!(null_render_targets(3, h.as_ptr(), 0, 32, middle), Some(vec![0x1000, 0, 0x1040]), "a later target keeps its index");
-        // one handle for the whole range: slot k is at base + k * the increment, passed as an array
-        let base = [0x2000usize];
-        let second = |x: usize| x == 0x2020;
-        assert_eq!(null_render_targets(3, base.as_ptr(), 1, 32, second), Some(vec![0x2000, 0, 0x2040]));
-        assert!(null_render_targets(0, h.as_ptr(), 0, 32, first).is_none());
+        note_null_view(h[0], false, true);
+        assert!(null_view(h[0], false), "the slot holds a stand-in view");
+        assert!(!null_view(h[1], false) && !null_view(h[2], false), "a later target keeps its index and its own view");
+        note_null_view(h[0], false, false);
     }
 
     /// A clear of a null view is skipped: the slot stays registered as null until a view is made
@@ -6470,10 +6483,10 @@ mod refused_rt_gpu_tests {
     }
 
     /// A texture the PC made without render-target use (as `create_without_refused_uses` makes
-    /// it) binds a null view at its own render-target slot; the target after it keeps its index,
-    /// renders and reads back, and the device is not removed.
+    /// it) gets a stand-in view at its own render-target slot; the target after it keeps its
+    /// index, renders and reads back, and the device is not removed.
     #[test]
-    fn a_null_render_target_keeps_its_index_and_the_next_slot_renders() {
+    fn a_stand_in_render_target_keeps_its_index_and_the_next_slot_renders() {
         let Some(dev) = device() else { return };
         unsafe {
             let nulled = texture(&dev, D3D12_RESOURCE_FLAG_NONE);
@@ -6483,47 +6496,32 @@ mod refused_rt_gpu_tests {
             let inc = dev.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
             let h0 = base;
             let h1 = D3D12_CPU_DESCRIPTOR_HANDLE { ptr: base.ptr + inc as usize };
-            // the slot of the texture without render-target use stays a null view
-            note_null_view(h0.ptr, false, true);
+            // the slot of the texture without render-target use: a stand-in target at its index
+            dev.CreateRenderTargetView(&nulled, None, h0);
             dev.CreateRenderTargetView(&target, None, h1);
-            assert!(null_view(h0.ptr, false));
+            assert!(null_view(h0.ptr, false), "the slot holds a stand-in view");
+            assert!(!null_view(h1.ptr, false), "the real target keeps its own view and index");
 
-            let handles = [h0.ptr, h1.ptr];
-            let bound = null_render_targets(2, handles.as_ptr(), 0, inc as usize, |h| null_view(h, false)).expect("a null slot");
-            assert_eq!(bound, vec![0, h1.ptr], "slot 0 is null, slot 1 keeps its handle and index");
-
+            let bound = [h0, h1];
             let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
             let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).unwrap();
-            let to_rt = D3D12_RESOURCE_BARRIER {
+            let barrier = |before, after| D3D12_RESOURCE_BARRIER {
                 Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
                 Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
                 Anonymous: D3D12_RESOURCE_BARRIER_0 {
                     Transition: std::mem::ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER {
                         pResource: std::mem::transmute_copy(&target),
                         Subresource: 0,
-                        StateBefore: D3D12_RESOURCE_STATE_COMMON,
-                        StateAfter: D3D12_RESOURCE_STATE_RENDER_TARGET,
+                        StateBefore: before,
+                        StateAfter: after,
                     }),
                 },
             };
-            list.ResourceBarrier(&[to_rt]);
-            let bound: Vec<D3D12_CPU_DESCRIPTOR_HANDLE> = bound.iter().map(|&ptr| D3D12_CPU_DESCRIPTOR_HANDLE { ptr }).collect();
+            list.ResourceBarrier(&[barrier(D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_RENDER_TARGET)]);
             list.OMSetRenderTargets(2, Some(bound.as_ptr()), false, None);
-            // a clear of the null slot would be skipped by `cl_clear_rtv`; the target's own clear
-            // still runs at its index
+            // the stand-in's clear is skipped by `cl_clear_rtv`; the target's own clear runs
             list.ClearRenderTargetView(h1, &CLEAR, None);
-            list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
-                Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
-                Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
-                Anonymous: D3D12_RESOURCE_BARRIER_0 {
-                    Transition: std::mem::ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER {
-                        pResource: std::mem::transmute_copy(&target),
-                        Subresource: 0,
-                        StateBefore: D3D12_RESOURCE_STATE_RENDER_TARGET,
-                        StateAfter: D3D12_RESOURCE_STATE_COPY_SOURCE,
-                    }),
-                },
-            }]);
+            list.ResourceBarrier(&[barrier(D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
             let desc = target.GetDesc();
             let mut fp = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
             let mut total = 0u64;
@@ -6565,8 +6563,6 @@ mod refused_rt_gpu_tests {
                 }
             }
             rb.Unmap(0, None);
-            note_null_view(h0.ptr, false, false);
-            let _ = nulled;
         }
     }
 }
