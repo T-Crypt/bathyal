@@ -231,7 +231,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
         // doesn't match the currently set Pipeline State Object"; a retail title's world then
         // hung the GPU, 0x887a0006). Skipped, like a draw or dispatch of such a pipeline.
         if super::pso_async::is_pending(with(this, |s| s.pso)) {
-            count(DRAWS_SKIPPED);
+            count(if gfx { DRAWS_SKIPPED } else { DISPATCHES_SKIPPED });
             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             if N.fetch_add(1, Ordering::Relaxed) < 4 {
                 crate::xlog_warn!("D3D12.X: ExecuteIndirect with a pipeline that is still being built skipped");

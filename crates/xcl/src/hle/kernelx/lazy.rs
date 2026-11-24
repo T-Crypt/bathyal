@@ -81,7 +81,7 @@ unsafe fn commit_with(page: usize, alloc: impl FnOnce(usize) -> bool) -> bool {
     if !g.contains(&page) {
         return false;
     }
-    let ok = !VirtualAlloc(page as *const c_void, PAGE, MEM_COMMIT, PAGE_READWRITE).is_null();
+    let ok = alloc(page);
     if ok {
         g.remove(&page);
     } else {
