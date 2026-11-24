@@ -274,6 +274,24 @@ unsafe fn commit_sparse(a: usize, n: usize, p: u32) -> *mut c_void {
     q
 }
 
+/// `size` bytes of the title's GPU memory in the coherent window, when it has room for them and
+/// for what XCL keeps there (`XCL_COHERENT_HEAPS=0` turns the window off).
+unsafe fn coherent_graphics(size: usize, t: u32, p: u32) -> Option<*mut c_void> {
+    if size > crate::gpu::uma::MAX_SIZE || std::env::var("XCL_COHERENT_HEAPS").is_ok_and(|v| v == "0") {
+        return None;
+    }
+    static ASKED: AtomicUsize = AtomicUsize::new(0);
+    let asked = ASKED.fetch_add(size, Ordering::Relaxed) + size;
+    crate::gpu::uma::note_coherent_need(asked);
+    let u = crate::gpu::uma::get()?;
+    let align = if t & 0x2000_0000 != 0 && t & 0x0040_0000 == 0 { 2 << 20 } else { crate::gpu::uma::GRAIN };
+    // what XCL keeps of the window for itself (readback heaps; its per-draw arguments have a pool
+    // of their own)
+    const KEEP: usize = 96 << 20;
+    let fits = u.size().saturating_sub(u.used()) >= size + KEEP;
+    u.committed_window().filter(|_| fits).and_then(|k| u.alloc_in(k, size, align))
+}
+
 pub unsafe extern "system" fn VirtualAlloc(addr: *const c_void, size: usize, t: u32, p: u32) -> *mut c_void {
     if let Some(q) = placeholders::alloc(addr, size, t, sanitize_protect(p)) {
         trace_mem("VirtualAlloc (placeholder)", addr as usize, size, t as u64, p, q as usize);
@@ -290,6 +308,16 @@ pub unsafe extern "system" fn VirtualAlloc(addr: *const c_void, size: usize, t: 
     // them (a newer retail title keeps index and vertex data in a 1.2 GB VirtualAlloc of large pages; outside
     // the windows the GPU faulted on it – a driver timeout)
     let large = t & MEM_64K_PAGES != MEM_64K_PAGES && t & MEM_LARGE_PAGES_X != 0 && p & PAGE_GPU_X != 0;
+    // Large-page data is CPU-written and GPU-read every frame: the coherent window holds one copy
+    // the GPU reads where it is, while sparse video memory needs each CPU write uploaded again and
+    // its gigabytes of pages walked by the write-watch at every submit (measured: a fraction of
+    // the frame rate). Sparse video memory stays the fallback when the window has no room.
+    if addr.is_null() && t & 0x1000 != 0 && large {
+        if let Some(q) = coherent_graphics(size, t, p) {
+            trace_mem("VirtualAlloc (large pages, coherent window)", 0, size, t as u64, p, q as usize);
+            return q;
+        }
+    }
     if addr.is_null() && t & 0x2000 != 0 && (t & MEM_64K_PAGES == MEM_64K_PAGES || large) {
         // (large pages: from the highest window down – the title's physical pages, gigabytes
         // in one piece, keep the lower ones)
@@ -353,20 +381,10 @@ pub unsafe extern "system" fn VirtualAlloc(addr: *const c_void, size: usize, t: 
     // the GPU reads where it is – one copy (a retail game's 4.4 GB; as plain memory its shaders
     // read zeros, in the sparse windows video memory would have doubled them). The window is as
     // large as what the title asked for last time (`uma::coherent_hint`).
-    if addr.is_null() && t & 0x1000 != 0 && p & PAGE_GRAPHICS_ANY != 0 && size <= crate::gpu::uma::MAX_SIZE && std::env::var("XCL_COHERENT_HEAPS").map_or(true, |v| v != "0") {
-        static ASKED: AtomicUsize = AtomicUsize::new(0);
-        let asked = ASKED.fetch_add(size, Ordering::Relaxed) + size;
-        crate::gpu::uma::note_coherent_need(asked);
-        if let Some(u) = uma {
-            let align = if t & 0x2000_0000 != 0 && t & 0x0040_0000 == 0 { 2 << 20 } else { crate::gpu::uma::GRAIN };
-            // what XCL keeps of the window for itself (readback heaps; its per-draw arguments have
-            // a pool of their own)
-            const KEEP: usize = 96 << 20;
-            let fits = u.size().saturating_sub(u.used()) >= size + KEEP;
-            if let Some(q) = u.committed_window().filter(|_| fits).and_then(|k| u.alloc_in(k, size, align)) {
-                trace_mem("VirtualAlloc (graphics, coherent window)", 0, size, t as u64, p, q as usize);
-                return q as *mut c_void;
-            }
+    if addr.is_null() && t & 0x1000 != 0 && p & PAGE_GRAPHICS_ANY != 0 {
+        if let Some(q) = coherent_graphics(size, t, p) {
+            trace_mem("VirtualAlloc (graphics, coherent window)", 0, size, t as u64, p, q as usize);
+            return q as *mut c_void;
         }
     }
     // GPU-visible title memory the windows above had no room for (a retail game: a 24 GB
