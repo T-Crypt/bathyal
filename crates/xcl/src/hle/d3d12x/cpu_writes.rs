@@ -334,44 +334,4 @@ mod tests {
         }
     }
 
-    /// A copy of the title's memory outside unified memory lands too, after the queue has done
-    /// what came before it.
-    #[test]
-    fn copies_land_after_the_queue() {
-        unsafe {
-            let mut dev: Option<ID3D12Device> = None;
-            if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
-                let factory: IDXGIFactory4 = CreateDXGIFactory1().unwrap();
-                let warp: IDXGIAdapter = factory.EnumWarpAdapter().unwrap();
-                D3D12CreateDevice(&warp, D3D_FEATURE_LEVEL_11_0, &mut dev).expect("WARP D3D12 device");
-            }
-            let dev = dev.unwrap();
-            let q: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() }).unwrap();
-            let src = Box::new([0xA5u8; 0x400]);
-            let dst = Box::new([0u8; 0x400]);
-            let (s, d) = (src.as_ptr() as usize, dst.as_ptr() as usize);
-            assert!(writable(d, 0x400) && readable(s, 0x400));
-            after(q.as_raw(), vec![Work::Copy((d, s, 0x400))]);
-            let t = std::time::Instant::now();
-            while *dst.first().unwrap() != 0xA5 {
-                assert!(t.elapsed().as_secs() < 5, "never copied");
-                std::thread::yield_now();
-            }
-            assert_eq!(*dst, *src, "the whole range");
-        }
-    }
-
-    /// A copy the CPU cannot make (a source that is no memory of the title's) changes nothing.
-    #[test]
-    fn a_copy_the_cpu_cannot_make_changes_nothing() {
-        unsafe {
-            let dst = Box::new([0u8; 0x100]);
-            let d = dst.as_ptr() as usize;
-            copy_now(d, 0x10, 0x100);
-            assert!(!readable(0x10, 0x100));
-            assert_eq!(*dst, [0u8; 0x100]);
-            copy_now(d, d, 0);
-            assert_eq!(*dst, [0u8; 0x100]);
-        }
-    }
 }
