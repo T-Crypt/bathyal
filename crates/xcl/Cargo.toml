@@ -10,7 +10,7 @@ name = "xcl"
 path = "src/lib.rs"
 
 [[bin]]
-name = "bathyal"
+name = "xcl"
 path = "src/main.rs"
 
 [dependencies]
