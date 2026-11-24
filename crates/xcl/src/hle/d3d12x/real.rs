@@ -3625,6 +3625,123 @@ fn wait_for_commit() {
     }
 }
 
+/// The driver's compiled compute pipelines, kept on disk between runs.
+///
+/// XCL keeps its DXIL (`dxc::cache_dir`), but the driver's own compile of that DXIL is the slow
+/// part on some GPUs: a retail title's compute programs took an NVIDIA driver 5 – 27 s each when
+/// its world loaded, in every run, and the title dispatched without them meanwhile. A pipeline's
+/// `GetCachedBlob` is saved under the hash of its DXIL when its build took `KEEP` or longer and
+/// given back as `CachedPSO` the next time; the driver refuses the blob of another driver or
+/// adapter (the file is dropped and the pipeline built as before). `XCL_PSO_DISK_CACHE=0`: off.
+mod driver_cache {
+    use std::ffi::c_void;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use windows::core::Interface;
+    use windows::Win32::Graphics::Direct3D12::ID3D12PipelineState;
+
+    /// builds shorter than this are not worth a file
+    const KEEP: std::time::Duration = std::time::Duration::from_millis(250);
+    static HITS: AtomicU64 = AtomicU64::new(0);
+    static STALE: AtomicU64 = AtomicU64::new(0);
+    static STORED: AtomicU64 = AtomicU64::new(0);
+
+    /// The file of the pipeline made from `dxil`: its hash, with its length.
+    pub fn name(dxil: &[u8]) -> String {
+        format!("{:016x}-{:x}.pso", crate::gpu::shader::fnv64(dxil), dxil.len())
+    }
+
+    pub fn path(dxil: &[u8]) -> Option<PathBuf> {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        ON.get_or_init(|| std::env::var("XCL_PSO_DISK_CACHE").map_or(true, |v| v.trim() != "0")).then(|| crate::gpu::recomp::dxc::cache_dir().join("driver").join(name(dxil)))
+    }
+
+    pub fn load(p: &Path) -> Option<Vec<u8>> {
+        std::fs::read(p).ok().filter(|b| !b.is_empty())
+    }
+
+    /// A pipeline was made from a kept blob (`ok`), or the driver refused the blob: dropped.
+    pub fn note(ok: bool, p: Option<&Path>) {
+        if ok {
+            let n = HITS.fetch_add(1, Ordering::Relaxed) + 1;
+            if n.is_power_of_two() {
+                crate::xlog_info!("D3D12.X: {n} compute pipelines made from the driver's compile of an earlier run (kept on disk)");
+            }
+        } else {
+            if let Some(p) = p {
+                let _ = std::fs::remove_file(p);
+            }
+            if STALE.fetch_add(1, Ordering::Relaxed) == 0 {
+                crate::xlog_info!("D3D12.X: a kept driver compile was refused (another driver or adapter?) – such pipelines are built again");
+            }
+        }
+    }
+
+    /// `bytes` to `p`, under another name first: a run that is cut short leaves no half file.
+    pub fn write(p: &Path, bytes: &[u8]) -> bool {
+        if bytes.is_empty() {
+            return false;
+        }
+        if let Some(dir) = p.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let tmp = p.with_extension(format!("tmp{}", std::process::id()));
+        let ok = std::fs::write(&tmp, bytes).is_ok() && std::fs::rename(&tmp, p).is_ok();
+        if !ok {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        ok
+    }
+
+    /// Keep what the driver compiled for `pso`, whose build took `took`.
+    pub unsafe fn store(p: &Path, pso: *mut c_void, took: std::time::Duration) {
+        if took < KEEP {
+            return;
+        }
+        let Some(state) = ID3D12PipelineState::from_raw_borrowed(&pso) else { return };
+        let Ok(blob) = state.GetCachedBlob() else { return };
+        let bytes = std::slice::from_raw_parts(blob.GetBufferPointer() as *const u8, blob.GetBufferSize());
+        if write(p, bytes) {
+            let n = STORED.fetch_add(1, Ordering::Relaxed) + 1;
+            if n.is_power_of_two() {
+                crate::xlog_info!("D3D12.X: {n} driver compiles kept on disk for the next run (this one: {} ms, {} KB)", took.as_millis(), bytes.len() >> 10);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn a_file_is_named_after_its_dxil() {
+            assert_eq!(name(b"abc"), name(b"abc"));
+            assert_ne!(name(b"abc"), name(b"abd"));
+            // (the length is in the name: two programs of one hash and different lengths differ)
+            assert!(name(&[0u8; 0x1234]).ends_with("-1234.pso"));
+        }
+
+        #[test]
+        fn a_kept_blob_is_read_back_and_a_refused_one_is_dropped() {
+            let dir = std::env::temp_dir().join(format!("xcl-driver-cache-test-{}", std::process::id()));
+            let p = dir.join("driver").join(name(b"program"));
+            assert_eq!(load(&p), None, "nothing kept yet");
+            assert!(!write(&p, &[]), "an empty blob is not kept");
+            assert_eq!(load(&p), None);
+            assert!(write(&p, &[1, 2, 3]));
+            assert_eq!(load(&p).as_deref(), Some(&[1u8, 2, 3][..]));
+            // no half file under the temporary name
+            assert_eq!(std::fs::read_dir(p.parent().unwrap()).unwrap().count(), 1);
+            // the driver took the blob: it stays; it refused it: gone, the pipeline is built again
+            note(true, Some(&p));
+            assert!(p.exists());
+            note(false, Some(&p));
+            assert_eq!(load(&p), None);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+}
+
 unsafe fn translated_compute_pso(this: *mut c_void, f: PsoFn, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> Option<Result<HRESULT, ()>> {
     with_switch_fallback(|| translated_compute_pso_once(this, f, desc, riid, ppv))
 }
@@ -3668,26 +3785,49 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
     // made 14 big compute pipelines twice while loading, 13 - 30 s each the second time.
     let key = compute_blob_key(&dxil, rs as usize, copy.Flags.0);
     let cached = compute_blob(key);
+    let started = std::time::Instant::now();
+    // what the driver compiled for this program in an earlier run, if it is kept (`driver_cache`)
+    let cache = driver_cache::path(&dxil);
+    let mut hr: HRESULT = -1;
+    let mut reused = false;
     if let Some(b) = &cached {
         copy.CachedPSO = D3D12_CACHED_PIPELINE_STATE { pCachedBlob: b.as_ptr() as *const c_void, CachedBlobSizeInBytes: b.len() };
-    }
-    let started = std::time::Instant::now();
-    // in the background, one at a time and within the commit left (each ~1.5 GB in the driver)
-    let _slot = (big && cached.is_none() && std::thread::current().name().is_some_and(|n| n.starts_with("xcl-pso"))).then(|| {
-        let slot = BIG_COMPILES.acquire();
-        wait_for_commit();
-        slot
-    });
-    let mut hr = finish_pso(this, f, &copy as *const _ as *const c_void, riid, ppv);
-    if hr < 0 && cached.is_some() {
-        // a blob the driver does not take (another root signature at the same address…): compiled
-        forget_compute_blob(key);
-        copy.CachedPSO = D3D12_CACHED_PIPELINE_STATE::default();
         hr = finish_pso(this, f, &copy as *const _ as *const c_void, riid, ppv);
+        if hr < 0 {
+            // a blob the driver does not take (another root signature at the same address…): compiled
+            forget_compute_blob(key);
+            copy.CachedPSO = D3D12_CACHED_PIPELINE_STATE::default();
+        }
+        reused = hr >= 0;
     }
-    let reused = hr >= 0 && cached.is_some() && copy.CachedPSO.CachedBlobSizeInBytes != 0;
-    if hr >= 0 && !reused {
-        keep_compute_blob(key, *ppv, dxil.len());
+    if hr < 0 {
+        if let Some(blob) = cache.as_deref().and_then(driver_cache::load) {
+            copy.CachedPSO = D3D12_CACHED_PIPELINE_STATE { pCachedBlob: blob.as_ptr() as *const c_void, CachedBlobSizeInBytes: blob.len() };
+            hr = finish_pso(this, f, &copy as *const _ as *const c_void, riid, ppv);
+            copy.CachedPSO = D3D12_CACHED_PIPELINE_STATE::default();
+            driver_cache::note(hr >= 0, cache.as_deref());
+            if hr >= 0 {
+                keep_compute_blob(key, *ppv, dxil.len());
+                reused = true;
+            }
+        }
+    }
+    if hr < 0 {
+        // in the background, one at a time and within the commit left (each ~1.5 GB in the driver)
+        let _slot = (big && std::thread::current().name().is_some_and(|n| n.starts_with("xcl-pso"))).then(|| {
+            let slot = BIG_COMPILES.acquire();
+            wait_for_commit();
+            slot
+        });
+        let t0 = std::time::Instant::now();
+        hr = finish_pso(this, f, &copy as *const _ as *const c_void, riid, ppv);
+        if hr >= 0 {
+            if let Some(p) = cache.as_deref() {
+                driver_cache::store(p, *ppv, t0.elapsed());
+            }
+            keep_compute_blob(key, *ppv, dxil.len());
+        }
+    }
     }
     if hr < 0 {
         note_translation_error(format!("the driver rejected the compute PSO with the translated CS ({hr:#x})"));
