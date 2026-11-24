@@ -355,13 +355,13 @@ fn resolve_within(pso: usize, limit: Option<Duration>, epoch: u64, budget: &Mute
 }
 
 /// Maximum per-frame time title threads wait for uncached compute pipelines on first
-/// bind/dispatch (`XCL_COMPUTE_PSO_WAIT_MS`, default 4000 ms; `0` = unbounded). Huge compute
+/// bind/dispatch (`XCL_COMPUTE_PSO_WAIT_MS`, default 1500 ms; `0` = unbounded). Huge compute
 /// shaders can take 20+ s to compile in DXC / the driver, and a loading frame can bind many
 /// uncached compute pipelines in a row; sharing one budget per frame keeps the total bounded.
 fn compute_wait_timeout() -> Option<std::time::Duration> {
     static LIMIT: OnceLock<Option<std::time::Duration>> = OnceLock::new();
     *LIMIT.get_or_init(|| {
-        let ms = std::env::var("XCL_COMPUTE_PSO_WAIT_MS").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(4000);
+        let ms = std::env::var("XCL_COMPUTE_PSO_WAIT_MS").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(1500);
         if ms == 0 { None } else { Some(std::time::Duration::from_millis(ms)) }
     })
 }

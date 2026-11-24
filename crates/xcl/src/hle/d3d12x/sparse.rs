@@ -1317,6 +1317,18 @@ pub unsafe fn free(p: usize) -> bool {
     u.sparse_release(p).is_some()
 }
 
+/// Whether any sparse window exists at all (the cheap test before per-address ones).
+pub(super) fn has_windows() -> bool {
+    STATE.lock().unwrap().as_ref().is_some_and(|s| !s.windows.is_empty())
+}
+
+/// Whether `a` lies in a sparse window: only there does the GPU write into memory the CPU
+/// view does not hold, so only there is a tile readback due (a value a shader wrote has no
+/// recorded `Write32/64BitValue` to go by).
+pub(super) fn in_window(a: usize) -> bool {
+    STATE.lock().unwrap().as_ref().is_some_and(|s| s.window_index(a).is_some())
+}
+
 /// After `queue.ExecuteCommandLists`: copy GPU-written sparse ranges (e.g. `Write32/64`,
 /// `FillMemoryWith32BitValueX`, `CopyMemoryToMemoryX`) back to their CPU view so CPU reads
 /// and spin-waits see the GPU writes without clobbering `sent` hashes. The copy runs on `queue`
