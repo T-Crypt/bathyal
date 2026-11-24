@@ -171,6 +171,63 @@ pub(super) fn probe_dynamic_depth_bias(dev: &ID3D12Device) -> bool {
     supported
 }
 
+/// Cached result of `CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS6).VariableShadingRateTier`:
+/// -1 = not yet probed, 0 = no variable-rate shading, 1 = tier 1 or better.
+static VRS: AtomicI8 = AtomicI8::new(-1);
+
+/// Query `D3D12_FEATURE_D3D12_OPTIONS6` for `VariableShadingRateTier >= 1` and cache it.
+pub(super) fn probe_variable_shading_rate(dev: &ID3D12Device) -> bool {
+    let mut opts = D3D12_FEATURE_DATA_D3D12_OPTIONS6::default();
+    let tier = unsafe {
+        dev.CheckFeatureSupport(
+            D3D12_FEATURE_D3D12_OPTIONS6,
+            &mut opts as *mut _ as *mut c_void,
+            std::mem::size_of::<D3D12_FEATURE_DATA_D3D12_OPTIONS6>() as u32,
+        )
+        .ok()
+        .map(|_| opts.VariableShadingRateTier.0)
+    };
+    let supported = tier.is_some_and(|t| t >= 1);
+    VRS.store(if supported { 1 } else { 0 }, Ordering::Release);
+    crate::xlog_info!(
+        "D3D12.X: variable-rate shading (OPTIONS6): {} (tier {})",
+        if supported { "supported" } else { "unsupported – RSSetShadingRate calls dropped" },
+        tier.map_or("not reported".to_string(), |t| t.to_string())
+    );
+    supported
+}
+
+/// The cached answer to `variable_shading_rate_supported`, if it has been probed.
+pub(super) fn cached_variable_shading_rate() -> Option<bool> {
+    match VRS.load(Ordering::Acquire) {
+        1 => Some(true),
+        0 => Some(false),
+        _ => None,
+    }
+}
+
+/// Whether the device supports variable-rate shading (`RSSetShadingRate`). Lazily probes `dev`
+/// if not yet probed; a null device is treated as unsupported.
+pub(super) unsafe fn variable_shading_rate_supported(dev: *mut c_void) -> bool {
+    if let Some(v) = cached_variable_shading_rate() {
+        return v;
+    }
+    if dev.is_null() {
+        return false;
+    }
+    ID3D12Device::from_raw_borrowed(&dev).is_some_and(probe_variable_shading_rate)
+}
+
+/// The cached answer, set without a device (a unit test's list has none).
+#[cfg(test)]
+pub(super) fn set_variable_shading_rate_for_test(supported: Option<bool>) {
+    VRS.store(match supported {
+        Some(true) => 1,
+        Some(false) => 0,
+        None => -1,
+    }, Ordering::Release);
+}
+
 /// Whether the D3D12 device supports `D3D12_PIPELINE_STATE_FLAG_DYNAMIC_DEPTH_BIAS` /
 /// `ID3D12GraphicsCommandList9::RSSetDepthBias`. Lazily probes `dev` if not yet probed.
 pub(super) unsafe fn dynamic_depth_bias_supported(dev: *mut c_void) -> bool {
@@ -1100,6 +1157,10 @@ unsafe fn create_placed_resource_inner(this: *mut c_void, va: u64, desc: *const 
     }
     if hr >= 0 && !(*ppv).is_null() {
         real::note_title_address(*ppv as usize, va as usize);
+        if buffer {
+            let pc = std::ptr::read_unaligned(d.as_ptr() as *const D3D12_RESOURCE_DESC);
+            real::note_title_buffer_bytes(*ppv as usize, pc.Width as usize);
+        }
     }
     if hr < 0 || once(&N, 4) {
         let w = |o: usize| u32::from_le_bytes(x[o..o + 4].try_into().unwrap());

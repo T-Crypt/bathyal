@@ -284,6 +284,11 @@ fn is_writable(va: usize, bytes: usize) -> bool {
     if crate::hle::d3d12x::sparse::known_writable(va, bytes) {
         return true;
     }
+    // nor a few pages the working set holds as read-write: `VirtualQuery` would size the title's
+    // whole block of memory around them (see `resident_and_writable`)
+    if crate::gpu::shader::resident_and_writable(va, bytes) {
+        return true;
+    }
     // walk every VirtualQuery region covering `[va, end)` – a ClzeroLoop can span adjacent
     // committed runs, and a single query only sees the first. Reject PAGE_GUARD so a write
     // through the VEH does not trip the guard (same shape as `dstorage::writable`)

@@ -7,7 +7,8 @@ the `XCL_*` settings and the `%LOCALAPPDATA%\XCL` data folder keep XCL's names s
 cleanly and existing caches stay valid.
 
 This repository holds code only: no game files, shaders, assets, keys or logs from any game, and no
-decryption or DRM workarounds. Bring your own legally obtained, unpacked game files.
+decryption or DRM workarounds. Bring your own legally obtained, unpacked game files. See
+[`LEGAL.md`](LEGAL.md) for what the project accepts and how to report material that should not be here.
 
 
 Bathyal runs Xbox Series X|S (GDK) game files on a Windows PC **without CPU emulation**: the game's
@@ -30,17 +31,16 @@ next steps:
 | **Unicorn Overlord** | `SEGAofAmericaInc.Pa253b0c1Y` 1.0.0.6 | ✅ | fully playable | – |
 | **Fortnite** | `436609B6.FortniteClient` 2.0.1461.7919 | ✅ | works fully, as far as the game allows without its online services | the game itself is online-only (multiplayer servers) |
 | **XDefiant** | `Ubisoft.XDefiant-Game` 1.0.0.186 | ✅ | works fully, as far as the game allows without its servers | the game's own servers have been shut down |
-| **A newer retail game** | – | 🚧 | starts in ~4 s, runs at a steady 30 fps without a crash, shows its menus and goes on past the first one to its settings; fits a 32 GB machine (~15 GB committed in the menus) | gameplay not reached yet; its minimap mesh pipelines are refused |
 
 ## Highlights
 
-- **100 % of a retail game's shaders translate** – all 26 698 RDNA2 programs (26 503 records) of its shader pack
-  become HLSL; random samples compile to DXIL with 0 errors.
-- **The game's own console DLLs run on the PC** – its Bink 2 video codec decodes the game's
-  movies, its ray-tracing BVH builder builds acceleration structures on a PC GPU, the AMD FSR 4
-  console upscaler runs a whole frame on a PC GPU, the GDK HTTP library initialises.
-- **Console textures decode exactly** – the GFX10 tiling and mip layout reproduce 909 of 912
-  textures of the game's texture archive byte for byte, its volume textures included.
+- **RDNA2 shaders translate to HLSL** – every stage of the console pipeline (VS, PS, CS,
+  geometry and mesh) becomes HLSL; random samples compile to DXIL with 0 errors.
+- **Console middleware DLLs run on the PC** – a Bink 2 video codec decodes movies, a
+  ray-tracing BVH builder builds acceleration structures on a PC GPU, an AMD FSR 4 console
+  upscaler runs a whole frame on a PC GPU, and the GDK HTTP library initialises.
+- **Console textures decode exactly** – the GFX10 tiling and mip layout reproduce a game's
+  textures byte for byte, volume textures included.
 - **370+ automated tests**, including GPU tests that compare translated shaders against expected
   results instruction by instruction.
 
@@ -52,37 +52,38 @@ next steps:
 
 | Feature | State | What it does | Verified by |
 |---|---|---|---|
-| **PE loader** | ✅ | relocations, imports by name / ordinal / delay-load, TLS callbacks, exception tables, game DLLs, data-driven import routing (HLE / Windows / stub) | the game's 16 console DLLs load with 0 unresolved imports |
+| **PE loader** | ✅ | relocations, imports by name / ordinal / delay-load, TLS callbacks, exception tables, game DLLs, data-driven import routing (HLE / Windows / stub) | console DLLs load with 0 unresolved imports |
 | **kernelx** | ✅ | title memory (budget from MicrosoftGame.Config, physical pages), threads on the PC's processors, modules, OS / console info | unit + end-to-end tests |
 | **Memory** | ✅ | title graphics memory shared by CPU and GPU without copies, up to 16 GB (4 GiB windows) | GPU tests: loads, stores and atomics across windows |
+| **DirectStorage memory inputs** | ✅ | deferred zero-filled mappings are readable as memory sources and physical-page arrays; read preparation leaves other reservations and existing protections unchanged | CPU regressions for deferred sources, owned page snapshots and protected ranges |
 | **File system** | ✅ | console paths (`GAME:`, `G:`, `D:` …) → the game folder; writes go to an overlay, the game folder is never modified; the console's drives: `S:\` (persistent local storage) and `T:\` (temp) in the title's data folder; free disk space answered for console paths | end-to-end: the test title's folder stays byte-identical; PLS and free space through the real call path |
 
 ### System services
 
 | Feature | State | What it does | Verified by |
 |---|---|---|---|
-| **XGameRuntime** | ✅ | the GDK thunk protocol real titles use, laid out from a table of all 396 GDK runtime functions; offline XUser, XGameSave, persistent local storage, XPackage, XGame (title id), XSystem – the title sees an Xbox Series X / S; task queues, async, networking and dialogs through the PC's XGameRuntime | the game's libHttpClient initialises; users, saves and storage through the real call path; slot layout cross-checked against the game's own thunks |
-| **Input** | ✅ | GameInput: one gamepad – the PC's XInput controller or a PlayStation controller, and keyboard and mouse as a gamepad (see [Controls](#controls)) | unit tests; an Xbox controller in Minecraft; a DualShock 4 (USB) |
+| **XGameRuntime** | ✅ | the GDK thunk protocol real titles use, laid out from a table of all 396 GDK runtime functions; offline XUser, XGameSave, persistent local storage, XPackage, XGame (title id), XSystem – the title sees an Xbox Series X / S; task queues, async, networking and dialogs through the PC's XGameRuntime | libHttpClient initialises; users, saves and storage through the real call path; slot layout cross-checked against a title's own thunks |
+| **Input** | ✅ | GameInput: one gamepad – the PC's XInput controller, and keyboard and mouse as a gamepad (see [Controls](#controls)) | unit tests; an Xbox controller in Minecraft |
 | **Audio** | ✅ | XAudio2 → system XAudio2.9 (PCM / float voices; Opus 0x704F decoded via `MSOpusDecoder.dll`; XMA1 / XMA2 decoded in pure Rust) | unit + end-to-end tests |
 
 ### Graphics
 
 | Feature | State | What it does | Verified by |
 |---|---|---|---|
-| **Shader recompiler** | ✅ | RDNA2 → HLSL → DXIL: VS, PS, CS, mesh (NGG), GS; atomics, LDS, scratch, images, samplers incl. static ones, wave ops, ray-tracing instructions; structured control flow; parallel DXC, disk cache | 26 698 / 26 698 programs of the retail pack; 0 DXC errors on random samples; per-instruction GPU tests |
-| **Pipelines** | ✅ | PSOs from console shaders: VS+PS, CS, MS+PS, VS+GS+PS; root signature with the shaders' static samplers; non-blocking creation – a pipeline whose shaders are not compiled yet gets a stand-in at once and is built in the background | GPU tests drawing the game's own VS / PS pairs, also built in the background |
-| **D3D12.X compute** | ✅ | console device slots, console descriptor heaps (T# / V# / S#), buffers at their console addresses, compute command lists recorded in the console format and replayed (tables, barriers, clears, copies) | the game's BVH builder and FSR 4 record and run through Bathyal |
+| **Shader recompiler** | ✅ | RDNA2 → HLSL → DXIL: VS, PS, CS, mesh (NGG), GS; atomics, LDS, scratch, images, samplers incl. static ones, wave ops, ray-tracing instructions; structured control flow; parallel DXC, disk cache | all stages; 0 DXC errors on random samples; per-instruction GPU tests |
+| **Pipelines** | ✅ | PSOs from console shaders: VS+PS, CS, MS+PS, VS+GS+PS; root signature with the shaders' static samplers; non-blocking creation – a pipeline whose shaders are not compiled yet gets a stand-in at once and is built in the background | GPU tests drawing real VS / PS pairs, also built in the background |
+| **D3D12.X compute** | ✅ | console device slots, console descriptor heaps (T# / V# / S#), buffers at their console addresses, compute command lists recorded in the console format and replayed (tables, barriers, clears, copies) | a console BVH builder and FSR 4 record and run through Bathyal |
 | **D3D12.X graphics** | ✅ | device, resources and heaps (also placed in title memory), pipelines; the title's graphics command lists – draws, indirect draws, graphics root arguments, barriers, copies, clears – and command lists recorded by console code, replayed; `PresentX` and frame pacing into an Bathyal window | Minecraft Preview plays its worlds (millions of draws, none skipped); Fortnite and XDefiant draw their screens |
-| **Textures** | ✅ | GFX10 tiling (all 14 2D swizzle modes, the 6 3D thick modes, linear), mip chains with mip tail, arrays, cubes and 3D textures → PC textures | 909 / 912 retail textures exact (the 3 volume LUTs decode smooth); GPU upload bit exact |
-| **Ray tracing** | ✅ | BLAS / TLAS built on the GPU by the game's own XboxBvhBuilder; RDNA2 BVH node format; BVH intersection instructions emulated in shaders | GPU traversal = brute force reference; the game's builder output checked on the GPU |
-| **Upscaling** | ✅ | the game's AMD FSR 4 console DLL (`amd_fidelityfx_upscaler_xbox.dll`): context, the 29 pipelines in the console driver's own container (FSPX) translated, a frame's 20 passes recorded and run on the GPU | end-to-end with the real DLL: a 1280×720 → 1920×1080 frame on an RX 9070, the input's gradient in the output |
+| **Textures** | ✅ | GFX10 tiling (all 14 2D swizzle modes, the 6 3D thick modes, linear), mip chains with mip tail, arrays, cubes and 3D textures → PC textures | real console textures exact, volume textures included; GPU upload bit exact |
+| **Ray tracing** | ✅ | BLAS / TLAS built on the GPU by the console BVH builder (XboxBvhBuilder); RDNA2 BVH node format; BVH intersection instructions emulated in shaders | GPU traversal = brute force reference; the builder's output checked on the GPU |
+| **Upscaling** | ✅ | the console AMD FSR 4 upscaler DLL: context, the 29 pipelines in the console driver's own container (FSPX) translated, a frame's 20 passes recorded and run on the GPU | end-to-end with the real DLL: a 1280×720 → 1920×1080 frame on an RX 9070, the input's gradient in the output |
 
 ### Media and tools
 
 | Feature | State | What it does | Verified by |
 |---|---|---|---|
-| **Video** | ✅ | the game's Bink 2 console DLL decodes its movies (720p / 1080p) on the CPU; the game's own YUV → RGB display shaders (`PS_Bink…` in its pack) translate like any other. Bink's GPU-assisted mode needs no Bink-specific support: its compute shaders ship with the game and go through the recompiler too (no game seen using it yet) | a game movie decodes frame by frame, picture checked |
-| **Tools** | ✅ | `bathyal inspect`, `bathyal run`, `bathyal disasm` (RDNA2, console shader containers), `bathyal shaders` (pack statistics, recompile / compile runs), `bathyal rpf` | – |
+| **Video** | ✅ | the console Bink 2 DLL decodes movies (720p / 1080p) on the CPU; a game's own YUV → RGB display shaders translate like any other. Bink's GPU-assisted mode needs no Bink-specific support: its compute shaders go through the recompiler too (no game seen using it yet) | a game movie decodes frame by frame, picture checked |
+| **Tools** | ✅ | `bathyal inspect`, `bathyal run`, `bathyal disasm` (RDNA2, console shader containers), `bathyal shaders` (corpus statistics, recompile / compile runs) | – |
 
 ## Controls
 
@@ -90,13 +91,9 @@ A **gamepad is recommended**: console games are made for one, and their menus an
 
 - **Gamepad:** any controller Windows sees through XInput (Xbox controllers, wired or wireless) is the
   game's gamepad – buttons, sticks, triggers and rumble. It can be plugged in or out while the game runs.
-- **PlayStation controllers** (DualShock 4 wired or over Bluetooth, DualSense wired) are the gamepad
-  when no XInput controller is connected – buttons, sticks and triggers, no rumble or light bar.
-  `XCL_PLAYSTATION_PAD=0` turns this off.
 - **Keyboard and mouse** work too, as a gamepad: WASD the left stick, the mouse the right stick, mouse
   buttons the triggers, the wheel the bumpers, Enter / Space A, Escape / Backspace B, arrows the D-pad,
-  E / Q Y / X, Shift / Ctrl the stick clicks, Tab View, P Menu, Page Up / Page Down the right stick up / down
-  (to scroll a menu's long text). `keyboard_mouse` and `mouse_sensitivity` in
+  E / Q Y / X, Shift / Ctrl the stick clicks, Tab View, P Menu. `keyboard_mouse` and `mouse_sensitivity` in
   the game's `xcl.toml` turn it off or change the mouse speed. A gamepad and the keyboard / mouse can be
   used together.
 
@@ -121,8 +118,6 @@ next to `bathyal.exe`, directly next to `bathyal.exe`, in `%LOCALAPPDATA%\XCL\D3
 - **Network:** title network access is enabled by default. Use `XCL_NETWORK=0` when bringing up an
   unfamiliar title: XCL blocks its WinHTTP and Winsock traffic while keeping loopback available. This
   also prevents a title crash reporter from sending a process dump containing local paths and names.
-- **Linux:** cross-build for `x86_64-pc-windows-gnu` and run under Wine + vkd3d-proton: setup, scripts
-  and known state in [`docs/linux.md`](docs/linux.md).
 - **GPU:** developed on AMD RDNA4. The console's geometry and NGG programs run as a compute pass plus a
   mesh pass, so a GPU without mesh shaders draws none of them. On GPUs with 32-lane waves only
   (NVIDIA) console wave64 compute, geometry and mesh programs run as two 32-lane halves that exchange
@@ -136,21 +131,15 @@ cargo build --release --workspace          # target\release\bathyal.exe
 bathyal inspect D:\Game\game.exe               # the game's imports and what Bathyal has for them
 bathyal run D:\Game [-- game arguments]        # run
 bathyal disasm <shader.bin> [--hex]            # RDNA2 disassembler (console containers too)
-bathyal shaders D:\data\shaders.rpf --top 50   # pack statistics; --recomp / --compile N
-bathyal rpf D:\data\shaders.rpf --extract NAME --out folder
+bathyal shaders D:\data\shaders --top 50      # corpus statistics; --recomp / --compile N
 ```
 
-- **Without a command line** (bathyal.exe opened from Explorer) Bathyal shows a small menu: *Add a
-  game folder…* (pick the folder of the game's unpacked files), *Choose a game…* (pick its exe or
-  `MicrosoftGame.config`) or *Run again* (the last one). On an error the window stays open until Enter.
+- **Without a command line** (bathyal.exe opened from Explorer) Bathyal shows a small menu: *Choose a
+  game…* (pick its exe or `MicrosoftGame.config`) or *Run again* (the last one). On an error the
+  window stays open until Enter.
 - Bathyal works on **unpacked** game files you own; it contains nothing for decrypting or
   circumventing DRM.
 - **The game folder is never modified** – writes go to the overlay.
-- `XCL_OVERLAY=1` draws a small stats panel into the top-left corner of the shown frame: the
-  title's fps and frame time, draws and dispatches per second, the process's commit and the
-  adapter's video memory, refreshed once a second. It is copied into the frame on XCL's own
-  command list (no extra window), so it also appears in screenshots and recordings. 8-bit
-  back buffers only.
 - Every run writes `report.json` (called stubs, unknown D3D12.X slots and interfaces, XGameRuntime
   classes asked for, shader statistics, audio formats, crash).
   `d3d12.presents` counts presentations, not visible content. With `XCL_FRAME_DUMP=N` (`N > 1`),
@@ -168,22 +157,7 @@ bathyal rpf D:\data\shaders.rpf --extract NAME --out folder
 
 ```powershell
 .\scripts\test.ps1                         # cargo build --workspace + cargo test --workspace
-cargo bench -p xcl                          # synthetic performance benchmarks
-cargo bench -p xcl --bench core             # run one benchmark target
-.\scripts\flamegraph.ps1 -Bench gpu_cpu     # profile a benchmark target on Windows
 ```
-
-Benchmarks use generated inputs and public XCL APIs; they do not require game files or a title
-executable. Cargo stores Criterion measurements under `target/criterion`. Use `-- --save-baseline
-NAME` and `-- --baseline NAME` to compare a change with a saved local baseline.
-
-CPU flamegraphs use the external [`cargo-flamegraph`](https://github.com/flamegraph-rs/flamegraph)
-tool and the benchmark profile retains debug symbols for readable stacks. Install the tool with
-`cargo install flamegraph`, then run the wrapper above. A single Criterion case can be selected
-with `-Filter 'recompiler_translate/linear/256'`; `-Output path.svg` changes the default
-`target/flamegraphs/<bench>.svg`. The wrapper never installs software or requests elevation.
-Flamegraphs sample on-CPU work only: use PIX or WPA to investigate GPU execution, fence waits,
-lock contention, scheduling, and other off-CPU time.
 
 Unit tests, an end-to-end test with our own "console title" (`tests/testtitle`) and GPU tests
 (D3D12, SM 6.6; skipped without a GPU / DXC; `XCL_ADAPTER=1` or `XCL_ADAPTER=radeon` picks
@@ -191,9 +165,9 @@ another adapter than the first high-performance one, for titles too). A GPU test
 the adapter (no GPU / DXC / wave64 / mesh shaders) passes too, but prints `SKIPPED <test>: <reason>`, and
 `scripts/test.ps1` counts them at the end; `XCL_REQUIRE_GPU=wave64` (or `mesh`, or `wave64,mesh`) makes
 those skips fail. Tests on real game data are opt-in through
-environment variables pointing at your own files – `XCL_SAMPLE_RPF` (shader pack),
-`XCL_SAMPLE_DLLS` (the game's console DLLs), `XCL_SAMPLE_TTPF` (texture archive),
-`XCL_SAMPLE_BK2` (a movie), `XCL_SAMPLE_BVH4`, `XCL_SAMPLE_AWC` (a sound) – described in `HANDOFF.md`; without them those
+environment variables pointing at your own files – `XCL_SAMPLE_DLLS` (console DLLs),
+`XCL_SAMPLE_TTPF` (texture archive), `XCL_SAMPLE_BK2` (a movie), `XCL_SAMPLE_AWC` (a sound) –
+described in `HANDOFF.md`; without them those
 tests pass without running anything (`scripts/test.ps1` lists the ones not set). No game data is
 part of the repository.
 

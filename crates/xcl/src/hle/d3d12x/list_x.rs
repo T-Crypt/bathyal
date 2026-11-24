@@ -1374,6 +1374,55 @@ pub(super) unsafe extern "system" fn dispatch_x(this: *mut c_void, x: u32, y: u3
     super::bind::dispatch(this, x, y, z);
 }
 
+/// PC #77 RSSetShadingRate(rate, combiners*)
+const PC_RSSET_SHADING_RATE: usize = 77;
+/// PC #78 RSSetShadingRateImage(shading rate image)
+const PC_RSSET_SHADING_RATE_IMAGE: usize = 78;
+
+/// `RSSetShadingRate` on the PC list (the caller checks that the device has VRS).
+unsafe fn rsset_shading_rate_pc(list: *mut c_void, rate: u32, combiners: *const i32) {
+    pc::<unsafe extern "system" fn(*mut c_void, i32, *const i32)>(list, PC_RSSET_SHADING_RATE)(list, rate as i32, combiners);
+}
+
+/// `RSSetShadingRateImage` on the PC list.
+unsafe fn rsset_shading_rate_image_pc(list: *mut c_void, image: usize) {
+    pc::<unsafe extern "system" fn(*mut c_void, usize)>(list, PC_RSSET_SHADING_RATE_IMAGE)(list, image);
+}
+
+/// Whether the list's device has variable-rate shading; the device is asked once.
+unsafe fn shading_rate_supported(list: *mut c_void) -> bool {
+    if let Some(v) = device_x::cached_variable_shading_rate() {
+        return v;
+    }
+    let dev = device_of(list).map_or(std::ptr::null_mut(), |d| d.as_raw() as *mut c_void);
+    device_x::variable_shading_rate_supported(dev)
+}
+
+/// command list #124 (older layout) / #126 (newer layout) RSSetShadingRate(rate, combiners*):
+/// a device without variable-rate shading gets nothing.
+pub(super) unsafe extern "system" fn rsset_shading_rate_x(this: *mut c_void, rate: u32, combiners: *const i32) {
+    if !shading_rate_supported(this) {
+        static N: AtomicU64 = AtomicU64::new(0);
+        if once(&N, 4) {
+            crate::xlog_warn!("D3D12.X: RSSetShadingRate({rate}, …) dropped: the device has no variable-rate shading");
+        }
+        return;
+    }
+    rsset_shading_rate_pc(this, rate, combiners);
+}
+
+/// command list #125 (older layout) / #127 (newer layout) RSSetShadingRateImage(image).
+pub(super) unsafe extern "system" fn rsset_shading_rate_image_x(this: *mut c_void, image: usize) {
+    if !shading_rate_supported(this) {
+        static N: AtomicU64 = AtomicU64::new(0);
+        if once(&N, 4) {
+            crate::xlog_warn!("D3D12.X: RSSetShadingRateImage({image:#x}) dropped: the device has no variable-rate shading");
+        }
+        return;
+    }
+    rsset_shading_rate_image_pc(this, image);
+}
+
 /// command list #146 console compute/UAV barrier (used by `XboxBvhBuilder.dll` between BVH
 /// build passes): emits a global UAV barrier so UMA writes become visible to the next pass
 pub(super) unsafe extern "system" fn uav_barrier_x(this: *mut c_void, _n: u32, _barriers: *const c_void) {
@@ -1901,26 +1950,41 @@ static MIRRORS: Mutex<Vec<(u64, usize, usize)>> = Mutex::new(Vec::new());
 static MIRROR_BYTES: AtomicU64 = AtomicU64::new(0);
 
 /// Where `[va, va + bytes)` is in a mirror, if it is in one.
-fn mirrored(va: u64, bytes: usize) -> Option<usize> {
+pub(super) fn mirrored(va: u64, bytes: usize) -> Option<usize> {
     MIRRORS.lock().unwrap().iter().find(|&&(s, l, _)| va >= s && va + bytes as u64 <= s + l as u64).map(|&(s, _, m)| m + (va - s) as usize)
 }
 
 /// The mirror address of the title's buffer at `va`; its range's mirror is made (and filled
 /// once) the first time.
-unsafe fn mirror_of(va: u64, bytes: usize, what: &str) -> Option<usize> {
+pub(super) unsafe fn mirror_of(va: u64, bytes: usize, what: &str) -> Option<usize> {
     if let Some(p) = mirrored(va, bytes) {
+        let src = crate::hle::kernelx::mirrors::source(va as usize).unwrap_or(va as usize);
+        if crate::gpu::shader::readable(src, bytes) {
+            std::ptr::copy_nonoverlapping(src as *const u8, p as *mut u8, bytes);
+        }
         return Some(p);
     }
     let mut g = MIRRORS.lock().unwrap();
     // again under the lock: two lists binding one new range at once must share a mirror (a
     // second one would never be synced – every later lookup finds the first)
     if let Some(&(s, _, m)) = g.iter().find(|&&(s, l, _)| va >= s && va + bytes as u64 <= s + l as u64) {
-        return Some(m + (va - s) as usize);
+        let p = m + (va - s) as usize;
+        let src = crate::hle::kernelx::mirrors::source(va as usize).unwrap_or(va as usize);
+        if crate::gpu::shader::readable(src, bytes) {
+            std::ptr::copy_nonoverlapping(src as *const u8, p as *mut u8, bytes);
+        }
+        return Some(p);
     }
     let start = va & !0xffff;
     let len = ((va + bytes as u64 + 0xffff) & !0xffff) - start;
+    let src_start = crate::hle::kernelx::mirrors::source(start as usize).unwrap_or(start as usize);
     // only as much as is the title's readable memory (the view itself is)
-    let (start, len) = if crate::gpu::shader::readable(start as usize, len as usize) { (start, len as usize) } else { (va, bytes) };
+    let (start, len, src) = if crate::gpu::shader::readable(src_start, len as usize) {
+        (start, len as usize, src_start)
+    } else {
+        let src_va = crate::hle::kernelx::mirrors::source(va as usize).unwrap_or(va as usize);
+        (va, bytes, src_va)
+    };
     if MIRROR_BYTES.load(Ordering::Relaxed) + len as u64 > 2 << 30 {
         static FULL: AtomicBool = AtomicBool::new(false);
         if !FULL.swap(true, Ordering::Relaxed) {
@@ -1933,7 +1997,7 @@ unsafe fn mirror_of(va: u64, bytes: usize, what: &str) -> Option<usize> {
         Some((p, _)) => p,
         None => u.alloc(len, 0x1_0000)? as usize,
     };
-    std::ptr::copy_nonoverlapping(start as *const u8, p as *mut u8, len);
+    std::ptr::copy_nonoverlapping(src as *const u8, p as *mut u8, len);
     g.push((start, len, p));
     let total = MIRROR_BYTES.fetch_add(len as u64, Ordering::Relaxed) + len as u64;
     if g.len() <= 8 || g.len().is_power_of_two() {
@@ -1964,8 +2028,9 @@ pub(super) unsafe fn sync_title_buffers(list: *mut c_void, indexed: Option<(u32,
     let copy = |va: u64, mirror: usize, bytes: u32, from: u64, len: u64| {
         let from = from.min(bytes as u64);
         let len = len.min(bytes as u64 - from) as usize;
-        if len > 0 && crate::gpu::shader::readable(va as usize + from as usize, len) {
-            std::ptr::copy_nonoverlapping((va + from) as *const u8, (mirror + from as usize) as *mut u8, len);
+        let src = crate::hle::kernelx::mirrors::source((va + from) as usize).unwrap_or((va + from) as usize);
+        if len > 0 && crate::gpu::shader::readable(src, len) {
+            std::ptr::copy_nonoverlapping(src as *const u8, (mirror + from as usize) as *mut u8, len);
         }
     };
     // the vertices read: [lo, hi)

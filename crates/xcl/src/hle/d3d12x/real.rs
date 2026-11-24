@@ -886,6 +886,16 @@ unsafe fn class_for(obj: *mut c_void, orig: usize, kind: Kind) -> usize {
             let pc = if newer < scanned { *ot.add(newer) } else { v[1 + newer] };
             v[1 + newer] = super::guard::make_layout_split(super::guard::LayoutTargets { older: v[1 + newer], newer: f, pc, newer_layout: &QUEUE_SHIFTED });
         }
+        // the newer layout's shading-rate methods (#126 / #127): PC methods on a PC-shaped
+        // call, a stub for anything else
+        for (newer, _pc) in NEWER_SHADING_RATE_SLOTS {
+            let Some(f) = newer_shading_rate_handler(newer) else { continue };
+            if newer >= total {
+                continue;
+            }
+            let pc = if newer < scanned { *ot.add(newer) } else { v[1 + newer] };
+            v[1 + newer] = super::guard::make_layout_split(super::guard::LayoutTargets { older: v[1 + newer], newer: f, pc, newer_layout: &QUEUE_SHIFTED });
+        }
     }
     // XCL_D3D12_TRACE: every public method called from console code is logged
     if std::env::var_os("XCL_D3D12_TRACE").is_some() {
@@ -1098,7 +1108,8 @@ fn console_slots(kind: Kind) -> Vec<(usize, usize)> {
                 (93, l::kickoff_x as usize),
                 (94, l::set_depth_bias_x as usize),
                 // DispatchMesh after RSSetShadingRate / RSSetShadingRateImage (#124 / #125) as on
-                // the PC – inferred, see `bind::dispatch_mesh`
+                // the PC – inferred, not seen in a title yet; on the newer layout this slot is
+                // RSSetShadingRate instead (`NEWER_SHADING_RATE_SLOTS`)
                 (126, b::dispatch_mesh as usize),
                 // console compute/BVH builder extensions (`XboxBvhBuilder.dll`)
                 (146, l::uav_barrier_x as usize),
@@ -1251,11 +1262,41 @@ fn resource_dim_to_view(r: &D3D12_RESOURCE_DESC) -> i32 {
 static NON_UMA_BUFFER_VIEWS: AtomicU64 = AtomicU64::new(0);
 
 /// V# of a buffer view (raw: 4-byte elements, num_records in bytes; structured / typed:
-/// stride = element size, num_records in elements); empty when the buffer is not in UMA.
+/// stride = element size, num_records in elements); mirrored into UMA if outside it.
 fn buffer_view(res: usize, format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT, first: u64, n: u32, stride: u32, raw: bool) -> [u32; 4] {
-    let Some((at, bytes)) = console_buffer(res) else {
-        note_buffer_view();
-        return [0; 4];
+    let (at, bytes) = match console_buffer(res) {
+        Some(b) => b,
+        None => {
+            let addr = title_address(res);
+            let desc_bytes = title_buffer_bytes(res).or_else(|| {
+                if res != 0 && crate::gpu::shader::readable(res, 8) {
+                    let res_ptr = res as *mut c_void;
+                    unsafe { ID3D12Resource::from_raw_borrowed(&res_ptr).map(|r| r.GetDesc().Width as usize) }
+                } else {
+                    None
+                }
+            });
+            match (addr, desc_bytes) {
+                (Some(va), Some(bytes)) if bytes > 0 => {
+                    let in_uma = crate::gpu::uma::get().is_some_and(|u| u.contains(va));
+                    if in_uma {
+                        (va, bytes)
+                    } else {
+                        match unsafe { super::list_x::mirror_of(va as u64, bytes, "buffer view") } {
+                            Some(m) => (m, bytes),
+                            None => {
+                                note_buffer_view();
+                                return [0; 4];
+                            }
+                        }
+                    }
+                }
+                _ => {
+                    note_buffer_view();
+                    return [0; 4];
+                }
+            }
+        }
     };
     let fmt = crate::gpu::desc::gfx10_format(format).unwrap_or(22);
     let (stride, elem) = if raw {
@@ -1692,6 +1733,16 @@ pub(super) fn note_title_format(res: usize, format: u32) {
     TITLE_FORMAT.lock().unwrap().get_or_insert_with(HashMap::new).insert(res, format);
 }
 
+static TITLE_BUFFER_BYTES: Mutex<Option<HashMap<usize, usize>>> = Mutex::new(None);
+
+pub(super) fn note_title_buffer_bytes(res: usize, bytes: usize) {
+    TITLE_BUFFER_BYTES.lock().unwrap().get_or_insert_with(HashMap::new).insert(res, bytes);
+}
+
+pub(super) fn title_buffer_bytes(res: usize) -> Option<usize> {
+    TITLE_BUFFER_BYTES.lock().unwrap().as_ref().and_then(|m| m.get(&res).copied())
+}
+
 /// resources whose Map gave their unified-memory address (no PC mapping to undo)
 static UNMAPPABLE: Mutex<Option<HashSet<usize>>> = Mutex::new(None);
 
@@ -1962,8 +2013,8 @@ fn note_buffer_view() {
 }
 
 /// #17 CreateConstantBufferView: a V# of float4 rows at the buffer's console address
-/// (`desc::cbv_words`; unified memory, anything else gets an empty V#). No PC CBV: translated
-/// shaders read buffers through `mem`.
+/// (`desc::cbv_words`; mirrored into UMA if outside it). No PC CBV: translated shaders read
+/// buffers through `mem`.
 unsafe extern "system" fn dev_create_cbv_x(this: *mut c_void, desc: *const D3D12_CONSTANT_BUFFER_VIEW_DESC, cpu: u64) {
     let Some(slot) = super::console_heap::slot(cpu).filter(|s| !s.sampler) else {
         let f: unsafe extern "system" fn(*mut c_void, *const D3D12_CONSTANT_BUFFER_VIEW_DESC, u64) = std::mem::transmute(orig_fn(this, 17));
@@ -1971,10 +2022,22 @@ unsafe extern "system" fn dev_create_cbv_x(this: *mut c_void, desc: *const D3D12
     };
     let (va, size) = desc.as_ref().map_or((0, 0), |d| (d.BufferLocation, d.SizeInBytes));
     let in_uma = crate::gpu::uma::get().is_some_and(|u| u.contains(va as usize));
-    if !in_uma {
-        note_buffer_view();
-    }
-    let (va, size) = if in_uma { (va, size) } else { (0, 0) };
+    let (va, size) = if in_uma {
+        (va, size)
+    } else if va != 0 && size > 0 {
+        match super::list_x::mirror_of(va, size as usize, "CBV") {
+            Some(m) => (m as u64, size),
+            None => {
+                note_buffer_view();
+                (0, 0)
+            }
+        }
+    } else {
+        if va != 0 {
+            note_buffer_view();
+        }
+        (0, 0)
+    };
     super::console_heap::write(&slot, &crate::gpu::desc::cbv_words(va, size));
 }
 
@@ -2257,10 +2320,16 @@ unsafe extern "system" fn dev_create_srv_x(this: *mut c_void, res: *mut c_void, 
     let Some(r) = ID3D12Resource::from_raw_borrowed(&res) else {
         return super::console_heap::write(&slot, &[0; 8]);
     };
-    if let Some(v) = desc.as_ref().filter(|v| v.ViewDimension == D3D12_SRV_DIMENSION_BUFFER) {
-        let b = &v.Anonymous.Buffer;
-        let raw = b.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0;
-        return super::console_heap::write(&slot, &buffer_view(res as usize, v.Format, b.FirstElement, b.NumElements, b.StructureByteStride, raw));
+    let rd = r.GetDesc();
+    if desc.as_ref().map_or(rd.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER, |v| v.ViewDimension == D3D12_SRV_DIMENSION_BUFFER) {
+        let (format, first, n, stride, raw) = match desc.as_ref() {
+            Some(v) => {
+                let b = &v.Anonymous.Buffer;
+                (v.Format, b.FirstElement, b.NumElements, b.StructureByteStride, b.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0)
+            }
+            None => (rd.Format, 0, (rd.Width / 4) as u32, 0, true),
+        };
+        return super::console_heap::write(&slot, &buffer_view(res as usize, format, first, n, stride, raw));
     }
     let (format, dim, array, mips) = match desc.as_ref() {
         Some(v) => {
@@ -2279,8 +2348,7 @@ unsafe extern "system" fn dev_create_srv_x(this: *mut c_void, res: *mut c_void, 
             (v.Format, v.ViewDimension.0, array, mips)
         }
         None => {
-            let d = r.GetDesc();
-            (d.Format, resource_dim_to_view(&d), d.DepthOrArraySize as u32, d.MipLevels as u32)
+            (rd.Format, resource_dim_to_view(&rd), rd.DepthOrArraySize as u32, rd.MipLevels as u32)
         }
     };
     match view_shape(r, format, dim, array, mips) {
@@ -2389,7 +2457,23 @@ fn buffer_words_at(va: u64, format: windows::Win32::Graphics::Dxgi::Common::DXGI
         (false, s) => (s, s),
     };
     let records = if stride == 0 { n.saturating_mul(4) } else { n };
-    crate::gpu::desc::buffer_words(va + first * elem as u64, stride, records, fmt)
+    let bytes = (first * elem as u64 + if stride == 0 { n as u64 * 4 } else { n as u64 * stride as u64 }) as usize;
+    let in_uma = crate::gpu::uma::get().is_some_and(|u| u.contains(va as usize));
+    let base = if in_uma {
+        va + first * elem as u64
+    } else if va != 0 && bytes > 0 {
+        match unsafe { super::list_x::mirror_of(va, bytes, "buffer view at") } {
+            Some(m) => m as u64 + first * elem as u64,
+            None => {
+                note_buffer_view();
+                return [0; 4];
+            }
+        }
+    } else {
+        note_buffer_view();
+        return [0; 4];
+    };
+    crate::gpu::desc::buffer_words(base, stride, records, fmt)
 }
 
 /// A UAV view desc `d` (None: the resource's own) of `rd` with the PC's format names
@@ -2477,10 +2561,15 @@ unsafe extern "system" fn dev_create_uav_x(this: *mut c_void, res: *mut c_void, 
         return super::console_heap::write(&slot, &[0; 8]);
     };
     let rd = r.GetDesc();
-    if let Some(v) = desc.as_ref().filter(|v| v.ViewDimension == D3D12_UAV_DIMENSION_BUFFER) {
-        let b = &v.Anonymous.Buffer;
-        let raw = b.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0;
-        return super::console_heap::write(&slot, &buffer_view(res as usize, v.Format, b.FirstElement, b.NumElements, b.StructureByteStride, raw));
+    if desc.as_ref().map_or(rd.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER, |v| v.ViewDimension == D3D12_UAV_DIMENSION_BUFFER) {
+        let (format, first, n, stride, raw) = match desc.as_ref() {
+            Some(v) => {
+                let b = &v.Anonymous.Buffer;
+                (v.Format, b.FirstElement, b.NumElements, b.StructureByteStride, b.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0)
+            }
+            None => (rd.Format, 0, (rd.Width / 4) as u32, 0, true),
+        };
+        return super::console_heap::write(&slot, &buffer_view(res as usize, format, first, n, stride, raw));
     }
     // UAV dimensions: 1 buffer, 2 tex1d, 3 tex1d array, 4 tex2d, 5 tex2d array, 8 tex3d
     let (format, dim, array, mip) = match desc.as_ref() {
@@ -3952,6 +4041,123 @@ fn wait_for_commit() {
     }
 }
 
+/// The driver's compiled compute pipelines, kept on disk between runs.
+///
+/// XCL keeps its DXIL (`dxc::cache_dir`), but the driver's own compile of that DXIL is the slow
+/// part on some GPUs: a retail title's compute programs took an NVIDIA driver 5 – 27 s each when
+/// its world loaded, in every run, and the title dispatched without them meanwhile. A pipeline's
+/// `GetCachedBlob` is saved under the hash of its DXIL when its build took `KEEP` or longer and
+/// given back as `CachedPSO` the next time; the driver refuses the blob of another driver or
+/// adapter (the file is dropped and the pipeline built as before). `XCL_PSO_DISK_CACHE=0`: off.
+mod driver_cache {
+    use std::ffi::c_void;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use windows::core::Interface;
+    use windows::Win32::Graphics::Direct3D12::ID3D12PipelineState;
+
+    /// builds shorter than this are not worth a file
+    const KEEP: std::time::Duration = std::time::Duration::from_millis(250);
+    static HITS: AtomicU64 = AtomicU64::new(0);
+    static STALE: AtomicU64 = AtomicU64::new(0);
+    static STORED: AtomicU64 = AtomicU64::new(0);
+
+    /// The file of the pipeline made from `dxil`: its hash, with its length.
+    pub fn name(dxil: &[u8]) -> String {
+        format!("{:016x}-{:x}.pso", crate::gpu::shader::fnv64(dxil), dxil.len())
+    }
+
+    pub fn path(dxil: &[u8]) -> Option<PathBuf> {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        ON.get_or_init(|| std::env::var("XCL_PSO_DISK_CACHE").map_or(true, |v| v.trim() != "0")).then(|| crate::gpu::recomp::dxc::cache_dir().join("driver").join(name(dxil)))
+    }
+
+    pub fn load(p: &Path) -> Option<Vec<u8>> {
+        std::fs::read(p).ok().filter(|b| !b.is_empty())
+    }
+
+    /// A pipeline was made from a kept blob (`ok`), or the driver refused the blob: dropped.
+    pub fn note(ok: bool, p: Option<&Path>) {
+        if ok {
+            let n = HITS.fetch_add(1, Ordering::Relaxed) + 1;
+            if n.is_power_of_two() {
+                crate::xlog_info!("D3D12.X: {n} compute pipelines made from the driver's compile of an earlier run (kept on disk)");
+            }
+        } else {
+            if let Some(p) = p {
+                let _ = std::fs::remove_file(p);
+            }
+            if STALE.fetch_add(1, Ordering::Relaxed) == 0 {
+                crate::xlog_info!("D3D12.X: a kept driver compile was refused (another driver or adapter?) – such pipelines are built again");
+            }
+        }
+    }
+
+    /// `bytes` to `p`, under another name first: a run that is cut short leaves no half file.
+    pub fn write(p: &Path, bytes: &[u8]) -> bool {
+        if bytes.is_empty() {
+            return false;
+        }
+        if let Some(dir) = p.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let tmp = p.with_extension(format!("tmp{}", std::process::id()));
+        let ok = std::fs::write(&tmp, bytes).is_ok() && std::fs::rename(&tmp, p).is_ok();
+        if !ok {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        ok
+    }
+
+    /// Keep what the driver compiled for `pso`, whose build took `took`.
+    pub unsafe fn store(p: &Path, pso: *mut c_void, took: std::time::Duration) {
+        if took < KEEP {
+            return;
+        }
+        let Some(state) = ID3D12PipelineState::from_raw_borrowed(&pso) else { return };
+        let Ok(blob) = state.GetCachedBlob() else { return };
+        let bytes = std::slice::from_raw_parts(blob.GetBufferPointer() as *const u8, blob.GetBufferSize());
+        if write(p, bytes) {
+            let n = STORED.fetch_add(1, Ordering::Relaxed) + 1;
+            if n.is_power_of_two() {
+                crate::xlog_info!("D3D12.X: {n} driver compiles kept on disk for the next run (this one: {} ms, {} KB)", took.as_millis(), bytes.len() >> 10);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn a_file_is_named_after_its_dxil() {
+            assert_eq!(name(b"abc"), name(b"abc"));
+            assert_ne!(name(b"abc"), name(b"abd"));
+            // (the length is in the name: two programs of one hash and different lengths differ)
+            assert!(name(&[0u8; 0x1234]).ends_with("-1234.pso"));
+        }
+
+        #[test]
+        fn a_kept_blob_is_read_back_and_a_refused_one_is_dropped() {
+            let dir = std::env::temp_dir().join(format!("xcl-driver-cache-test-{}", std::process::id()));
+            let p = dir.join("driver").join(name(b"program"));
+            assert_eq!(load(&p), None, "nothing kept yet");
+            assert!(!write(&p, &[]), "an empty blob is not kept");
+            assert_eq!(load(&p), None);
+            assert!(write(&p, &[1, 2, 3]));
+            assert_eq!(load(&p).as_deref(), Some(&[1u8, 2, 3][..]));
+            // no half file under the temporary name
+            assert_eq!(std::fs::read_dir(p.parent().unwrap()).unwrap().count(), 1);
+            // the driver took the blob: it stays; it refused it: gone, the pipeline is built again
+            note(true, Some(&p));
+            assert!(p.exists());
+            note(false, Some(&p));
+            assert_eq!(load(&p), None);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+}
+
 unsafe fn translated_compute_pso(this: *mut c_void, f: PsoFn, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> Option<Result<HRESULT, ()>> {
     with_switch_fallback(|| translated_compute_pso_once(this, f, desc, riid, ppv))
 }
@@ -3991,15 +4197,53 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
     copy.pRootSignature = std::mem::transmute::<*mut c_void, std::mem::ManuallyDrop<Option<ID3D12RootSignature>>>(rs);
     copy.CS = bytecode(&dxil);
     copy.CachedPSO = D3D12_CACHED_PIPELINE_STATE::default();
-    let key = super::pso_disk::compute_key(&copy, &compiled.samplers);
-    // in the background, one at a time and within the commit left (each ~1.5 GB in the driver)
-    let _slot = (big && std::thread::current().name().is_some_and(|n| n.starts_with("xcl-pso"))).then(|| {
-        let slot = BIG_COMPILES.acquire();
-        wait_for_commit();
-        slot
-    });
-    // a driver blob saved for this pipeline skips the driver's compile (`pso_disk`)
-    let hr = finish_pso_cached(this, f, &mut copy as *mut _ as *mut c_void, false, key, riid, ppv);
+    // A program built again gets the driver's own result of its first build: a retail title
+    // made 14 big compute pipelines twice while loading, 13 - 30 s each the second time.
+    let key = compute_blob_key(&dxil, rs as usize, copy.Flags.0);
+    let cached = compute_blob(key);
+    let started = std::time::Instant::now();
+    // what the driver compiled for this program in an earlier run, if it is kept (`driver_cache`)
+    let cache = driver_cache::path(&dxil);
+    let mut hr: HRESULT = -1;
+    let mut reused = false;
+    if let Some(b) = &cached {
+        copy.CachedPSO = D3D12_CACHED_PIPELINE_STATE { pCachedBlob: b.as_ptr() as *const c_void, CachedBlobSizeInBytes: b.len() };
+        hr = finish_pso(this, f, &copy as *const _ as *const c_void, riid, ppv);
+        if hr < 0 {
+            // a blob the driver does not take (another root signature at the same address…): compiled
+            forget_compute_blob(key);
+            copy.CachedPSO = D3D12_CACHED_PIPELINE_STATE::default();
+        }
+        reused = hr >= 0;
+    }
+    if hr < 0 {
+        if let Some(blob) = cache.as_deref().and_then(driver_cache::load) {
+            copy.CachedPSO = D3D12_CACHED_PIPELINE_STATE { pCachedBlob: blob.as_ptr() as *const c_void, CachedBlobSizeInBytes: blob.len() };
+            hr = finish_pso(this, f, &copy as *const _ as *const c_void, riid, ppv);
+            copy.CachedPSO = D3D12_CACHED_PIPELINE_STATE::default();
+            driver_cache::note(hr >= 0, cache.as_deref());
+            if hr >= 0 {
+                keep_compute_blob(key, *ppv, dxil.len());
+                reused = true;
+            }
+        }
+    }
+    if hr < 0 {
+        // in the background, one at a time and within the commit left (each ~1.5 GB in the driver)
+        let _slot = (big && std::thread::current().name().is_some_and(|n| n.starts_with("xcl-pso"))).then(|| {
+            let slot = BIG_COMPILES.acquire();
+            wait_for_commit();
+            slot
+        });
+        let t0 = std::time::Instant::now();
+        hr = finish_pso(this, f, &copy as *const _ as *const c_void, riid, ppv);
+        if hr >= 0 {
+            if let Some(p) = cache.as_deref() {
+                driver_cache::store(p, *ppv, t0.elapsed());
+            }
+            keep_compute_blob(key, *ppv, dxil.len());
+        }
+    }
     if hr < 0 {
         note_translation_error(format!("the driver rejected the compute PSO with the translated CS ({hr:#x})"));
         return Some(Err(()));
@@ -4011,8 +4255,87 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
         PSO_USER_SGPRS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, n);
     }
     note_translated_compute(hr, ppv);
-    crate::xlog_info!("D3D12.X: compute PSO with the translated console CS ({} B DXIL)", dxil.len());
+    crate::xlog_info!(
+        "D3D12.X: compute PSO with the translated console CS ({} B DXIL, {} ms{})",
+        dxil.len(),
+        started.elapsed().as_millis(),
+        if reused { ", the driver's blob of an earlier build" } else { "" }
+    );
     Some(Ok(hr))
+}
+
+/// The driver's compiled form of translated compute programs (`GetCachedBlob`),
+/// by (DXIL hash, root signature, flags), up to `COMPUTE_BLOBS_MAX` bytes in all.
+static COMPUTE_BLOBS: Mutex<Option<(HashMap<(u64, usize, i32), std::sync::Arc<Vec<u8>>>, usize)>> = Mutex::new(None);
+const COMPUTE_BLOBS_MAX: usize = 512 << 20;
+/// smaller programs compile in milliseconds: not kept
+const COMPUTE_BLOB_MIN_DXIL: usize = 16 << 10;
+
+fn compute_blob_key(dxil: &[u8], rs: usize, flags: i32) -> (u64, usize, i32) {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    dxil.hash(&mut h);
+    (h.finish(), rs, flags)
+}
+
+fn compute_blob(key: (u64, usize, i32)) -> Option<std::sync::Arc<Vec<u8>>> {
+    COMPUTE_BLOBS.lock().unwrap().as_ref().and_then(|(m, _)| m.get(&key).cloned())
+}
+
+fn forget_compute_blob(key: (u64, usize, i32)) {
+    if let Some((m, total)) = COMPUTE_BLOBS.lock().unwrap().as_mut() {
+        if let Some(b) = m.remove(&key) {
+            *total -= b.len();
+        }
+    }
+}
+
+#[cfg(test)]
+mod compute_blob_tests {
+    #[test]
+    fn a_blob_is_found_only_for_the_same_program_root_signature_and_flags_and_is_forgotten() {
+        let dxil = vec![7u8; 1000];
+        let key = super::compute_blob_key(&dxil, 0x1000, 0);
+        assert_eq!(key, super::compute_blob_key(&dxil.clone(), 0x1000, 0));
+        assert_ne!(key, super::compute_blob_key(&dxil, 0x2000, 0));
+        assert_ne!(key, super::compute_blob_key(&dxil, 0x1000, 1));
+        let mut other = dxil.clone();
+        other[999] = 8;
+        assert_ne!(key, super::compute_blob_key(&other, 0x1000, 0));
+        {
+            let mut g = super::COMPUTE_BLOBS.lock().unwrap();
+            let (m, total) = g.get_or_insert_with(|| (super::HashMap::new(), 0));
+            m.insert(key, std::sync::Arc::new(vec![1, 2, 3]));
+            *total += 3;
+        }
+        assert_eq!(super::compute_blob(key).as_deref().map(|v| v.len()), Some(3));
+        let before = super::COMPUTE_BLOBS.lock().unwrap().as_ref().unwrap().1;
+        super::forget_compute_blob(key);
+        assert!(super::compute_blob(key).is_none());
+        assert_eq!(super::COMPUTE_BLOBS.lock().unwrap().as_ref().unwrap().1, before - 3);
+    }
+}
+
+/// The driver's blob of the PSO just built (adopted: its PC `GetCachedBlob` through `orig_fn`).
+unsafe fn keep_compute_blob(key: (u64, usize, i32), pso: *mut c_void, dxil_len: usize) {
+    if dxil_len < COMPUTE_BLOB_MIN_DXIL || pso.is_null() || !is_adopted(pso) || compute_blob(key).is_some() {
+        return;
+    }
+    type GetBlob = unsafe extern "system" fn(*mut c_void, *mut *mut c_void) -> HRESULT;
+    let get: GetBlob = std::mem::transmute(orig_fn(pso, slot_of(pso, "GetCachedBlob")));
+    let mut raw = std::ptr::null_mut();
+    if get(pso, &mut raw) < 0 || raw.is_null() {
+        return;
+    }
+    let blob = ID3DBlob::from_raw(raw);
+    let bytes = std::slice::from_raw_parts(blob.GetBufferPointer() as *const u8, blob.GetBufferSize()).to_vec();
+    let mut g = COMPUTE_BLOBS.lock().unwrap();
+    let (m, total) = g.get_or_insert_with(|| (HashMap::new(), 0));
+    if bytes.is_empty() || *total + bytes.len() > COMPUTE_BLOBS_MAX {
+        return;
+    }
+    *total += bytes.len();
+    m.insert(key, std::sync::Arc::new(bytes));
 }
 
 unsafe fn translated_graphics_pso(this: *mut c_void, f: PsoFn, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> Option<HRESULT> {
@@ -5587,6 +5910,9 @@ unsafe extern "system" fn alloc_reset(this: *mut c_void) -> HRESULT {
 // So the shift starts at #59 or below; where is not known. The newer layout's #139 is a Reset with one argument more (the same
 // title: (allocator, NULL, 0) on each list it takes from its pool before recording – as a stub
 // the list stayed closed, the debug layer saw every call on it refused, and Close failed).
+// The newer layout's shading-rate methods sit at #126 / #127 (the older layout's #124 / #125):
+// a retail title calls #126 with a rate in edx and a combiner array in r8, about once a frame,
+// and #127 with one resource pointer (`NEWER_SHADING_RATE_SLOTS`).
 
 /// the title's runtime has the newer layouts (queue: two methods before Signal; command list:
 /// console methods from CopyTextureRegionX on two slots later)
@@ -5597,9 +5923,25 @@ pub(super) static QUEUE_SHIFTED: AtomicBool = AtomicBool::new(false);
 static QUEUE_OLDER: AtomicBool = AtomicBool::new(false);
 
 /// command list slots of the newer layout → the older layout's slot of the same method
-/// (128, 126): DispatchMesh, if the shift reaches it – not seen yet; `bind::dispatch_mesh` drops
-/// a call without a console mesh pipeline bound.
-const NEWER_LIST_SLOTS: [(usize, usize); 22] = [(61, 59), (62, 60), (63, 61), (64, 62), (65, 63), (70, 68), (71, 69), (72, 70), (73, 71), (74, 72), (80, 78), (83, 81), (85, 83), (86, 84), (87, 85), (90, 88), (91, 89), (92, 90), (95, 93), (96, 94), (128, 126), (139, 10)];
+/// (`bind::dispatch_mesh` drops a call without a console mesh pipeline bound). Slots #128 and
+/// #129 are not in here: no title call of either was seen (see `NEWER_SHADING_RATE_SLOTS`).
+const NEWER_LIST_SLOTS: [(usize, usize); 21] = [(61, 59), (62, 60), (63, 61), (64, 62), (65, 63), (70, 68), (71, 69), (72, 70), (73, 71), (74, 72), (80, 78), (83, 81), (85, 83), (86, 84), (87, 85), (90, 88), (91, 89), (92, 90), (95, 93), (96, 94), (139, 10)];
+
+/// The newer layout's two slots before DispatchMesh's PC position: (console slot, PC slot) of
+/// `RSSetShadingRate` / `RSSetShadingRateImage`. On that layout the title calls #126 about once
+/// per frame with a rate in edx and a combiner array in r8 (the older layout's #124); #127
+/// takes one resource pointer. Neither is routed to `bind::dispatch_mesh`: no title call at
+/// #128 or #129 sets three group counts, so the mesh work goes elsewhere.
+const NEWER_SHADING_RATE_SLOTS: [(usize, usize); 2] = [(126, 77), (127, 78)];
+
+/// The handler for the newer layout's console slot `newer` (`NEWER_SHADING_RATE_SLOTS`).
+fn newer_shading_rate_handler(newer: usize) -> Option<usize> {
+    Some(match newer {
+        126 => super::list_x::rsset_shading_rate_x as usize,
+        127 => super::list_x::rsset_shading_rate_image_x as usize,
+        _ => return None,
+    })
+}
 
 /// The title called device method `slot`, which only runtimes with the newer layouts have (a retail game
 /// records its first lists before any queue call could tell).
@@ -6286,6 +6628,89 @@ mod queue_tests {
 }
 
 #[cfg(test)]
+mod newer_shading_rate_slot_tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    /// the tests share `QUEUE_SHIFTED`
+    static LOCK: Mutex<()> = Mutex::new(());
+
+    /// what the fake PC list received: RSSetShadingRate (this, rate, combiners) and
+    /// RSSetShadingRateImage (this, image)
+    static RATE: Mutex<Option<(usize, i32, usize)>> = Mutex::new(None);
+    static IMAGE: Mutex<Option<(usize, usize)>> = Mutex::new(None);
+
+    unsafe extern "system" fn rate_rec(this: *mut c_void, rate: i32, combiners: *const i32) {
+        *RATE.lock().unwrap() = Some((this as usize, rate, combiners as usize));
+    }
+    unsafe extern "system" fn image_rec(this: *mut c_void, image: usize) {
+        *IMAGE.lock().unwrap() = Some((this as usize, image));
+    }
+
+    /// A list object whose PC table has the two shading-rate methods at #77 / #78.
+    fn fake_list(pc: &[usize; 80]) -> *mut c_void {
+        static EXT: Mutex<Option<[usize; 2]>> = Mutex::new(None);
+        static OBJ: Mutex<Option<[usize; 2]>> = Mutex::new(None);
+        *EXT.lock().unwrap() = Some([pc.as_ptr() as usize, 0]);
+        let vtbl = EXT.lock().unwrap().as_ref().unwrap().as_ptr() as usize + 8;
+        *OBJ.lock().unwrap() = Some([vtbl, 0]);
+        OBJ.lock().unwrap().as_ref().unwrap().as_ptr() as *mut c_void
+    }
+
+    /// On the newer layout the title's #126 (rate in edx, combiner array in r8) becomes the PC's
+    /// RSSetShadingRate at #77 with the same arguments; #127 becomes #78 with its resource.
+    #[test]
+    fn the_newer_layouts_126_and_127_reach_the_pcs_shading_rate_methods() {
+        let _g = LOCK.lock().unwrap();
+        let mut pc = [0usize; 80];
+        pc[77] = rate_rec as usize;
+        pc[78] = image_rec as usize;
+        let obj = fake_list(&pc);
+        super::super::device_x::set_variable_shading_rate_for_test(Some(true));
+        let combiners = [1i32, 2];
+        assert_eq!(newer_shading_rate_handler(126), Some(super::super::list_x::rsset_shading_rate_x as usize), "#126 is routed to the PC shading-rate method");
+        assert_eq!(newer_shading_rate_handler(127), Some(super::super::list_x::rsset_shading_rate_image_x as usize), "#127 is routed to the PC shading-rate image method");
+        unsafe {
+            let f: unsafe extern "system" fn(*mut c_void, u32, *const i32) = std::mem::transmute(newer_shading_rate_handler(126).unwrap());
+            f(obj, 0x5, combiners.as_ptr());
+            assert_eq!(*RATE.lock().unwrap(), Some((obj as usize, 5, combiners.as_ptr() as usize)), "#126 is PC #77 with the title's rate and combiners");
+            let f: unsafe extern "system" fn(*mut c_void, usize) = std::mem::transmute(newer_shading_rate_handler(127).unwrap());
+            f(obj, 0x1234);
+            assert_eq!(*IMAGE.lock().unwrap(), Some((obj as usize, 0x1234)), "#127 is PC #78 with the title's resource");
+        }
+        super::super::device_x::set_variable_shading_rate_for_test(None);
+        assert!(newer_shading_rate_handler(128).is_none() && newer_shading_rate_handler(129).is_none(), "#128 and #129 stay stubs");
+        assert_eq!(NEWER_SHADING_RATE_SLOTS, [(126, 77), (127, 78)], "the newer slots are the PC's #77 / #78");
+    }
+
+    /// A device without variable-rate shading gets neither call.
+    #[test]
+    fn a_device_without_vrs_gets_no_shading_rate_call() {
+        let _g = LOCK.lock().unwrap();
+        let pc = [0usize; 80];
+        let obj = fake_list(&pc);
+        super::super::device_x::set_variable_shading_rate_for_test(Some(false));
+        *RATE.lock().unwrap() = None;
+        unsafe {
+            let f: unsafe extern "system" fn(*mut c_void, u32, *const i32) = std::mem::transmute(newer_shading_rate_handler(126).unwrap());
+            f(obj, 1, std::ptr::null());
+        }
+        assert!(RATE.lock().unwrap().is_none(), "nothing reaches the PC");
+        super::super::device_x::set_variable_shading_rate_for_test(None);
+    }
+
+    /// Neither `NEWER_LIST_SLOTS` nor the console slots send a mesh dispatch anywhere: #128 and
+    /// #129 are left to the stubs.
+    #[test]
+    fn no_slot_sends_128_or_129_to_dispatch_mesh() {
+        assert!(NEWER_LIST_SLOTS.iter().all(|&(newer, _)| newer != 128 && newer != 129));
+        let slots = console_slots(Kind::CommandList);
+        assert!(slots.iter().all(|&(s, _)| s != 128 && s != 129));
+        assert!(slots.iter().any(|&(s, _)| s == 126), "the older layout's #126 stays");
+    }
+}
+
+#[cfg(test)]
 mod srv_tests {
     use super::*;
     use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_BC1_UNORM_SRGB;
@@ -6774,5 +7199,85 @@ mod refused_rt_gpu_tests {
             }
             rb.Unmap(0, None);
         }
+    }
+}
+
+mod non_uma_buffer_view_tests {
+    use super::*;
+    use windows::Win32::Graphics::Dxgi::Common::*;
+    use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE};
+
+    #[test]
+    fn buffer_views_outside_uma_are_mirrored() {
+        let Some(u) = crate::gpu::uma::get() else { return };
+        let size = 0x2_0000;
+        let va = unsafe { VirtualAlloc(std::ptr::null(), size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE) } as usize;
+        assert_ne!(va, 0);
+        assert!(!u.contains(va), "host allocation should be outside UMA");
+
+        unsafe {
+            for i in 0..(size / 4) {
+                *((va as *mut u32).add(i)) = 0xAA00_0000 | i as u32;
+            }
+        }
+
+        let fake_res = 0xdead_beef_usize;
+        note_title_address(fake_res, va);
+        note_title_buffer_bytes(fake_res, size);
+
+        // 1. Raw buffer view via buffer_view
+        let words = buffer_view(fake_res, DXGI_FORMAT_UNKNOWN, 0, (size / 4) as u32, 0, true);
+        let b = crate::gpu::desc::buffer(&words);
+        assert!(u.contains(b.address as usize), "mirrored address {:#x} should be in UMA", b.address);
+        assert_eq!(b.stride, 0);
+        assert_eq!(b.num_records, size as u32);
+        let mirrored_first_word = unsafe { *(b.address as *const u32) };
+        assert_eq!(mirrored_first_word, 0xAA00_0000);
+
+        // 2. Structured buffer view with offset
+        let words2 = buffer_view(fake_res, DXGI_FORMAT_UNKNOWN, 4, 10, 16, false);
+        let b2 = crate::gpu::desc::buffer(&words2);
+        assert_eq!(b2.address, b.address + 4 * 16);
+        assert_eq!(b2.stride, 16);
+        assert_eq!(b2.num_records, 10);
+
+        // 3. buffer_words_at (from dev_create_srv_at_x / dev_create_uav_at_x)
+        let words3 = buffer_words_at(va as u64, DXGI_FORMAT_R32_UINT, 2, 8, 4, false);
+        let b3 = crate::gpu::desc::buffer(&words3);
+        assert!(u.contains(b3.address as usize), "buffer_words_at address {:#x} should be in UMA", b3.address);
+        assert_eq!(b3.address, b.address + 2 * 4);
+        assert_eq!(b3.stride, 4);
+        assert_eq!(b3.num_records, 8);
+
+        unsafe { VirtualFree(va as *mut _, 0, MEM_RELEASE) };
+    }
+
+    #[test]
+    fn cbv_outside_uma_is_mirrored_and_refreshed() {
+        let Some(u) = crate::gpu::uma::get() else { return };
+        let size = 0x1000;
+        let va = unsafe { VirtualAlloc(std::ptr::null(), size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE) } as usize;
+        assert_ne!(va, 0);
+        assert!(!u.contains(va));
+
+        unsafe {
+            *((va as *mut u32)) = 0x11223344;
+        }
+
+        let m1 = unsafe { super::super::list_x::mirror_of(va as u64, size, "CBV") }.expect("CBV mirror created");
+        assert!(u.contains(m1));
+        assert_eq!(unsafe { *(m1 as *const u32) }, 0x11223344);
+
+        // Update host memory
+        unsafe {
+            *((va as *mut u32)) = 0x55667788;
+        }
+
+        // mirror_of should refresh the mirror from the host CPU memory
+        let m2 = unsafe { super::super::list_x::mirror_of(va as u64, size, "CBV") }.expect("CBV mirror reused");
+        assert_eq!(m1, m2);
+        assert_eq!(unsafe { *(m2 as *const u32) }, 0x55667788);
+
+        unsafe { VirtualFree(va as *mut _, 0, MEM_RELEASE) };
     }
 }
