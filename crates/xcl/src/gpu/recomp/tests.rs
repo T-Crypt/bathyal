@@ -452,7 +452,7 @@ fn unary_f64_math_vop1_and_vop3() {
     assert_eq!(t.hlsl.matches("fract_d(").count(), 3, "{}", t.hlsl); // helper plus two calls
     // f64 roots through sqrt_d (HLSL's sqrt is f32): V_SQRT / V_RSQ, twice each
     assert_eq!(t.hlsl.matches("sqrt_d(").count(), 1 + 4, "{}", t.hlsl); // helper plus four calls
-    assert_eq!(t.hlsl.matches("(double)1 / sqrt_d(").count(), 2, "{}", t.hlsl);
+    assert_eq!(t.hlsl.matches("rcp_d(sqrt_d(").count(), 2, "{}", t.hlsl);
     if super::dxc::location().is_ok() {
         super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl));
     }
@@ -867,6 +867,7 @@ fn f64_roots(wave64: bool) {
     let p = prog(&[
         ("V_SQRT_F64", "ENC_VOP1", &[("VDST", 2), ("SRC0", V)], None),
         ("V_RSQ_F64", "ENC_VOP1", &[("VDST", 4), ("SRC0", V)], None),
+        ("V_RCP_F64", "ENC_VOP1", &[("VDST", 6), ("SRC0", V)], None),
     ]);
     let mut st = KernelState::default();
     f64_lanes(&mut st, &F64_EDGES);
@@ -883,7 +884,8 @@ fn f64_roots(wave64: bool) {
     let mut bad = Vec::new();
     for (l, v) in r.vgpr.iter().take(lanes).enumerate() {
         let x = f64::from_bits(F64_EDGES[l % F64_EDGES.len()]);
-        for (name, got, want, tol) in [("sqrt", pair(v, 2), x.sqrt(), 1), ("rsq", pair(v, 4), 1.0 / x.sqrt(), 2)] {
+        let checks = [("sqrt", pair(v, 2), x.sqrt(), 1), ("rsq", pair(v, 4), 1.0 / x.sqrt(), 2), ("rcp", pair(v, 6), 1.0 / x, 1)];
+        for (name, got, want, tol) in checks {
             if ulps(got, want) > tol {
                 bad.push(format!("v_{name}_f64({x:e}) = {got:e}, want {want:e}"));
             }
