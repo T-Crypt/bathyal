@@ -1092,6 +1092,7 @@ mod shader_cache_tests {
                 .recv_timeout(std::time::Duration::from_secs(2))
                 .unwrap();
             let probe = scope.spawn(move || {
+                let t0 = std::time::Instant::now();
                 let (result, missed) = dxc::cached_only(|| {
                     cached_shader(cache, key(1), b"a", || {
                         let dxil =
@@ -1102,13 +1103,15 @@ mod shader_cache_tests {
                         })
                     })
                 });
-                probe_tx.send(result.is_err() && missed).unwrap();
+                probe_tx.send((result.is_err() && missed, t0.elapsed())).unwrap();
             });
-            let result = probe_rx.recv_timeout(std::time::Duration::from_secs(2));
+            let (missed, took) = probe_rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
             release_tx.send(()).unwrap();
             worker.join().unwrap().unwrap();
             probe.join().unwrap();
-            assert!(result.unwrap());
+            assert!(missed, "a cached-only lookup of a key in flight is a miss");
+            // the rule: a lookup in cached_only mode never waits for a flight (only a worker may)
+            assert!(took < std::time::Duration::from_millis(50), "the cached-only lookup waited {took:?} for the flight");
         });
     }
 
