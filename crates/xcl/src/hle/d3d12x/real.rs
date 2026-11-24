@@ -610,6 +610,10 @@ static CLASSES: Mutex<Vec<Class>> = Mutex::new(Vec::new());
 static EXTS: Mutex<Option<HashSet<usize>>> = Mutex::new(None);
 
 unsafe fn vt(obj: *mut c_void) -> *const usize {
+    if !(obj as usize).is_multiple_of(8) {
+        eprintln!("vt: misaligned this {obj:p}\n{}", std::backtrace::Backtrace::force_capture());
+        return std::ptr::null();
+    }
     *(obj as *const *const usize)
 }
 
