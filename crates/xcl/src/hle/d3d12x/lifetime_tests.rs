@@ -128,6 +128,10 @@ fn a_resource_released_after_submit_outlives_its_submission() {
             let ef: EF = std::mem::transmute(real::orig_fn(qraw, 10));
             let one = [backing];
             ef(qraw, 1, one.as_ptr());
+        } else if std::env::var_os("XCL_TEST_RAWEXEC").is_some() {
+            let ef: unsafe extern "system" fn(*mut c_void, u32, *const *mut c_void) = std::mem::transmute(real::orig_fn(queue.as_raw() as *mut c_void, 10));
+            let one = [list.as_raw() as *mut c_void];
+            ef(queue.as_raw() as *mut c_void, 1, one.as_ptr());
         } else {
             queue.ExecuteCommandLists(&[Some(list.cast().unwrap())]);
         }
