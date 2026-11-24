@@ -188,10 +188,12 @@ pub(super) fn poll() {
         let mut g = STATE.lock().unwrap_or_else(|e| e.into_inner());
         let Some(st) = g.as_mut() else { return };
         for s in st.in_flight.iter_mut() {
+            eprintln!("poll: sub q={:x} fence={:x} val={} assigned={} done={} objs={:x?} completed={}", s.queue, s.fence, s.value, s.assigned, s.done, s.objects, s.assigned.then(|| completed(s.fence)).unwrap_or(0));
             if !s.done && s.assigned && completed(s.fence) >= s.value {
                 s.done = true;
             }
         }
+        eprintln!("poll: deferred={:x?} objects={:x?}", st.deferred, st.objects.keys().collect::<Vec<_>>());
         let mut free = Vec::new();
         st.deferred.retain(|&h| {
             let busy = st.objects.get(&h).map_or(true, |e| e.open > 0) || st.in_flight.iter().any(|s| !s.done && s.objects.contains(&h));
