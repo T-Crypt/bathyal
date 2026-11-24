@@ -2112,6 +2112,7 @@ mod tests {
                 rb_alloc,
                 rb_list,
                 rb_last_fence: 0,
+                rb_fences: FxHashMap::default(),
                 waited: FxHashMap::default(),
                 runs: None,
                 scratch_runs: Vec::new(),
