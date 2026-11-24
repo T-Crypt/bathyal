@@ -74,8 +74,13 @@ fn a_resource_released_after_submit_outlives_its_submission() {
         let raw_list = list.as_raw() as *mut c_void;
 
         // the two copies name the source, the destination and the readback buffer
-        list_x::copy_buffer_region_x(raw_list, dst.as_raw() as usize, 0, src.as_raw() as usize, 0, BYTES);
-        list_x::copy_buffer_region_x(raw_list, rb.as_raw() as usize, 0, dst.as_raw() as usize, 0, BYTES);
+        if std::env::var_os("XCL_TEST_PC").is_some() {
+            list.CopyBufferRegion(&dst, 0, &src, 0, BYTES);
+            list.CopyBufferRegion(&rb, 0, &dst, 0, BYTES);
+        } else {
+            list_x::copy_buffer_region_x(raw_list, dst.as_raw() as usize, 0, src.as_raw() as usize, 0, BYTES);
+            list_x::copy_buffer_region_x(raw_list, rb.as_raw() as usize, 0, dst.as_raw() as usize, 0, BYTES);
+        }
         list.Close().expect("Close");
 
         let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() }).expect("queue");
