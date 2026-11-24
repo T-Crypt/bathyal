@@ -1301,6 +1301,8 @@ unsafe fn map_pages(away: &mut Away, va: *mut c_void, n: usize, arr: *mut usize)
             continue;
         }
         if let Some(&old) = away.page.get(&p) {
+            // a logical move: the old address leaves, and a lazy page is only unmarked
+            // (memory is as it was, so the runs `map_pages` makes stay – #556)
             unmap_away(away, old, &(0..0));
         }
         let fresh = !in_uma(at) && !committed_page(at);

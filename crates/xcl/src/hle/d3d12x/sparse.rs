@@ -2066,6 +2066,76 @@ mod tests {
     }
 
     #[test]
+    fn a_pool_retired_a_moment_ago_is_taken_back() {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        use windows::Win32::Graphics::Dxgi::*;
+
+        unsafe {
+            let mut dev: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                let factory: IDXGIFactory4 = CreateDXGIFactory1().expect("DXGI factory");
+                let warp: IDXGIAdapter = factory.EnumWarpAdapter().expect("WARP");
+                D3D12CreateDevice(&warp, D3D_FEATURE_LEVEL_11_0, &mut dev).expect("WARP D3D12 device");
+            }
+            let dev = dev.expect("D3D12 device");
+            let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).expect("queue");
+            let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).expect("fence");
+            let rb_fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).expect("rb_fence");
+            let event = windows::Win32::System::Threading::CreateEventW(None, false, false, None).expect("event");
+            let rb_alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).expect("rb_alloc");
+            let rb_list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &rb_alloc, None).expect("rb_list");
+            rb_list.Close().expect("rb_list close");
+            let mut s = State {
+                dev,
+                queue,
+                fence,
+                value: 0,
+                event,
+                rb_fence,
+                rb_value: 0,
+                windows: Vec::new(),
+                pools: Vec::new(),
+                free: Vec::new(),
+                retired: Vec::new(),
+                parked: FxHashMap::default(),
+                mapped: FxHashMap::default(),
+                pinned: FxHashMap::default(),
+                buffers: FxHashMap::default(),
+                to_zero: Vec::new(),
+                staging: None,
+                ring_write: 0,
+                ring_submitted: 0,
+                ring_free: 0,
+                inflight: VecDeque::new(),
+                zero_buf: None,
+                slots: Vec::new(),
+                next_slot: 0,
+                readback: None,
+                rb_alloc,
+                rb_list,
+                rb_last_fence: 0,
+                waited: FxHashMap::default(),
+                runs: None,
+                scratch_runs: Vec::new(),
+            };
+
+            let (first, reused) = s.take_tile().expect("a tile from a new pool");
+            assert!(!reused, "a new pool's tile needs no clearing");
+            s.free.push(first);
+            s.retire_free_pools();
+            assert_eq!(s.retired.len(), 1, "an all-free pool is retired");
+            for round in 0..8 {
+                let (tile, reused) = s.take_tile().expect("a tile");
+                assert!(reused, "round {round}: a tile of a retired pool is cleared before use");
+                s.free.push(tile);
+                s.retire_free_pools();
+                assert_eq!(s.retired.len(), 1, "round {round}: the retired pool was taken back, not a new one made");
+                assert_eq!(s.pools.iter().filter(|p| p.is_some()).count(), 0, "round {round}");
+            }
+        }
+    }
+
+    #[test]
     fn aligned_tile_addresses_spread_across_hash_buckets() {
         use std::hash::BuildHasher;
 
