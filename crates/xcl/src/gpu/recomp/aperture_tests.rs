@@ -636,18 +636,18 @@ fn nv_parallel_driver_compile() {
         .split(',')
         .filter_map(|v| v.trim().parse().ok())
         .collect();
-    let jobs = num("XCL_NV_JOBS", 8);
-    let blocks = num("XCL_NV_BLOCKS", 1400);
+    let jobs = num("XCL_NV_JOBS", 6);
+    let blocks = num("XCL_NV_BLOCKS", 700);
     let program = |salt: u32| -> Vec<u8> {
         let mut v = Vec::new();
         let mut e = |n: &str, enc: &str, f: &[(&str, u64)], l: Option<u32>| v.extend(encode(n, enc, f, l).unwrap_or_else(|x| panic!("{n}: {x}")));
         e("S_MOV_B32", "ENC_SOP1", &[("SDST", 30), ("SSRC0", 255)], Some(salt));
         for i in 0..blocks as u64 {
-            // the run's salt in an address: the DXIL (and so the driver's cache key) differs
-            // per run, where a constant only in a register could be optimised away
-            e("S_LOAD_DWORDX4", "ENC_SMEM", &[("SDATA", 8), ("SBASE", 2), ("OFFSET", ((i * 16) ^ (salt as u64 & 0xF0)) & 0xFFFF)], None);
-            e("BUFFER_LOAD_DWORD", "ENC_MUBUF", &[("VDATA", 1), ("VADDR", 0), ("SRSRC", 2), ("SOFFSET", 128), ("IDXEN", 1)], None);
-            e("GLOBAL_LOAD_DWORD", "ENC_FLAT_GLBL", &[("VDST", 6), ("ADDR", 4), ("SADDR", 0x7D), ("OFFSET", (i * 4) & 0x7FF)], None);
+            // the run's salt in three addresses: the DXIL (and so the driver's cache key)
+            // differs per program, where a constant only in a register could be optimised away
+            e("S_LOAD_DWORDX4", "ENC_SMEM", &[("SDATA", 8), ("SBASE", 2), ("OFFSET", ((i * 16) ^ ((salt as u64 & 0xFF) << 4)) & 0xFFFF)], None);
+            e("BUFFER_LOAD_DWORD", "ENC_MUBUF", &[("VDATA", 1), ("VADDR", 0), ("SRSRC", 2), ("SOFFSET", 128 + (salt as u64 & 0x1F) * 4), ("IDXEN", 1)], None);
+            e("GLOBAL_LOAD_DWORD", "ENC_FLAT_GLBL", &[("VDST", 6), ("ADDR", 4), ("SADDR", 0x7D), ("OFFSET", ((i * 4) ^ (salt as u64 & 0x3F)) & 0x7FF)], None);
             for k in 0..12u64 {
                 e("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 2), ("SRC0", 256 + 1 + (k & 1) * 5), ("VSRC1", 2)], None);
                 e("V_MUL_LO_U16", "ENC_VOP3", &[("VDST", 3), ("SRC0", 256 + 2), ("SRC1", 30)], None);
