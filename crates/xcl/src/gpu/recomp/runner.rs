@@ -1462,7 +1462,7 @@ pub fn try_create_texture(desc: &D3D12_RESOURCE_DESC) -> Result<(), String> {
                 .CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() }, D3D12_HEAP_FLAG_NONE, desc, D3D12_RESOURCE_STATE_COMMON, None, &mut r)
                 .map_err(|x| format!("CreateCommittedResource: {x}"))
         }
-    })
+    }
 }
 
 /// A compute shader with the console dispatch ABI (`Mode::Compute`): `groups` thread groups,
