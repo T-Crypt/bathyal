@@ -933,7 +933,24 @@ unsafe fn read_own(at: usize, out: *mut u8, len: usize) -> bool {
 
 /// How long a destination page array that still holds a 0 entry at its request's turn waits
 /// for the title to fill it.
-const LATE_PAGE_WAIT_MS: u64 = 5;
+const LATE_PAGE_WAIT_MS: u64 = 250;
+
+/// Whether `n` bytes at `p` are committed, writable memory, given the same moment as a late
+/// page array: a retail title commits or unprotects a streaming destination from another
+/// thread around `Submit`, and during its world load (every CPU busy with pipeline builds) a
+/// request that checked once failed and left the title with nothing it never checks for.
+fn writable_soon(p: usize, n: usize) -> bool {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(LATE_PAGE_WAIT_MS);
+    loop {
+        if writable(p, n) {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
 
 /// The page numbers of a destination page array at its request's turn.
 ///
@@ -1049,7 +1066,11 @@ unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[us
             );
         }
     }
-    if !r.dest_physical_pages() && !writable(r.destination as usize, n) {
+    if !r.dest_physical_pages() && !writable_soon(r.destination as usize, n) {
+        warn_once(
+            "destination not writable",
+            format_args!("a request's destination {:#x} ({n} bytes) is not committed, writable memory after {LATE_PAGE_WAIT_MS} ms; it fails with E_ACCESS_VIOLATION", r.destination),
+        );
         return Err(E_ACCESS_VIOLATION);
     }
     let src: Vec<u8> = if r.memory_source() {
