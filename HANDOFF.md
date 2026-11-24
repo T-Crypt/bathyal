@@ -2014,3 +2014,21 @@ driver-chosen CPU mapping, neither of which is a window address. A title allocat
 have two addresses (its pointer and its GPU VA). Also `CreateCommandListX` constant buffers are
 read by translated shaders through `mem` at the console address, so blocking that needs the
 decided GPU page table (placeholders + relocation), not a heap type change.
+
+Measured (galaxy, RTX 4090, 2026-11-23): `GPUUploadHeapSupported` yes; a GPU_UPLOAD heap is
+created and mapped; 1 MB, 64 MB and 1 GB heaps mapped at the same 4 GiB block (window index 2
+of the console address model) and the same GPU VA region; a compute shader read what the CPU
+wrote through the mapping (test `gpu_upload_heap_cpu_writes_reach_a_compute_shader`). A title
+run with `XCL_GPU_UPLOAD=1` and one with `XCL_GPU_UPLOAD=0` both ended at the same device
+removal 0x887a0001 / exception in `game_scarlett_master.exe+0x2474606` (the known null
+depth-UAV removal on this base), so the flag changed no behaviour there.
+
+Next step for the streaming regions (not implemented): a *GPU_UPLOAD window*. Title code
+dereferences its allocation address and passes the same value as a GPU address, so the address
+must be the heap's CPU mapping M. Window `(M >> 32) & 3` then has to be the upload window, its
+shader base must be `H - low32(M)` (a root-/descriptor-UAV base below the resource; accesses
+land at `H + offset`, inside the heap buffer), and its console addresses are `M + offset`.
+That needs the console windows built *after* the heap (the mapping address is the driver's),
+one of the four window indices given up (8 GiB of sparse, or the coherent window), and every
+title allocation in it placed in the heap at its offset. When the title allocates before its
+D3D12 device exists, the windows are already fixed and this falls back.
