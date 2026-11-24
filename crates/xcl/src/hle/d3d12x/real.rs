@@ -5871,6 +5871,12 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
         .iter()
         .map(|&l| super::console_list::pc_list(l).or_else(|| super::title_list::backing(l)).unwrap_or(l))
         .collect();
+    // a list must have its queue's type: the PC removes the device (DXGI_ERROR_INVALID_CALL)
+    // when a list of another type is executed. Such a list is logged and left out.
+    let mapped = lists_of_the_queue_type(this, mapped);
+    if mapped.is_empty() {
+        return;
+    }
     super::list_x::note_queue_for_lists(this as usize, &mapped);
     // through the queue's gate: a held `Wait32/64BitValueX` never blocks this thread. The
     // upload of changed textures, the sparse readback, the bottom-of-pipe work and the present
@@ -5878,6 +5884,28 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
     let _ = f;
     super::list_x::submit_lists(this as usize, &mapped);
     stop_if_device_removed();
+}
+
+/// The lists of `mapped` whose type is the type of `queue`; the others are logged (the first
+/// 16, then every power of two) and dropped.
+unsafe fn lists_of_the_queue_type(queue: *mut c_void, mapped: Vec<*mut c_void>) -> Vec<*mut c_void> {
+    let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&queue) else { return mapped };
+    let qt = q.GetDesc().Type.0;
+    let mut kept = Vec::with_capacity(mapped.len());
+    for l in mapped {
+        let lt = ID3D12CommandList::from_raw_borrowed(&l).map(|c| c.GetType().0);
+        match lt {
+            Some(t) if t != qt => {
+                static N: AtomicU64 = AtomicU64::new(0);
+                let n = N.fetch_add(1, Ordering::Relaxed);
+                if n < 16 || (n + 1).is_power_of_two() {
+                    crate::xlog_warn!("D3D12.X: a type {t} command list {l:p} executed on a type {qt} queue {queue:p} – left out ({} so far)", n + 1);
+                }
+            }
+            _ => kept.push(l),
+        }
+    }
+    kept
 }
 
 /// Wait (up to 10 s) until the GPU has finished the work submitted to the queues console code
