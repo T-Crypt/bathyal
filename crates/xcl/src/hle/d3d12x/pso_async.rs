@@ -31,6 +31,9 @@ struct Pending {
     timed_out: std::sync::atomic::AtomicBool,
     /// the stand-in was released before the real pipeline was built
     orphan: std::sync::atomic::AtomicBool,
+    /// `complete` ran: the build is over for good and its ticket is closed (a failed build
+    /// keeps `real` 0, so a later draw of the stand-in must not count as outstanding work)
+    finished: std::sync::atomic::AtomicBool,
     /// its shaders are in the prewarm record (marked once)
     noted: std::sync::atomic::AtomicBool,
 }
@@ -45,11 +48,18 @@ impl Pending {
 static PENDING: Mutex<Option<HashMap<usize, Arc<Pending>>>> = Mutex::new(None);
 
 /// The build went to a worker (or is being built in a bind): show it in the pending report.
+/// A build that is over is not reported again: `resolve`, `resolve_wait` and `resolve_within`
+/// call this on every bind and draw of a stand-in, and one whose build ended (or failed) would
+/// otherwise open a ticket no worker will ever finish.
 fn note_building(p: &Pending) {
     if !crate::pending::enabled() {
         return;
     }
     let mut t = p.ticket.lock().unwrap();
+    // under the ticket lock, where `complete` sets it: a build that ends now leaves no ticket
+    if p.finished.load(Ordering::Acquire) {
+        return;
+    }
     if t.is_none() {
         *t = Some(crate::pending::begin(
             crate::pending::Kind::PsoBuild,
@@ -60,8 +70,13 @@ fn note_building(p: &Pending) {
 
 /// The build is done (`real`: its pipeline, 0 = failed).
 fn complete(p: &Pending, real: usize) {
-    // the build is over: the pending-work report forgets it
-    p.ticket.lock().unwrap().take();
+    // the build is over: the pending-work report forgets it, and a later bind or draw of the
+    // stand-in does not report it again
+    {
+        let mut ticket = p.ticket.lock().unwrap();
+        p.finished.store(true, Ordering::Release);
+        ticket.take();
+    }
     if real == 0 {
         FAILED.fetch_add(1, Ordering::Relaxed);
     } else {
@@ -176,6 +191,7 @@ fn submit_as(standin: usize, compute: bool, job: Job, send: bool) {
         compute,
         timed_out: Default::default(),
         orphan: Default::default(),
+        finished: Default::default(),
         noted: Default::default(),
     });
     PENDING.lock().unwrap().get_or_insert_with(HashMap::new).insert(standin, p.clone());
@@ -872,6 +888,53 @@ mod tests {
         assert_eq!(resolve_within(standin, Some(Duration::from_millis(400)), 1, &b), real);
         assert!(t.elapsed() < Duration::from_millis(400), "first draw waited {:?}", t.elapsed());
         let _ = released(standin);
+    }
+
+    /// The pending report is off unless a run asks for it: a test that counts tickets turns it
+    /// on, and off again when it ends.
+    struct Reporting;
+
+    impl Reporting {
+        fn on() -> Reporting {
+            crate::pending::set_enabled(true);
+            Reporting
+        }
+    }
+
+    impl Drop for Reporting {
+        fn drop(&mut self) {
+            crate::pending::set_enabled(false);
+        }
+    }
+
+    fn pso_reports(standin: usize) -> usize {
+        crate::pending::count_matching(crate::pending::Kind::PsoBuild, standin as u64)
+    }
+
+    /// A build that is over is not reported again. `complete` closes its ticket, but every
+    /// later `resolve_within` (each draw) and `resolve` (a stand-in whose build failed keeps
+    /// `real` 0) went on through `note_building`, which opened a fresh ticket that no worker
+    /// would ever finish: a loading screen draws the same handful of pipelines every frame, so
+    /// the report showed that many pipeline builds outstanding for the rest of the run while
+    /// the builds themselves were done.
+    #[test]
+    fn a_build_that_is_over_is_not_reported_again() {
+        let _reporting = Reporting::on();
+        let b = budget();
+        // built: the draws after it is built use the real pipeline and leave nothing behind
+        let (built, built_real) = (0x7410_00b1usize, 0x7410_00b2usize);
+        submit_lazy(built, false, Box::new(move || built_real));
+        assert_eq!(resolve_within(built, Some(Duration::from_secs(5)), 1, &b), built_real);
+        assert_eq!(resolve_within(built, Some(Duration::from_millis(200)), 2, &b), built_real);
+        assert_eq!(pso_reports(built), 0, "a build that is over is not outstanding work");
+        // failed: the stand-in keeps being drawn and bound, and nothing is building
+        let failed = 0x7410_00b3usize;
+        submit_lazy(failed, false, Box::new(|| 0));
+        assert_eq!(resolve_within(failed, Some(Duration::from_secs(5)), 3, &b), failed);
+        assert_eq!(resolve(failed), failed);
+        assert_eq!(pso_reports(failed), 0, "a failed build is not outstanding work");
+        let _ = released(built);
+        let _ = released(failed);
     }
 
     /// The pool: NVIDIA gets the measured best count, everything else keeps a worker per core
