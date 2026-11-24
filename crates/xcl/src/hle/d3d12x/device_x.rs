@@ -944,7 +944,7 @@ pub(super) unsafe fn format_support1(this: *mut c_void, format: u32) -> Option<u
     let dev = ID3D12Device::from_raw_borrowed(&this)?;
     let mut d = D3D12_FEATURE_DATA_FORMAT_SUPPORT { Format: DXGI_FORMAT(format as i32), Support1: D3D12_FORMAT_SUPPORT1(0), Support2: D3D12_FORMAT_SUPPORT2(0) };
     dev.CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &mut d as *mut _ as *mut c_void, std::mem::size_of_val(&d) as u32).ok()?;
-    Some(d.Support1.0 as u32)
+    Some(d.Support1.0)
 }
 
 /// device #108 (a retail game) GetResourceAllocationInfo2(visible mask, count, D3D12_RESOURCE_DESC1s,
