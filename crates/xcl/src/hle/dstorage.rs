@@ -2088,7 +2088,7 @@ mod tests {
     fn a_destination_page_filled_in_after_submit() {
         use crate::hle::kernelx::{AllocateTitlePhysicalPages, FreeTitlePhysicalPages, MapTitlePhysicalPages, PHYS_PAGE_SIZE};
         use std::sync::atomic::{AtomicBool, Ordering};
-        use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_DECOMMIT, MEM_RESERVE, PAGE_READWRITE};
+        use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_DECOMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE};
         /// the source is freed and reused by the title while the queue works through its requests
         const REQUESTS: u32 = 20_000;
         if crate::gpu::uma::get().is_none() {

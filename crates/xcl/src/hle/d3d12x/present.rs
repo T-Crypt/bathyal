@@ -641,7 +641,7 @@ unsafe fn ensure_swapchain(p: &mut Presenter, hwnd: HWND, w: u32, h: u32, fmt: D
                 p.fmt = fmt;
                 p.resize_failed = None;
                 crate::xlog_info!("present: swap chain {w}x{h} {:?}", fmt);
-                let _ = configure_color_space(sc, fmt);
+                let _ = configure_color_space(&sc, fmt);
                 return true;
             }
             Err(e) => {
