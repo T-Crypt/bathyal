@@ -549,7 +549,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let key = 0x7410_0000_0000_00e5u64;
         let compiles = std::cell::Cell::new(0u32);
-        let mut create = |key: u64| -> Vec<u8> {
+        let create = |key: u64| -> Vec<u8> {
             if let Some(blob) = load_in(&dir, key) {
                 return blob;
             }
