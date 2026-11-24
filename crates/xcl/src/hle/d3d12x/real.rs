@@ -1256,13 +1256,12 @@ fn resource_dim_to_view(r: &D3D12_RESOURCE_DESC) -> i32 {
                 2
             }
         }
-        D3D12_RESOURCE_DIMENSION_TEXTURE2D => {
-            if r.DepthOrArraySize > 1 {
-                5
-            } else {
-                4
-            }
-        }
+        D3D12_RESOURCE_DIMENSION_TEXTURE2D => match (r.SampleDesc.Count > 1, r.DepthOrArraySize > 1) {
+            (true, true) => 7,
+            (true, false) => 6,
+            (false, true) => 5,
+            (false, false) => 4,
+        },
         D3D12_RESOURCE_DIMENSION_TEXTURE3D => 8,
         _ => 1,
     }
@@ -2225,12 +2224,23 @@ fn pc_srv(created: Option<u32>, rd: &D3D12_RESOURCE_DESC, v: Option<&D3D12_SHADE
                 Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
                 ..Default::default()
             };
-            if rd.DepthOrArraySize > 1 {
-                v.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
-                v.Anonymous.Texture2DArray = D3D12_TEX2D_ARRAY_SRV { MipLevels: u32::MAX, ArraySize: rd.DepthOrArraySize as u32, ..Default::default() };
-            } else {
-                v.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-                v.Anonymous.Texture2D = D3D12_TEX2D_SRV { MipLevels: u32::MAX, ..Default::default() };
+            let slices = u32::from(rd.DepthOrArraySize);
+            // a multisampled depth buffer has only the MS view dimensions
+            match (rd.SampleDesc.Count > 1, slices > 1) {
+                (true, true) => {
+                    v.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY;
+                    v.Anonymous.Texture2DMSArray = D3D12_TEX2DMS_ARRAY_SRV { FirstArraySlice: 0, ArraySize: slices };
+                }
+                (true, false) => v.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DMS,
+                (false, true) => {
+                    v.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+                    v.Anonymous.Texture2DArray = D3D12_TEX2D_ARRAY_SRV { MipLevels: u32::MAX, ArraySize: slices, ..Default::default() };
+                }
+                (false, false) => {
+                    v.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+                    v.Anonymous.Texture2D = D3D12_TEX2D_SRV { MipLevels: u32::MAX, ..Default::default() };
+                }
+            }
             }
             v
         }
@@ -6699,6 +6709,43 @@ mod srv_tests {
         let mut d2 = cube;
         d2.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
         assert!(cube_as_cube_array(&d2).is_none());
+    }
+
+    #[test]
+    fn a_default_view_of_a_depth_buffer_matches_its_sample_count_and_array_size() {
+        use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R24_UNORM_X8_TYPELESS, DXGI_FORMAT_R24G8_TYPELESS, DXGI_SAMPLE_DESC};
+        for (samples, slices, dimension, dim) in [
+            (1, 1, D3D12_SRV_DIMENSION_TEXTURE2D, 4),
+            (1, 3, D3D12_SRV_DIMENSION_TEXTURE2DARRAY, 5),
+            (4, 1, D3D12_SRV_DIMENSION_TEXTURE2DMS, 6),
+            (4, 3, D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY, 7),
+        ] {
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                DepthOrArraySize: slices,
+                MipLevels: 1,
+                Format: DXGI_FORMAT_R24G8_TYPELESS,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: samples, Quality: 0 },
+                ..Default::default()
+            };
+            let v = pc_srv(&desc, None).expect("a typeless depth buffer gets a view of its own");
+            assert_eq!(v.Format, DXGI_FORMAT_R24_UNORM_X8_TYPELESS);
+            assert_eq!(v.ViewDimension, dimension, "{samples} samples, {slices} slices");
+            let a = &v.Anonymous;
+            match dimension {
+                D3D12_SRV_DIMENSION_TEXTURE2D => assert_eq!(unsafe { a.Texture2D.MipLevels }, u32::MAX),
+                D3D12_SRV_DIMENSION_TEXTURE2DARRAY => {
+                    assert_eq!(unsafe { (a.Texture2DArray.FirstArraySlice, a.Texture2DArray.ArraySize, a.Texture2DArray.MipLevels) }, (0, u32::from(slices), u32::MAX))
+                }
+                D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY => {
+                    assert_eq!(unsafe { (a.Texture2DMSArray.FirstArraySlice, a.Texture2DMSArray.ArraySize) }, (0, u32::from(slices)))
+                }
+                _ => {}
+            }
+            // the console view (T#) of the resource without a description
+            assert_eq!(resource_dim_to_view(&desc), dim, "{samples} samples, {slices} slices");
+            assert_eq!(v.ViewDimension.0, dim);
+        }
     }
 }
 
