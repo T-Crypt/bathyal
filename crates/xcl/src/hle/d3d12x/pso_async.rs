@@ -8,9 +8,10 @@
 //! for at its first bind (a skipped dispatch would corrupt what it computes).
 //! `XCL_ASYNC_PSO=0` builds every pipeline in the call, as before.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 struct Pending {
     /// the build, until a worker – or a bind that cannot wait for the queue – takes it
@@ -69,66 +70,48 @@ pub fn enabled() -> bool {
 /// Builds the real pipeline: its raw pointer, 0 = failed.
 pub type Job = Box<dyn FnOnce() -> usize + Send>;
 
-struct WorkQueue<T> {
-    gfx: VecDeque<T>,
-    compute: VecDeque<T>,
+fn spawn_pool(prefix: &str, threads: usize) -> Mutex<mpsc::Sender<Arc<Pending>>> {
+    let (tx, rx) = mpsc::channel::<Arc<Pending>>();
+    let rx = Arc::new(Mutex::new(rx));
+    // translation recurses deeply on big programs; DXC itself runs on its own pool
+    for k in 0..threads {
+        let rx = rx.clone();
+        let _ = std::thread::Builder::new().name(format!("{prefix}-{k}")).stack_size(64 << 20).spawn(move || loop {
+            let next = rx.lock().unwrap().recv();
+            let Ok(p) = next else { return };
+            // (None: a bind took it and builds it itself)
+            let job = p.job.lock().unwrap().take();
+            if let Some(job) = job {
+                complete(&p, job());
+            }
+        });
+    }
+    Mutex::new(tx)
 }
 
-impl<T> WorkQueue<T> {
-    fn new() -> Self {
-        Self { gfx: VecDeque::new(), compute: VecDeque::new() }
-    }
+fn queue() -> &'static Mutex<mpsc::Sender<Arc<Pending>>> {
+    static Q: OnceLock<Mutex<mpsc::Sender<Arc<Pending>>>> = OnceLock::new();
+    Q.get_or_init(|| spawn_pool("xcl-pso", crate::gpu::recomp::dxc::compile_threads()))
+}
 
-    fn push(&mut self, compute: bool, item: T) {
-        if compute {
-            self.compute.push_back(item);
-        } else {
-            self.gfx.push_back(item);
+/// Dedicated worker pool for compute pipelines so a backlog (or driver stall, #156) of graphics
+/// builds cannot starve compute dispatches indefinitely.
+fn compute_queue() -> &'static Mutex<mpsc::Sender<Arc<Pending>>> {
+    static Q: OnceLock<Mutex<mpsc::Sender<Arc<Pending>>>> = OnceLock::new();
+    Q.get_or_init(|| spawn_pool("xcl-pso-compute", (crate::gpu::recomp::dxc::compile_threads() / 2).clamp(1, 4)))
+}
+
+/// Send `p` to its worker pool if not already sent; clears `sent` on failure so a later bind
+/// can retry instead of stalling forever.
+fn enqueue(p: &Arc<Pending>) -> bool {
+    if !p.sent.swap(true, Ordering::AcqRel) {
+        let q = if p.compute { compute_queue() } else { queue() };
+        if q.lock().unwrap().send(p.clone()).is_err() {
+            p.sent.store(false, Ordering::Release);
+            return false;
         }
     }
-
-    fn pop_next(&mut self) -> Option<T> {
-        self.gfx.pop_front().or_else(|| self.compute.pop_front())
-    }
-}
-
-struct Pool {
-    q: Mutex<WorkQueue<Arc<Pending>>>,
-    cv: Condvar,
-}
-
-fn pool() -> &'static Arc<Pool> {
-    static Q: OnceLock<Arc<Pool>> = OnceLock::new();
-    Q.get_or_init(|| {
-        let p = Arc::new(Pool { q: Mutex::new(WorkQueue::new()), cv: Condvar::new() });
-        let n = crate::gpu::recomp::dxc::compile_threads();
-        for k in 0..n {
-            let p = p.clone();
-            let _ = std::thread::Builder::new().name(format!("xcl-pso-{k}")).stack_size(64 << 20).spawn(move || loop {
-                let next = {
-                    let mut q = p.q.lock().unwrap();
-                    loop {
-                        if let Some(item) = q.pop_next() {
-                            break item;
-                        }
-                        q = p.cv.wait(q).unwrap();
-                    }
-                };
-                let job = next.job.lock().unwrap().take();
-                if let Some(job) = job {
-                    complete(&next, job());
-                }
-            });
-        }
-        p
-    })
-}
-
-fn enqueue(p: Arc<Pending>) {
-    let pool = pool();
-    let mut q = pool.q.lock().unwrap();
-    q.push(p.compute, p);
-    pool.cv.notify_one();
+    true
 }
 
 /// Release a pipeline state XCL owns (raw pointer, 0 = none).
@@ -175,7 +158,7 @@ fn submit_as(standin: usize, compute: bool, job: Job, send: bool) {
         crate::xlog_info!("D3D12.X: pipelines whose shaders are not compiled yet get a stand-in and are built in the background");
     });
     if send {
-        enqueue(p);
+        let _ = enqueue(&p);
     }
 }
 
@@ -189,9 +172,7 @@ pub fn resolve(pso: usize) -> usize {
     match p.real.load(Ordering::Acquire) {
         0 => {
             // a lazy one is wanted now: to the workers
-            if !p.sent.swap(true, Ordering::AcqRel) {
-                enqueue(p);
-            }
+            let _ = enqueue(&p);
             pso
         }
         r => r,
@@ -381,8 +362,8 @@ fn resolve_compute_within(pso: usize, limit: Option<std::time::Duration>, budget
     if let r @ 1.. = p.real.load(Ordering::Acquire) {
         return r;
     }
-    if !p.sent.swap(true, Ordering::AcqRel) {
-        enqueue(p.clone());
+    if !enqueue(&p) {
+        return pso;
     }
     if p.timed_out.load(Ordering::Acquire) {
         return match p.real.load(Ordering::Acquire) {
@@ -569,90 +550,208 @@ pub fn counts() -> (usize, usize, usize) {
     (BUILT.load(Ordering::Relaxed), FAILED.load(Ordering::Relaxed), pending)
 }
 
+/// Failed builds and builds actually started or sent to workers, excluding dormant lazy pipelines.
+pub fn activity() -> (usize, usize) {
+    let active = PENDING.lock().unwrap().as_ref().map_or(0, |m| {
+        m.values().filter(|p| p.is_active()).count()
+    });
+    (FAILED.load(Ordering::Relaxed), active)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::mpsc;
-    use std::time::Duration;
 
+    fn budget() -> Mutex<DrawWait> {
+        Mutex::new(DrawWait { epoch: 0, spent: Duration::ZERO })
+    }
+
+    /// A graphics build that does not finish (an NVIDIA driver compile of minutes, #156) holds a
+    /// draw only up to the limit, once until the next present, and runs on a worker. With
+    /// `resolve_wait` the draw waited for it without limit (building it itself when no worker
+    /// had taken it), which held the title past its hang watchdog.
     #[test]
-    fn graphics_jobs_dequeue_ahead_of_queued_compute_jobs() {
-        let mut q = WorkQueue::new();
-        q.push(true, "c1");
-        q.push(true, "c2");
-        q.push(false, "g1");
-        q.push(true, "c3");
-        q.push(false, "g2");
-        assert_eq!(q.pop_next(), Some("g1"));
-        assert_eq!(q.pop_next(), Some("g2"));
-        assert_eq!(q.pop_next(), Some("c1"));
-        assert_eq!(q.pop_next(), Some("c2"));
-        assert_eq!(q.pop_next(), Some("c3"));
-        assert_eq!(q.pop_next(), None);
+    fn a_draw_waits_for_a_graphics_build_only_within_the_limit_and_never_builds_it_itself() {
+        let (standin, real) = (0x7410_0001usize, 0x7410_0002usize);
+        let (go_tx, go_rx) = mpsc::channel::<()>();
+        let (who_tx, who_rx) = mpsc::channel::<Option<String>>();
+        submit_lazy(
+            standin,
+            false,
+            Box::new(move || {
+                let _ = who_tx.send(std::thread::current().name().map(str::to_string));
+                let _ = go_rx.recv();
+                real
+            }),
+        );
+        let b = budget();
+        let limit = Some(Duration::from_millis(300));
+        let t = Instant::now();
+        assert_eq!(resolve_within(standin, limit, 1, &b), standin, "drawn with the stand-in");
+        let took = t.elapsed();
+        assert!(took >= Duration::from_millis(290) && took < Duration::from_secs(5), "waited {took:?}");
+        let who = who_rx.recv_timeout(Duration::from_secs(5)).expect("the build went to a worker");
+        assert!(who.as_deref().is_some_and(|n| n.starts_with("xcl-pso")), "built on {who:?}");
+        // the limit is spent until the next present: the next draw does not wait
+        let t = Instant::now();
+        assert_eq!(resolve_within(standin, limit, 1, &b), standin);
+        assert!(t.elapsed() < Duration::from_millis(200), "waited {:?} with the limit spent", t.elapsed());
+        assert!(is_pending(standin));
+        // after the next present, once built: the real pipeline
+        go_tx.send(()).unwrap();
+        assert_eq!(resolve_within(standin, Some(Duration::from_secs(10)), 2, &b), real);
+        assert!(!is_pending(standin));
+        let _ = released(standin);
+    }
+
+    /// Compute pipelines are still waited for (a skipped dispatch corrupts its results), and
+    /// `XCL_PSO_WAIT_MS=0` (no limit) waits for graphics ones as before.
+    #[test]
+    fn compute_pipelines_and_no_limit_wait_as_before() {
+        let b = budget();
+        let (c, c_real) = (0x7410_0011usize, 0x7410_0012usize);
+        submit_lazy(
+            c,
+            true,
+            Box::new(move || {
+                std::thread::sleep(Duration::from_millis(100));
+                c_real
+            }),
+        );
+        assert_eq!(resolve_within(c, Some(Duration::ZERO), 1, &b), c_real);
+        let (g, g_real) = (0x7410_0021usize, 0x7410_0022usize);
+        submit_lazy(g, false, Box::new(move || g_real));
+        assert_eq!(resolve_within(g, None, 1, &b), g_real);
+        assert_eq!(resolve_within(0x7410_0031, Some(Duration::ZERO), 1, &b), 0x7410_0031, "not a stand-in");
+        let _ = released(c);
+        let _ = released(g);
     }
 
     #[test]
-    fn worker_pool_prioritizes_graphics_pipeline_over_queued_compute() {
-        let n = crate::gpu::recomp::dxc::compile_threads();
-        let (started_tx, started_rx) = mpsc::channel::<usize>();
-        let mut gates = Vec::with_capacity(n);
-        let mut blockers = Vec::with_capacity(n);
-        for i in 0..n {
-            let id = 0x7600_0001usize + i * 2;
-            let (tx, rx) = mpsc::channel::<()>();
-            let stx = started_tx.clone();
-            submit(
-                id,
-                true,
-                Box::new(move || {
-                    let _ = stx.send(id);
-                    let _ = rx.recv_timeout(Duration::from_secs(10));
-                    id + 1
-                }),
-            );
-            gates.push(tx);
-            blockers.push(id);
-        }
-        for _ in 0..n {
-            started_rx.recv_timeout(Duration::from_secs(5)).expect("worker started blocker");
-        }
-        let (order_tx, order_rx) = mpsc::channel::<&'static str>();
-        let compute_id = 0x7601_0001usize;
-        let graphics_id = 0x7601_0003usize;
-        let ctx = order_tx.clone();
-        let (c_release_tx, c_release_rx) = mpsc::channel::<()>();
-        submit(
-            compute_id,
+    fn lazy_pipeline_is_active_only_after_its_build_starts() {
+        let standin = usize::MAX - 1000;
+        submit_lazy(standin, true, Box::new(move || {
+            let p = entry(standin).unwrap();
+            assert!(p.is_active());
+            0
+        }));
+        let p = entry(standin).unwrap();
+        assert!(!p.is_active());
+        assert_eq!(resolve_wait(standin), standin);
+        assert!(!p.is_active());
+        assert_eq!(released(standin), 0);
+    }
+
+    #[test]
+    fn bounded_compute_wait_times_out_then_resolves_once_worker_finishes() {
+        let standin = 0x7300_0001usize;
+        let real_pso = 0x7300_0002usize;
+        let budget = FrameBudget::new();
+        let (tx, rx) = mpsc::channel::<()>();
+        submit_lazy(
+            standin,
             true,
             Box::new(move || {
-                let _ = ctx.send("compute");
-                let _ = c_release_rx.recv_timeout(Duration::from_secs(5));
-                compute_id + 1
+                let _ = rx.recv_timeout(Duration::from_secs(5));
+                real_pso
             }),
         );
-        let gtx = order_tx.clone();
-        submit(
-            graphics_id,
-            false,
+
+        // First call sends the lazy build to the compute worker pool and returns the stand-in after ~limit.
+        let t0 = Instant::now();
+        assert_eq!(resolve_compute_within(standin, Some(Duration::from_millis(60)), &budget), standin);
+        assert!(t0.elapsed() < Duration::from_secs(1), "bounded wait must not block indefinitely");
+        assert!(is_pending_compute(standin));
+
+        // Subsequent calls while still building return immediately (even on a fresh frame budget).
+        budget.reset();
+        let t1 = Instant::now();
+        assert_eq!(resolve_compute_within(standin, Some(Duration::from_secs(2)), &budget), standin);
+        assert!(t1.elapsed() < Duration::from_millis(200), "post-timeout calls must return immediately");
+
+        // Unblock the background worker; once complete, resolution immediately returns the real PSO.
+        tx.send(()).unwrap();
+        let wait = Instant::now();
+        while resolve_compute_within(standin, Some(Duration::from_millis(50)), &budget) != real_pso {
+            assert!(wait.elapsed() < Duration::from_secs(5), "background compute PSO never completed");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!is_pending_compute(standin));
+        assert_eq!(released(standin), real_pso);
+    }
+
+    #[test]
+    fn bounded_compute_wait_returns_real_when_build_finishes_in_time() {
+        let standin = 0x7300_0003usize;
+        let real_pso = 0x7300_0004usize;
+        let budget = FrameBudget::new();
+        let (name_tx, name_rx) = mpsc::channel::<String>();
+        submit_lazy(
+            standin,
+            true,
             Box::new(move || {
-                let _ = gtx.send("graphics");
-                graphics_id + 1
+                let _ = name_tx.send(std::thread::current().name().unwrap_or("").to_string());
+                real_pso
             }),
         );
-        gates[0].send(()).unwrap();
-        assert_eq!(order_rx.recv_timeout(Duration::from_secs(5)).unwrap(), "graphics");
-        for g in &gates[1..] {
-            let _ = g.send(());
+        assert_eq!(resolve_compute_within(standin, Some(Duration::from_secs(4)), &budget), real_pso);
+        let worker_name = name_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(
+            worker_name.starts_with("xcl-pso-compute-"),
+            "compute pipelines must run on dedicated compute workers, got {worker_name:?}"
+        );
+        assert_eq!(released(standin), real_pso);
+    }
+
+    #[test]
+    fn bounded_compute_wait_shares_per_frame_budget_across_pipelines() {
+        let standin_a = 0x7300_0005usize;
+        let real_a = 0x7300_0006usize;
+        let standin_b = 0x7300_0007usize;
+        let real_b = 0x7300_0008usize;
+        let budget = FrameBudget::new();
+        let (tx_a, rx_a) = mpsc::channel::<()>();
+        let (tx_b, rx_b) = mpsc::channel::<()>();
+        submit_lazy(
+            standin_a,
+            true,
+            Box::new(move || {
+                let _ = rx_a.recv_timeout(Duration::from_secs(5));
+                real_a
+            }),
+        );
+        submit_lazy(
+            standin_b,
+            true,
+            Box::new(move || {
+                let _ = rx_b.recv_timeout(Duration::from_secs(5));
+                real_b
+            }),
+        );
+
+        // First slow pipeline consumes the entire 60 ms frame budget.
+        assert_eq!(resolve_compute_within(standin_a, Some(Duration::from_millis(60)), &budget), standin_a);
+
+        // Second uncached pipeline in the same frame is queued but does NOT stall for another 60 ms.
+        let t_b = Instant::now();
+        assert_eq!(resolve_compute_within(standin_b, Some(Duration::from_millis(60)), &budget), standin_b);
+        assert!(
+            t_b.elapsed() < Duration::from_millis(20),
+            "second pipeline in exhausted frame must not multiply wait time"
+        );
+
+        // Next frame refreshes the budget; once `b` finishes, waiting on it resolves `real_b`.
+        budget.reset();
+        tx_b.send(()).unwrap();
+        assert_eq!(resolve_compute_within(standin_b, Some(Duration::from_secs(4)), &budget), real_b);
+
+        tx_a.send(()).unwrap();
+        let wait = Instant::now();
+        while resolve_compute_within(standin_a, Some(Duration::from_millis(50)), &budget) != real_a {
+            assert!(wait.elapsed() < Duration::from_secs(5), "background compute PSO A never completed");
+            std::thread::sleep(Duration::from_millis(10));
         }
-        let _ = c_release_tx.send(());
-        assert_eq!(order_rx.recv_timeout(Duration::from_secs(5)).unwrap(), "compute");
-        assert_eq!(resolve_wait(graphics_id), graphics_id + 1);
-        assert_eq!(resolve_wait(compute_id), compute_id + 1);
-        for id in blockers {
-            assert_eq!(resolve_wait(id), id + 1);
-            let _ = released(id);
-        }
-        let _ = released(compute_id);
-        let _ = released(graphics_id);
+        assert_eq!(released(standin_a), real_a);
+        assert_eq!(released(standin_b), real_b);
     }
 }
