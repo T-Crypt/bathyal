@@ -823,7 +823,8 @@ unsafe extern "system" fn factory_create_status_array(_p: *mut c_void, capacity:
     if capacity == 0 || capacity > 1 << 20 {
         return E_INVALIDARG;
     }
-    let inner = Arc::new(StatusInner { id: NEXT_STATUS_ID.fetch_add(1, Ordering::Relaxed), slots: (0..capacity).map(|_| AtomicI32::new(E_PENDING)).collect() });
+    // a slot nothing was enqueued into is complete (S_OK); EnqueueStatus makes it E_PENDING
+    let inner = Arc::new(StatusInner { id: NEXT_STATUS_ID.fetch_add(1, Ordering::Relaxed), slots: (0..capacity).map(|_| AtomicI32::new(S_OK)).collect() });
     let o = new_object(status_vtbl(), inner);
     let hr = status_qi(o, riid, out);
     status_release(o);
@@ -2555,6 +2556,23 @@ mod tests {
             assert!(queue(q).worker.lock().unwrap().is_none());
 
             queue_release(q);
+            status_release(s);
+        }
+    }
+
+    /// A slot nothing was enqueued into is complete with S_OK, so a title that waits for
+    /// IsComplete before (re)using a slot does not wait forever on its first use.
+    #[test]
+    fn a_new_status_array_slot_is_complete() {
+        unsafe {
+            let mut f = std::ptr::null_mut();
+            assert_eq!(DStorageGetFactory(&IID_FACTORY, &mut f), S_OK);
+            let vt = *(f as *const *const usize);
+            let create_status: unsafe extern "system" fn(*mut c_void, u32, *const u8, *const GUID, *mut *mut c_void) -> HRESULT = std::mem::transmute(*vt.add(5));
+            let mut s = std::ptr::null_mut();
+            assert_eq!(create_status(f, 4, std::ptr::null(), &IID_STATUS_ARRAY, &mut s), S_OK);
+            assert!(status_is_complete(s, 3));
+            assert_eq!(status_get_hresult(s, 3), S_OK);
             status_release(s);
         }
     }
