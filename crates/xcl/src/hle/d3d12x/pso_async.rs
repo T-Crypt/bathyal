@@ -14,6 +14,10 @@ use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 struct Pending {
+    /// the stand-in address the title knows the pipeline by
+    standin: usize,
+    /// the pending-work report forgets the build when this drops
+    ticket: Mutex<Option<crate::pending::Ticket>>,
     /// the build, until a worker – or a bind that cannot wait for the queue – takes it
     job: Mutex<Option<Job>>,
     /// the build went to the workers (a lazy one goes on its first `resolve`)
@@ -36,8 +40,24 @@ impl Pending {
 /// stand-in handed to the title → its real pipeline
 static PENDING: Mutex<Option<HashMap<usize, Arc<Pending>>>> = Mutex::new(None);
 
+/// The build went to a worker (or is being built in a bind): show it in the pending report.
+fn note_building(p: &Pending) {
+    if !crate::pending::enabled() {
+        return;
+    }
+    let mut t = p.ticket.lock().unwrap();
+    if t.is_none() {
+        *t = Some(crate::pending::begin(
+            crate::pending::Kind::PsoBuild,
+            crate::pending::Meta { size: p.standin as u64, extra: if p.compute { 1 } else { 0 }, ..Default::default() },
+        ));
+    }
+}
+
 /// The build is done (`real`: its pipeline, 0 = failed).
 fn complete(p: &Pending, real: usize) {
+    // the build is over: the pending-work report forgets it
+    p.ticket.lock().unwrap().take();
     if real == 0 {
         FAILED.fetch_add(1, Ordering::Relaxed);
     } else {
@@ -120,6 +140,8 @@ pub fn submit_lazy(standin: usize, compute: bool, job: Job) {
 
 fn submit_as(standin: usize, compute: bool, job: Job, send: bool) {
     let p = Arc::new(Pending {
+        standin,
+        ticket: Mutex::new(None),
         job: Mutex::new(Some(job)),
         sent: std::sync::atomic::AtomicBool::new(send),
         real: AtomicUsize::new(0),
@@ -134,6 +156,7 @@ fn submit_as(standin: usize, compute: bool, job: Job, send: bool) {
         crate::xlog_info!("D3D12.X: pipelines whose shaders are not compiled yet get a stand-in and are built in the background");
     });
     if send {
+        note_building(&p);
         let _ = queue().lock().unwrap().send(p);
     }
 }
@@ -149,6 +172,7 @@ pub fn resolve(pso: usize) -> usize {
         0 => {
             // a lazy one is wanted now: to the workers
             if !p.sent.swap(true, Ordering::AcqRel) {
+                note_building(&p);
                 let _ = queue().lock().unwrap().send(p);
             }
             pso
@@ -163,6 +187,7 @@ pub fn resolve_wait(pso: usize) -> usize {
     let Some(p) = entry(pso) else { return pso };
     let start = Instant::now();
     p.sent.store(true, Ordering::Release);
+    note_building(&p);
     let job = p.job.lock().unwrap().take();
     let here = job.is_some();
     if let Some(job) = job {
@@ -240,6 +265,7 @@ fn resolve_within(pso: usize, limit: Option<Duration>, epoch: u64, budget: &Mute
     };
     // to the workers (a lazy one has not gone yet)
     if !p.sent.swap(true, Ordering::AcqRel) {
+        note_building(&p);
         let _ = queue().lock().unwrap().send(p.clone());
     }
     let start = Instant::now();
