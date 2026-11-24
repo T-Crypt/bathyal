@@ -1,11 +1,16 @@
-//! Driver pipeline blobs (`ID3D12PipelineState::GetCachedBlob`).
+//! Driver pipeline blobs (`ID3D12PipelineState::GetCachedBlob`) and the prewarm record.
 //!
 //! Translating a console shader is cached as DXIL. The driver then compiles that DXIL again
 //! on every launch. A blob from `GetCachedBlob` is that compile: the next
 //! `Create*PipelineState` passes it in `CachedPSO` and the driver skips the work when the
 //! blob still matches this device. A driver update rejects the blob; the caller drops the
-//! file and compiles again.
+//! file and compiles again, and this module starts the run with an empty library.
+//!
+//! The console shaders a pipeline was drawn with are written to `drawn.txt` beside the blobs.
+//! The next run builds those pipelines while the title loads instead of at their first use
+//! (`pso_async::build_during_load`).
 
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
@@ -55,6 +60,10 @@ fn path_for(dir: &Path, key: u64) -> PathBuf {
     dir.join(format!("{key:016x}.blob"))
 }
 
+fn drawn_path(dir: &Path) -> PathBuf {
+    dir.join("drawn.txt")
+}
+
 fn payload(file: &[u8]) -> Option<&[u8]> {
     if file.len() < 8 || &file[..4] != MAGIC || u32::from_le_bytes(file[4..8].try_into().ok()?) != VERSION {
         return None;
@@ -68,19 +77,27 @@ pub fn load(key: u64) -> Option<std::sync::Arc<Vec<u8>>> {
     if let Some(hit) = memory().lock().unwrap().get(&key).cloned() {
         return Some(hit);
     }
-    let bytes = std::fs::read(path_for(&dir(), key)).ok()?;
-    let blob = payload(&bytes)?.to_vec();
-    let blob = std::sync::Arc::new(blob);
+    let blob = std::sync::Arc::new(load_in(&dir(), key)?);
     memory().lock().unwrap().insert(key, blob.clone());
     Some(blob)
 }
 
+/// A blob read from the library in `dir` (no in-memory cache: what a fresh run sees).
+fn load_in(dir: &Path, key: u64) -> Option<Vec<u8>> {
+    let bytes = std::fs::read(path_for(dir, key)).ok()?;
+    payload(&bytes).map(<[u8]>::to_vec)
+}
+
 fn write_file(key: u64, blob: &[u8]) {
-    let dir = dir();
-    if std::fs::create_dir_all(&dir).is_err() {
+    save_in(&dir(), key, blob);
+}
+
+/// Write a blob into the library in `dir`, unless the same bytes are there already.
+fn save_in(dir: &Path, key: u64, blob: &[u8]) {
+    if std::fs::create_dir_all(dir).is_err() {
         return;
     }
-    let path = path_for(&dir, key);
+    let path = path_for(dir, key);
     if std::fs::read(&path).ok().and_then(|b| payload(&b).map(|p| p == blob)).unwrap_or(false) {
         return;
     }
@@ -123,6 +140,172 @@ pub fn store(key: u64, blob: &[u8]) {
 pub fn forget(key: u64) {
     memory().lock().unwrap().remove(&key);
     let _ = std::fs::remove_file(path_for(&dir(), key));
+}
+
+/// The device refused a saved blob. A new driver refuses the others too, so the blobs this
+/// run has read go with it and the library starts empty; the run logs it once.
+pub fn rejected(key: u64) {
+    forget(key);
+    memory().lock().unwrap().clear();
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        crate::xlog_warn!(
+            "D3D12.X: the device refused a saved pipeline blob – pipelines are compiled again this run; delete the pipeline library folder to start clean (XCL_PSO_CACHE names it)"
+        );
+    });
+}
+
+/// Identity of the console shaders a pipeline is built from: what the next run greets a
+/// deferred pipeline by, before it is translated (the driver blob's key needs the DXIL, which
+/// does not exist yet then). `blobs` is the pipeline's shaders in description order, empty
+/// ones left out, as `real::own_*` copies them.
+pub fn shaders_sig(blobs: &[&[u8]]) -> u64 {
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    mix(&mut h, b"sh1");
+    for b in blobs {
+        mix_u32(&mut h, b.len() as u32);
+        mix(&mut h, b);
+    }
+    h
+}
+
+/// Console shader identity of pipelines built this run, by pipeline state.
+static PSO_SHADERS: Mutex<Option<HashMap<usize, u64>>> = Mutex::new(None);
+/// how many pipelines are in `PSO_SHADERS` (a bind skips the lock while none are)
+static SHADERS_KNOWN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Pipeline state `pso` was built from the shaders of `sig`.
+pub fn note_pso_shader(pso: usize, sig: u64) {
+    if pso == 0 {
+        return;
+    }
+    PSO_SHADERS.lock().unwrap().get_or_insert_with(HashMap::new).insert(pso, sig);
+    SHADERS_KNOWN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// `pso` was released: it cannot be drawn with again.
+pub fn forget_pso(pso: usize) {
+    if SHADERS_KNOWN.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+        return;
+    }
+    if PSO_SHADERS.lock().unwrap().as_mut().and_then(|m| m.remove(&pso)).is_some() {
+        SHADERS_KNOWN.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// `pso` is bound: what it was built from is drawn with, and the next run builds it during
+/// load.
+pub fn note_drawn(pso: usize) {
+    if SHADERS_KNOWN.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+        return;
+    }
+    let sig = PSO_SHADERS.lock().unwrap().as_ref().and_then(|m| m.get(&pso).copied());
+    if let Some(sig) = sig {
+        mark_drawn(&dir(), sig);
+    }
+}
+
+/// The shaders drawn with in an earlier run, and the ones this run has added not yet written.
+struct Drawn {
+    dir: PathBuf,
+    keys: HashSet<u64>,
+    unsaved: usize,
+}
+
+static DRAWN: Mutex<Option<Drawn>> = Mutex::new(None);
+/// how many entries are written at once by the side thread
+const DRAWN_BATCH: usize = 64;
+
+fn read_drawn(dir: &Path) -> HashSet<u64> {
+    std::fs::read_to_string(drawn_path(dir))
+        .map(|text| text.lines().filter_map(|l| u64::from_str_radix(l.trim(), 16).ok()).collect())
+        .unwrap_or_default()
+}
+
+fn write_drawn(dir: &Path, keys: &HashSet<u64>) {
+    if std::fs::create_dir_all(dir).is_err() {
+        return;
+    }
+    let mut text = String::with_capacity(17 * keys.len());
+    for k in keys {
+        text.push_str(&format!("{k:016x}\n"));
+    }
+    let path = drawn_path(dir);
+    let tmp = path.with_extension(format!("tmp{}", std::process::id()));
+    if std::fs::write(&tmp, &text).is_ok() && std::fs::rename(&tmp, &path).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+}
+
+fn flush_async(dir: PathBuf, keys: HashSet<u64>) {
+    let _ = std::thread::Builder::new().name("xcl-pso-drawn".into()).spawn(move || write_drawn(&dir, &keys));
+}
+
+/// The drawn set of `dir`, read from disk the first time it is asked for.
+fn with_drawn<R>(dir: &Path, f: impl FnOnce(&mut Drawn) -> R) -> R {
+    let mut g = DRAWN.lock().unwrap();
+    let stale = g.as_ref().map_or(true, |d| d.dir != dir);
+    if stale {
+        // the marks not written yet belong to the old dir
+        if let Some(d) = g.take().filter(|d| d.unsaved > 0) {
+            write_drawn(&d.dir, &d.keys);
+        }
+        *g = Some(Drawn { dir: dir.to_path_buf(), keys: read_drawn(dir), unsaved: 0 });
+    }
+    f(g.as_mut().unwrap())
+}
+
+/// A shader identity drawn with in an earlier run (its pipeline is built during load).
+pub fn wanted_shader(sig: u64) -> bool {
+    wanted_in(&dir(), sig)
+}
+
+fn wanted_in(dir: &Path, sig: u64) -> bool {
+    let wanted = with_drawn(dir, |d| d.keys.contains(&sig));
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    if wanted {
+        ONCE.call_once(|| {
+            let n = with_drawn(dir, |d| d.keys.len());
+            crate::xlog_info!("D3D12.X: pipeline library: {n} pipeline(s) drawn with in an earlier run are built while the title loads");
+        });
+    }
+    wanted
+}
+
+fn mark_drawn(dir: &Path, sig: u64) {
+    with_drawn(dir, |d| {
+        if d.keys.insert(sig) {
+            d.unsaved += 1;
+            if d.unsaved >= DRAWN_BATCH {
+                d.unsaved = 0;
+                flush_async(dir.to_path_buf(), d.keys.clone());
+            }
+        }
+    });
+}
+
+/// Write the shaders drawn with since the last write (the frame counter calls it now and then,
+/// so a short run records what it drew).
+pub fn flush_drawn() {
+    with_drawn(&dir(), |d| {
+        if d.unsaved > 0 {
+            d.unsaved = 0;
+            let (dir, keys) = (d.dir.clone(), d.keys.clone());
+            flush_async(dir, keys);
+        }
+    });
+}
+
+/// Forget what was drawn with in memory (the file stays): what a restart of the process sees.
+#[cfg(test)]
+pub(crate) fn forget_drawn_memory() {
+    let mut g = DRAWN.lock().unwrap();
+    if let Some(mut d) = g.take() {
+        if d.unsaved > 0 {
+            d.unsaved = 0;
+            write_drawn(&d.dir, &d.keys);
+        }
+    }
 }
 
 fn mix(h: &mut u64, bytes: &[u8]) {
@@ -320,6 +503,82 @@ pub fn stream_key(buf: &[u8], samplers: &[([u32; 4], bool)]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A drawn pipeline's shaders are written beside the blobs, and a restart (the set in
+    /// memory gone) finds them: the next run builds that pipeline during load. A blob
+    /// corrupted on disk leaves the library with nothing for its key.
+    #[test]
+    fn drawn_shaders_and_blobs_survive_a_restart_and_a_corrupt_blob_leaves_an_empty_library() {
+        let dir = std::env::temp_dir().join(format!("xcl-pso-library-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (key, sig) = (0x7410_0000_0000_00a1u64, 0x7410_0000_0000_00b2u64);
+        assert!(!wanted_in(&dir, sig));
+        mark_drawn(&dir, sig);
+        let blob = b"driver blob";
+        save_in(&dir, key, blob);
+        // a restart: only the files remain
+        forget_drawn_memory();
+        assert!(wanted_in(&dir, sig), "the drawn shaders are read back from disk");
+        assert_eq!(load_in(&dir, key).as_deref(), Some(&blob[..]), "and so is the blob");
+        // a blob from another version, or one cut short, is not used
+        std::fs::write(path_for(&dir, key), b"XPSO\x02\x00\x00\x00driver blob").unwrap();
+        assert_eq!(load_in(&dir, key), None);
+        std::fs::write(path_for(&dir, key), b"trunc").unwrap();
+        assert_eq!(load_in(&dir, key), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A blob the device refuses takes the blobs this run has read with it: the library starts
+    /// empty, and the run logs it once.
+    #[test]
+    fn a_blob_the_device_refuses_starts_an_empty_library() {
+        let key = 0x7410_0000_0000_00d4u64;
+        memory().lock().unwrap().insert(key, std::sync::Arc::new(b"a blob".to_vec()));
+        assert!(load(key).is_some());
+        rejected(key);
+        assert!(load(key).is_none(), "nothing of the refused library is used again");
+    }
+
+    /// What a creation does: the blob from the library, else the compile and its blob saved.
+    /// The second creation, in what a restart leaves, compiles nothing.
+    #[test]
+    fn a_library_hit_compiles_nothing_on_the_next_run() {
+        let dir = std::env::temp_dir().join(format!("xcl-pso-recreate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let key = 0x7410_0000_0000_00e5u64;
+        let compiles = std::cell::Cell::new(0u32);
+        let mut create = |key: u64| -> Vec<u8> {
+            if let Some(blob) = load_in(&dir, key) {
+                return blob;
+            }
+            // the translation's compile, which a library hit must not reach
+            compiles.set(compiles.get() + 1);
+            let blob = b"freshly compiled".to_vec();
+            save_in(&dir, key, &blob);
+            blob
+        };
+        assert_eq!(create(key), b"freshly compiled".to_vec());
+        assert_eq!(compiles.get(), 1);
+        assert_eq!(create(key), b"freshly compiled".to_vec(), "the library answers the next run");
+        assert_eq!(compiles.get(), 1, "and nothing compiles");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Two pipelines are told apart by their shaders, and the same shaders at other addresses
+    /// are the same pipeline (a restart moves them).
+    #[test]
+    fn a_shader_identity_is_the_code_and_the_order_of_the_stages() {
+        let (vs, ps) = ([7u8; 16], [8u8; 24]);
+        let sig = shaders_sig(&[&vs, &ps]);
+        assert_eq!(sig, shaders_sig(&[&vs, &ps]));
+        assert_ne!(sig, shaders_sig(&[&ps, &vs]), "stage order counts");
+        assert_ne!(sig, shaders_sig(&[&vs]), "a missing stage counts");
+        let mut other = ps;
+        other[0] = 9;
+        assert_ne!(sig, shaders_sig(&[&vs, &other]));
+    }
 
     #[test]
     fn shader_bytes_change_the_key_and_the_blob_round_trips() {
