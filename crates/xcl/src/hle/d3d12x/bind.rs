@@ -220,6 +220,17 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
     super::lifetime::note(this as usize, sig);
     super::lifetime::note(this as usize, args);
     super::lifetime::note(this as usize, count_buf);
+    // `XCL_INDIRECT=0`: a diagnostic switch; ExecuteIndirect calls are counted and left out
+    // (nothing is recorded), to tell whether a GPU hang comes from indirect work
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *OFF.get_or_init(|| std::env::var("XCL_INDIRECT").is_ok_and(|v| v == "0")) {
+        static LEFT_OUT: AtomicU64 = AtomicU64::new(0);
+        let n = LEFT_OUT.fetch_add(1, Ordering::Relaxed);
+        if n < 2 || (n + 1).is_power_of_two() {
+            crate::xlog_info!("D3D12.X: {} ExecuteIndirect calls left out (XCL_INDIRECT=0)", n + 1);
+        }
+        return;
+    }
     type F = unsafe extern "system" fn(*mut c_void, usize, u32, usize, u64, usize, u64);
     let pc: F = std::mem::transmute(super::real::orig_fn(this, 59));
     let raw_pso = with(this, |s| s.pso);
