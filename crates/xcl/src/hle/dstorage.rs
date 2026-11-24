@@ -2902,6 +2902,9 @@ mod tests {
     /// independently of the decoder (`tests/data/bcpack`).
     #[test]
     fn bcpack_bc1_requests_are_unpacked_alone_and_after_zlib() {
+        // the decoder's own refusals are checked: placeholders off, a refused stream fails
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _v = EnvVar::set("XCL_BCPACK_PLACEHOLDER", "0");
         use crate::hle::bcpack::tests as fx;
         let bc1 = SOURCE_MEMORY_BIT | 1 << BCPACK_SHIFT;
         let small = fx::data("bc1-16-1.bin").unwrap();
