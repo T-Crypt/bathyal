@@ -183,8 +183,9 @@ pub fn record_of(sig: &Signature, bytes: &[u8]) -> Option<Record> {
         _ => return None,
     };
     let n = match kind {
-        Kind::Draw | Kind::Dispatch | Kind::DispatchMesh => 4,
+        Kind::Draw => 4,
         Kind::DrawIndexed => 5,
+        Kind::Dispatch | Kind::DispatchMesh => 3,
     };
     let mut counts = [0u32; 5];
     for (i, c) in counts.iter_mut().enumerate().take(n) {
@@ -257,8 +258,9 @@ pub fn write_record(sig: &Signature, bytes: &mut [u8], offset: usize, r: &Record
     let Some(a) = sig.count_arg() else { return false };
     let at = offset + a.offset as usize;
     let n = match r.kind {
-        Kind::Draw | Kind::Dispatch | Kind::DispatchMesh => 4,
+        Kind::Draw => 4,
         Kind::DrawIndexed => 5,
+        Kind::Dispatch | Kind::DispatchMesh => 3,
     };
     match bytes.get_mut(at..at + 4 * n) {
         Some(dst) => {
@@ -351,6 +353,23 @@ mod tests {
         let rs = parse_records(&sig, &buf, 4u32.min(3));
         assert_eq!(rs.len(), 3);
         assert_eq!(rs[2].counts[0], 8);
+    }
+
+    #[test]
+    fn dispatch_records_are_three_words_wide() {
+        let sig = Signature::from_args(12, &[[ARG_DISPATCH, 0, 0, 0]]).expect("signature");
+        let mut buf = vec![0u8; 24];
+        put(&mut buf, 0, &[1, 2, 3]);
+        put(&mut buf, 12, &[4, 5, 6]);
+        let rs = parse_records(&sig, &buf, 2);
+        assert_eq!(rs.len(), 2, "both dispatch records parse");
+        assert_eq!(rs[0].counts[..3], [1, 2, 3]);
+        assert_eq!(rs[1].counts[..3], [4, 5, 6]);
+        assert_eq!(rs[0].counts[3], 0, "no fourth word is read");
+
+        // a mesh dispatch record is the same width
+        let sig = Signature::from_args(12, &[[ARG_DISPATCH_MESH, 0, 0, 0]]).expect("signature");
+        assert_eq!(parse_records(&sig, &buf, 2).len(), 2);
     }
 
     #[test]

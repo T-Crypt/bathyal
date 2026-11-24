@@ -660,7 +660,7 @@ fn gpu_indirect_two_pass_mesh_runs_each_record() {
         // the argument records in title memory: dispatch (1,1,1) then (2,1,1)
         let arg_bytes = 2 * 12usize;
         let args = u.alloc(arg_bytes, 256).unwrap();
-        let words: [u32; 12] = [1, 1, 1, 0, 2, 1, 1, 0, 0, 0, 0, 0];
+        let words: [u32; 6] = [1, 1, 1, 2, 1, 1]; // (1,1,1) then (2,1,1), stride 12
         std::ptr::copy_nonoverlapping(words.as_ptr(), args as *mut u32, words.len());
         let fake_res = 0x1C0_1000usize;
         super::real::note_test_console_buffer(fake_res, args as usize, arg_bytes);
