@@ -857,8 +857,10 @@ mod tests {
 
     #[test]
     fn bounded_compute_wait_times_out_then_resolves_once_worker_finishes() {
-        let standin = 0x7300_0001usize;
-        let real_pso = 0x7300_0002usize;
+        // not `0x7300_0001`, which `bind`'s test uses: both run in one process, and its
+        // release would drop this test's pending entry
+        let standin = 0x7300_0101usize;
+        let real_pso = 0x7300_0102usize;
         let budget = FrameBudget::new();
         let (tx, rx) = mpsc::channel::<()>();
         submit_lazy(
