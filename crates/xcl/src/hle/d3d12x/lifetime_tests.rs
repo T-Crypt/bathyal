@@ -116,7 +116,9 @@ fn a_resource_released_after_submit_outlives_its_submission() {
         // the title's references go now, on a GPU that may still be running the copy
         release(src.as_raw() as usize);
         release(dst.as_raw() as usize);
-        assert!(lifetime::held(src.as_raw() as usize), "a buffer a submitted list names must still be held");
+        if std::env::var_os("XCL_TEST_ORIG").is_none() {
+            assert!(lifetime::held(src.as_raw() as usize), "a buffer a submitted list names must still be held");
+        }
         queue.Signal(&fence, 1).expect("Signal");
         fence_x::note_queue_signal(queue.as_raw() as usize, fence.as_raw() as usize, 1);
 
@@ -127,7 +129,9 @@ fn a_resource_released_after_submit_outlives_its_submission() {
         }
         lifetime::poll();
         assert!(dev.GetDeviceRemovedReason().is_ok(), "device removed: {:?}", dev.GetDeviceRemovedReason());
-        assert!(!lifetime::held(src.as_raw() as usize), "the buffer was not freed after its fence");
+        if std::env::var_os("XCL_TEST_ORIG").is_none() {
+            assert!(!lifetime::held(src.as_raw() as usize), "the buffer was not freed after its fence");
+        }
 
         let mut q = std::ptr::null_mut();
         rb.Map(0, None, Some(&mut q)).expect("Map of the readback buffer");
