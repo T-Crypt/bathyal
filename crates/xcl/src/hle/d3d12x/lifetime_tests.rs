@@ -65,15 +65,12 @@ fn a_resource_released_after_submit_outlives_its_submission() {
         let src = tracked_buffer(&dev, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
         let dst = tracked_buffer(&dev, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COPY_DEST);
         let rb = tracked_buffer(&dev, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
-                eprintln!("m1 buffers");
-let pattern: Vec<u8> = (0..BYTES).map(|k| (k as u8).wrapping_mul(7).wrapping_add(3)).collect();
-                eprintln!("m2 before map");
-let mut p = std::ptr::null_mut();
+        let pattern: Vec<u8> = (0..BYTES).map(|k| (k as u8).wrapping_mul(7).wrapping_add(3)).collect();
+        let mut p = std::ptr::null_mut();
         src.Map(0, None, Some(&mut p)).expect("Map of the upload buffer");
         std::ptr::copy_nonoverlapping(pattern.as_ptr(), p as *mut u8, BYTES as usize);
         src.Unmap(0, None);
 
-        eprintln!("m3 filled");
         // the queue and the list from the PC device's own entries
         type QF = unsafe extern "system" fn(*mut c_void, *const D3D12_COMMAND_QUEUE_DESC, *const windows::core::GUID, *mut *mut c_void) -> i32;
         let qf: QF = std::mem::transmute(real::orig_fn(d, 8));
@@ -90,23 +87,21 @@ let mut p = std::ptr::null_mut();
         assert!(lf(d, 0, D3D12_COMMAND_LIST_TYPE_DIRECT.0, alloc.as_raw() as *mut c_void, std::ptr::null_mut(), &liid, &mut raw_list) >= 0, "CreateCommandList");
         let list = ID3D12GraphicsCommandList::from_raw_borrowed(&raw_list).expect("PC list");
 
-        eprintln!("m4 list made");
         // two copies name the source, the destination and the readback buffer
         list.CopyBufferRegion(&dst, 0, &src, 0, BYTES);
         list.CopyBufferRegion(&rb, 0, &dst, 0, BYTES);
         for r in [&src, &dst] {
             lifetime::note(raw_list as usize, r.as_raw() as usize);
         }
-        eprintln!("m5 copied");
         list.Close().expect("Close");
 
         let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).expect("fence");
         let one = [raw_list];
-        let ef: unsafe extern "system" fn(*mut c_void, u32, *const *mut c_void) = std::mem::transmute(real::orig_fn(qraw, 10));
+        let ef: unsafe extern "system" fn(*mut c_void, u32, *const *mut c_void) =
+            std::mem::transmute(*(*(qraw as *const *const usize)).add(10));
         lifetime::submit(qraw as usize, &one);
         ef(qraw, 1, one.as_ptr());
 
-        eprintln!("m6 submitted");
         // the title's references go now, on a GPU that may still be running the copy
         release(src.as_raw() as usize);
         release(dst.as_raw() as usize);
@@ -114,7 +109,6 @@ let mut p = std::ptr::null_mut();
         queue.Signal(&fence, 1).expect("Signal");
         lifetime::signal(qraw as usize, fence.as_raw() as usize, 1);
 
-        eprintln!("m7 released+signal");
         let t0 = std::time::Instant::now();
         while fence.GetCompletedValue() < 1 {
             assert!(t0.elapsed().as_secs() < 20, "the GPU did not finish (device removed: {:?})", dev.GetDeviceRemovedReason());
@@ -124,14 +118,12 @@ let mut p = std::ptr::null_mut();
         assert!(dev.GetDeviceRemovedReason().is_ok(), "device removed: {:?}", dev.GetDeviceRemovedReason());
         assert!(!lifetime::held(src.as_raw() as usize), "the buffer was not freed after its fence");
 
-        eprintln!("m8 waited");
         let mut q = std::ptr::null_mut();
         rb.Map(0, None, Some(&mut q)).expect("Map of the readback buffer");
         let got = std::slice::from_raw_parts(q as *const u8, BYTES as usize).to_vec();
         rb.Unmap(0, None);
         assert_eq!(got, pattern, "the copy read memory that was not the source's");
 
-        eprintln!("m9 read back");
         release(rb.as_raw() as usize);
         release(raw_list as usize);
         release(qraw as usize);
