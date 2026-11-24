@@ -315,6 +315,8 @@ static TEXTURES_LEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicU
 static WATCH_CACHE: Mutex<Option<((u64, u64, u64), Arc<Vec<(usize, usize)>>)>> = Mutex::new(None);
 /// the queue uploads go to, per device
 static QUEUES: Mutex<BTreeMap<usize, ID3D12CommandQueue>> = Mutex::new(BTreeMap::new());
+/// reusable allocator, list, fence and persistently-mapped staging buffer, per device
+static UPLOADERS: Mutex<BTreeMap<usize, texture::BatchUploader>> = Mutex::new(BTreeMap::new());
 static UPLOADS: AtomicU64 = AtomicU64::new(0);
 
 /// Number of textures kept in title memory and uploads done so far.
@@ -1071,7 +1073,12 @@ unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>, title: Option<&ID3D12C
         };
         match own_work(|| {
             super::vram::before_execute(&queue);
-            texture::upload_batch(dev, &queue, &batch)
+            let mut uploaders = UPLOADERS.lock().unwrap();
+            let uploader = match uploaders.entry(device) {
+                std::collections::btree_map::Entry::Occupied(e) => e.into_mut(),
+                std::collections::btree_map::Entry::Vacant(v) => v.insert(texture::BatchUploader::new(dev)?),
+            };
+            uploader.upload_batch(dev, &queue, &batch)
         }) {
             Ok(failed) => {
                 for (_, e) in failed {

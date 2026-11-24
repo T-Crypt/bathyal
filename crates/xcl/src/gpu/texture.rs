@@ -201,6 +201,251 @@ pub unsafe fn upload(dev: &ID3D12Device, queue: &ID3D12CommandQueue, res: &ID3D1
     r
 }
 
+struct PendingBatch {
+    fence_value: u64,
+    temp_staging: Option<ID3D12Resource>,
+}
+
+/// Reusable command allocator, list, fence, event, and persistently-mapped upload staging
+/// buffer for repeated texture batch uploads (e.g. per-frame video planes and streamed textures).
+pub struct BatchUploader {
+    alloc: ID3D12CommandAllocator,
+    list: ID3D12GraphicsCommandList,
+    fence: ID3D12Fence,
+    event: windows::Win32::Foundation::HANDLE,
+    fence_value: u64,
+    wait_timeout_ms: u32,
+    staging: Option<(ID3D12Resource, *mut u8, u64)>,
+    pending: Option<PendingBatch>,
+    removed: bool,
+}
+
+// SAFETY: D3D12 objects, the event handle, and the persistently-mapped upload buffer pointer
+// are serialized by the caller's mutex.
+unsafe impl Send for BatchUploader {}
+
+impl Drop for BatchUploader {
+    fn drop(&mut self) {
+        unsafe {
+            if let Some((ref res, _, _)) = self.staging {
+                res.Unmap(0, None);
+            }
+            if !self.event.is_invalid() {
+                let _ = windows::Win32::Foundation::CloseHandle(self.event);
+            }
+        }
+    }
+}
+
+impl BatchUploader {
+    /// Keep at most 64 MiB of persistently-mapped upload staging across frames; larger one-off
+    /// batches use a temporary buffer and release it after waiting.
+    const MAX_CACHED_STAGING: u64 = 64 << 20;
+
+    pub unsafe fn new(dev: &ID3D12Device) -> Result<Self, String> {
+        let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).map_err(err)?;
+        let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).map_err(err)?;
+        list.Close().map_err(err)?;
+        let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).map_err(err)?;
+        let event = windows::Win32::System::Threading::CreateEventW(None, false, false, None).map_err(err)?;
+        Ok(Self {
+            alloc,
+            list,
+            fence,
+            event,
+            fence_value: 0,
+            wait_timeout_ms: 10_000,
+            staging: None,
+            pending: None,
+            removed: false,
+        })
+    }
+
+    /// Wait for any previously submitted batch to complete before touching the staging buffer or
+    /// resetting the command allocator. Retains `pending` (and any temporary staging allocation)
+    /// across timeouts; clears it and marks the uploader unusable on device removal.
+    unsafe fn finish_pending(&mut self, dev: &ID3D12Device) -> Result<(), String> {
+        if self.removed {
+            let reason = dev
+                .GetDeviceRemovedReason()
+                .err()
+                .unwrap_or_else(|| windows::core::Error::from_hresult(windows::Win32::Graphics::Dxgi::DXGI_ERROR_DEVICE_REMOVED));
+            return Err(format!("texture copy: {}", fence::FenceError::Removed(reason)));
+        }
+        let Some(target) = self.pending.as_ref().map(|p| p.fence_value) else {
+            return Ok(());
+        };
+        if target == u64::MAX {
+            return Err("texture copy: previous upload did not signal its fence".into());
+        }
+        match fence::wait(&self.fence, target, dev, Some(self.event), self.wait_timeout_ms) {
+            Ok(()) => {
+                self.pending = None;
+                Ok(())
+            }
+            Err(fence::FenceError::Removed(e)) => {
+                self.removed = true;
+                self.pending = None;
+                Err(format!("texture copy: {}", fence::FenceError::Removed(e)))
+            }
+            Err(e) => Err(format!("texture copy: {e}")),
+        }
+    }
+
+    /// Upload `items` on `queue` using the reused allocator, list, fence, and staging buffer.
+    pub unsafe fn upload_batch(
+        &mut self,
+        dev: &ID3D12Device,
+        queue: &ID3D12CommandQueue,
+        items: &[(ID3D12Resource, Vec<Subresource>, Vec<D3D12_RESOURCE_STATES>)],
+    ) -> Result<Vec<(usize, String)>, String> {
+        if items.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.finish_pending(dev)?;
+        struct Plan {
+            index: usize,
+            fps: Vec<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>,
+            rows: Vec<u32>,
+            base_offset: u64,
+        }
+        let mut plans = Vec::with_capacity(items.len());
+        let mut failed = Vec::new();
+        let mut total_bytes = 0u64;
+        for (k, (res, subs, states)) in items.iter().enumerate() {
+            let check = (|| -> Result<(Vec<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>, Vec<u32>, u64), String> {
+                validate_subresources(subs)?;
+                let rd = res.GetDesc();
+                let n = subs.len();
+                validate_subresource_count(&rd, n)?;
+                if states.len() != 1 && states.len() != n {
+                    return Err(format!("{} subresource states for {n} subresources", states.len()));
+                }
+                let mut fps = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); n];
+                let mut rows = vec![0u32; n];
+                let mut row_bytes = vec![0u64; n];
+                let mut total = 0u64;
+                dev.GetCopyableFootprints(&rd, 0, n as u32, 0, Some(fps.as_mut_ptr()), Some(rows.as_mut_ptr()), Some(row_bytes.as_mut_ptr()), Some(&mut total));
+                for (i, ((s, fp), (&nrows, &nbytes))) in subs.iter().zip(&fps).zip(rows.iter().zip(&row_bytes)).enumerate() {
+                    if s.rows != nrows as usize || s.depth != fp.Footprint.Depth as usize || s.row_bytes != nbytes as usize {
+                        return Err(format!(
+                            "texture subresource {i} is {}x{}x{} B, resource expects {}x{}x{} B",
+                            s.row_bytes, s.rows, s.depth, nbytes, nrows, fp.Footprint.Depth
+                        ));
+                    }
+                }
+                Ok((fps, rows, total))
+            })();
+            match check {
+                Ok((fps, rows, total)) => {
+                    let base_offset = total_bytes.checked_add(511).ok_or("texture batch staging overflow")? & !511;
+                    total_bytes = base_offset.checked_add(total).ok_or("texture batch staging overflow")?;
+                    plans.push(Plan { index: k, fps, rows, base_offset });
+                }
+                Err(e) => failed.push((k, e)),
+            }
+        }
+        if plans.is_empty() {
+            return Ok(failed);
+        }
+
+        let mut temp_staging: Option<ID3D12Resource> = None;
+        let (staging_res, staging_ptr): (ID3D12Resource, *mut u8) = if total_bytes <= Self::MAX_CACHED_STAGING {
+            let need_new = self.staging.as_ref().is_none_or(|(_, _, cap)| *cap < total_bytes);
+            if need_new {
+                if let Some((old, _, _)) = self.staging.take() {
+                    old.Unmap(0, None);
+                }
+                let cap = total_bytes.next_power_of_two().clamp(1 << 20, Self::MAX_CACHED_STAGING);
+                let res = buffer(dev, cap)?;
+                let mut p = std::ptr::null_mut();
+                res.Map(0, None, Some(&mut p)).map_err(err)?;
+                self.staging = Some((res, p as *mut u8, cap));
+            }
+            let (res, ptr, _) = self.staging.as_ref().unwrap();
+            (res.clone(), *ptr)
+        } else {
+            let res = buffer(dev, total_bytes)?;
+            let mut p = std::ptr::null_mut();
+            res.Map(0, None, Some(&mut p)).map_err(err)?;
+            temp_staging = Some(res.clone());
+            (res, p as *mut u8)
+        };
+
+        for plan in &plans {
+            let (_, subs, _) = &items[plan.index];
+            for ((s, fp), &nrows) in subs.iter().zip(&plan.fps).zip(&plan.rows) {
+                let pitch = fp.Footprint.RowPitch as usize;
+                let row = s.row_bytes.min(pitch);
+                let slice_pitch = pitch * nrows as usize;
+                let base = (plan.base_offset + fp.Offset) as usize;
+                if row == pitch && s.row_bytes == pitch {
+                    let total_copy = (fp.Footprint.Depth as usize).min(s.depth) * (nrows as usize).min(s.rows) * row;
+                    std::ptr::copy_nonoverlapping(s.data.as_ptr(), staging_ptr.add(base), total_copy);
+                } else {
+                    for z in 0..(fp.Footprint.Depth as usize).min(s.depth) {
+                        for y in 0..(nrows as usize).min(s.rows) {
+                            let at = base + z * slice_pitch + y * pitch;
+                            std::ptr::copy_nonoverlapping(s.data[(z * s.rows + y) * s.row_bytes..].as_ptr(), staging_ptr.add(at), row);
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some(ref tmp) = temp_staging {
+            tmp.Unmap(0, None);
+        }
+
+        self.alloc.Reset().map_err(err)?;
+        self.list.Reset(&self.alloc, None).map_err(err)?;
+        for plan in &plans {
+            let (res, subs, states) = &items[plan.index];
+            let n = subs.len();
+            let to_copy = transitions(res, states, &[D3D12_RESOURCE_STATE_COPY_DEST], n);
+            if !to_copy.is_empty() {
+                self.list.ResourceBarrier(&to_copy);
+            }
+            for (k, fp) in plan.fps.iter().enumerate() {
+                let mut placed = *fp;
+                placed.Offset += plan.base_offset;
+                let dst = D3D12_TEXTURE_COPY_LOCATION {
+                    pResource: std::mem::transmute_copy(res),
+                    Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: k as u32 },
+                };
+                let src = D3D12_TEXTURE_COPY_LOCATION {
+                    pResource: std::mem::transmute_copy(&staging_res),
+                    Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: placed },
+                };
+                self.list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
+            }
+            let back = transitions(res, &[D3D12_RESOURCE_STATE_COPY_DEST], states, n);
+            if !back.is_empty() {
+                self.list.ResourceBarrier(&back);
+            }
+        }
+        self.list.Close().map_err(err)?;
+        queue.ExecuteCommandLists(&[Some(windows::core::Interface::cast(&self.list).map_err(err)?)]);
+        self.fence_value += 1;
+        if let Err(e) = queue.Signal(&self.fence, self.fence_value) {
+            let fe = fence::api_error(dev, "Signal", e);
+            if matches!(fe, fence::FenceError::Removed(_)) {
+                self.removed = true;
+            } else {
+                // The list was submitted without a fence signal; retain any temporary staging and
+                // block reuse permanently rather than racing the GPU.
+                self.pending = Some(PendingBatch { fence_value: u64::MAX, temp_staging });
+            }
+            return Err(format!("texture copy: {fe}"));
+        }
+        self.pending = Some(PendingBatch { fence_value: self.fence_value, temp_staging });
+        self.finish_pending(dev)?;
+        Ok(failed)
+    }
+}
+
 /// Several uploads on one list, one wait: (resource, subresources, states) each – the states
 /// the texture is in and is left in: one for every subresource, or one per subresource (D3D12
 /// order). A failure of one is returned with its index; the others still run.
@@ -641,6 +886,106 @@ mod tests {
                     assert!(g == w, "format {} {:?} mode {} subresource {k} ({} × {} rows × {} B) differs", t.format, t.ty, t.swizzle_mode, w.depth, w.rows, w.row_bytes);
                 }
             }
+        }
+    }
+
+    #[test]
+    fn gpu_batch_uploader_reuses_staging_and_reports_partial_failures() {
+        let Some((dev, queue)) = device() else {
+            println!("no D3D12 device – skipping");
+            crate::gpu::recomp::runner::skip_test("no GPU");
+            return;
+        };
+        let rgba8 = desc::gfx10_format(DXGI_FORMAT_R8G8B8A8_UNORM).unwrap();
+        let t_a = image(rgba8, ImageType::D2, 64, 32, 1, 3, 0, 0x60_0000);
+        let t_b = image(rgba8, ImageType::D2, 48, 24, 1, 1, 0, 0x64_0000);
+        let (subs_a1, mem_a) = console_texture(&t_a);
+        let (subs_b1, mem_b) = console_texture(&t_b);
+        unsafe {
+            let res_a = create(&dev, &queue, &t_a, &mem_a, CONSOLE_PIPES).unwrap();
+            let res_b = create(&dev, &queue, &t_b, &mem_b, CONSOLE_PIPES).unwrap();
+            let mut uploader = BatchUploader::new(&dev).unwrap();
+
+            assert!(uploader.upload_batch(&dev, &queue, &[]).unwrap().is_empty());
+
+            // Batch 1: valid mipped texture (pitch-aligned + non-aligned mips), invalid item, valid texture.
+            let subs_a2: Vec<Subresource> = subs_a1.iter().map(|s| Subresource { data: s.data.iter().map(|&b| b ^ 0x5a).collect(), ..s.clone() }).collect();
+            let subs_b2: Vec<Subresource> = subs_b1.iter().map(|s| Subresource { data: s.data.iter().map(|&b| b.wrapping_add(17)).collect(), ..s.clone() }).collect();
+            let bad = vec![subs_b2[0].clone()]; // res_a requires 3 subresources
+            let failed = uploader
+                .upload_batch(
+                    &dev,
+                    &queue,
+                    &[
+                        (res_a.clone(), subs_a2.clone(), vec![SHADER_READ]),
+                        (res_a.clone(), bad.clone(), vec![SHADER_READ]),
+                        (res_b.clone(), subs_b2.clone(), vec![SHADER_READ]),
+                    ],
+                )
+                .unwrap();
+            assert_eq!(failed.len(), 1);
+            assert_eq!(failed[0].0, 1);
+            assert_eq!(read_back(&dev, &queue, &res_a, &subs_a2), subs_a2);
+            assert_eq!(read_back(&dev, &queue, &res_b, &subs_b2), subs_b2);
+
+            // Batch 2: reuse the same allocator, list, fence and staging buffer with fresh contents.
+            let subs_a3: Vec<Subresource> = subs_a1.iter().map(|s| Subresource { data: s.data.iter().map(|&b| !b).collect(), ..s.clone() }).collect();
+            let subs_b3: Vec<Subresource> = subs_b1.iter().map(|s| Subresource { data: s.data.iter().map(|&b| b.rotate_left(3)).collect(), ..s.clone() }).collect();
+            let failed2 = uploader
+                .upload_batch(
+                    &dev,
+                    &queue,
+                    &[
+                        (res_a.clone(), subs_a3.clone(), vec![SHADER_READ; subs_a3.len()]),
+                        (res_b.clone(), subs_b3.clone(), vec![SHADER_READ]),
+                    ],
+                )
+                .unwrap();
+            assert!(failed2.is_empty());
+            assert_eq!(read_back(&dev, &queue, &res_a, &subs_a3), subs_a3);
+            assert_eq!(read_back(&dev, &queue, &res_b, &subs_b3), subs_b3);
+
+            // Batch 3: all-invalid batch reports every failure without touching the GPU.
+            let failed3 = uploader.upload_batch(&dev, &queue, &[(res_a.clone(), bad, vec![SHADER_READ])]).unwrap();
+            assert_eq!(failed3.len(), 1);
+            assert_eq!(failed3[0].0, 0);
+        }
+    }
+
+    #[test]
+    fn gpu_batch_uploader_retains_pending_batch_and_blocks_reuse_until_completion() {
+        let Some((dev, queue)) = device() else {
+            println!("no D3D12 device – skipping");
+            crate::gpu::recomp::runner::skip_test("no GPU");
+            return;
+        };
+        let rgba8 = desc::gfx10_format(DXGI_FORMAT_R8G8B8A8_UNORM).unwrap();
+        let t = image(rgba8, ImageType::D2, 32, 16, 1, 1, 0, 0x68_0000);
+        let (subs_old, mem) = console_texture(&t);
+        let subs_new: Vec<Subresource> = subs_old.iter().map(|s| Subresource { data: s.data.iter().map(|&b| b ^ 0xA5).collect(), ..s.clone() }).collect();
+        unsafe {
+            let res = create(&dev, &queue, &t, &mem, CONSOLE_PIPES).unwrap();
+            let mut uploader = BatchUploader::new(&dev).unwrap();
+
+            // Simulate a submitted batch whose fence wait timed out while still in flight.
+            let held = buffer(&dev, 4096).unwrap();
+            uploader.fence_value = 1;
+            uploader.wait_timeout_ms = 0;
+            uploader.pending = Some(PendingBatch { fence_value: 1, temp_staging: Some(held) });
+
+            let err = uploader.upload_batch(&dev, &queue, &[(res.clone(), subs_new.clone(), vec![SHADER_READ])]).unwrap_err();
+            assert!(err.contains("still pending"), "expected timeout error, got: {err}");
+            assert!(uploader.pending.as_ref().is_some_and(|p| p.fence_value == 1 && p.temp_staging.is_some()));
+            // Texture was not overwritten while the earlier batch remained pending.
+            assert_eq!(read_back(&dev, &queue, &res, &subs_old), subs_old);
+
+            // Once the pending fence completes, the next upload reclaims staging and succeeds.
+            uploader.fence.Signal(1).unwrap();
+            uploader.wait_timeout_ms = 10_000;
+            let failed = uploader.upload_batch(&dev, &queue, &[(res.clone(), subs_new.clone(), vec![SHADER_READ])]).unwrap();
+            assert!(failed.is_empty());
+            assert!(uploader.pending.is_none());
+            assert_eq!(read_back(&dev, &queue, &res, &subs_new), subs_new);
         }
     }
 
