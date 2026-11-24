@@ -908,6 +908,43 @@ pub fn pc_creation_desc(x: &[u8; 0x38]) -> [u8; 0x38] {
     d
 }
 
+/// `D3D12_FORMAT_SUPPORT1` bits the uses of a texture need (`drop_refused_uses`).
+pub const SUPPORT_RENDER_TARGET: u32 = 0x2000;
+pub const SUPPORT_DEPTH_STENCIL: u32 = 0x8000;
+pub const SUPPORT_TYPED_UAV: u32 = 0x0100_0000;
+
+/// The `D3D12_RESOURCE_FLAG`s of the uses a driver's format support can refuse.
+pub const USE_RENDER_TARGET: u32 = 0x1;
+pub const USE_DEPTH_STENCIL: u32 = 0x2;
+pub const USE_UNORDERED_ACCESS: u32 = 0x4;
+
+/// A texture's resource flags with only the uses `support` (its `D3D12_FORMAT_SUPPORT1`) refuses
+/// removed: a format that has no render-target, depth or typed unordered-access use stays a
+/// texture shaders sample and copies move. `kept_dropped`: which uses went.
+pub fn drop_refused_uses(flags: u32, support: u32) -> (u32, u32) {
+    let mut kept = flags;
+    if flags & USE_RENDER_TARGET != 0 && support & SUPPORT_RENDER_TARGET == 0 {
+        kept &= !USE_RENDER_TARGET;
+    }
+    if flags & USE_DEPTH_STENCIL != 0 && support & SUPPORT_DEPTH_STENCIL == 0 {
+        kept &= !USE_DEPTH_STENCIL;
+    }
+    if flags & USE_UNORDERED_ACCESS != 0 && support & SUPPORT_TYPED_UAV == 0 {
+        kept &= !USE_UNORDERED_ACCESS;
+    }
+    (kept, flags & !kept)
+}
+
+/// `CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT)` for `format`: its `D3D12_FORMAT_SUPPORT1`
+/// bits (None: no answer from the device).
+pub(super) unsafe fn format_support1(this: *mut c_void, format: u32) -> Option<u32> {
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
+    let dev = ID3D12Device::from_raw_borrowed(&this)?;
+    let mut d = D3D12_FEATURE_DATA_FORMAT_SUPPORT { Format: DXGI_FORMAT(format as i32), Support1: D3D12_FORMAT_SUPPORT1(0), Support2: D3D12_FORMAT_SUPPORT2(0) };
+    dev.CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &mut d as *mut _ as *mut c_void, std::mem::size_of_val(&d) as u32).ok()?;
+    Some(d.Support1.0)
+}
+
 /// device #108 (a retail game) GetResourceAllocationInfo2(visible mask, count, D3D12_RESOURCE_DESC1s,
 /// D3D12_RESOURCE_ALLOCATION_INFO1* each) -> {size, alignment} of them all, returned like #25's;
 /// each resource's {offset, alignment, size} goes to the last argument when there is one.
@@ -1385,5 +1422,21 @@ mod tests {
             assert_eq!(unregister_page_pool_x(std::ptr::null_mut(), i as u64), S_OK);
             assert_eq!(unregister_page_pool_x(std::ptr::null_mut(), i as u64), E_FAIL);
         }
+    }
+
+    /// A driver's format support that refuses one use (a fake answer): only that use goes, and a
+    /// format it supports fully keeps every flag.
+    #[test]
+    fn a_refused_use_is_the_only_one_dropped() {
+        let full = SUPPORT_RENDER_TARGET | SUPPORT_DEPTH_STENCIL | SUPPORT_TYPED_UAV | 0x20 | 0x40;
+        let all = USE_RENDER_TARGET | USE_DEPTH_STENCIL | USE_UNORDERED_ACCESS;
+        assert_eq!(drop_refused_uses(all, full), (all, 0), "every use supported: as the title asked");
+        // no render-target use: the other uses and the console bits stay
+        assert_eq!(drop_refused_uses(all | 0x10, full & !SUPPORT_RENDER_TARGET), ((all & !USE_RENDER_TARGET) | 0x10, USE_RENDER_TARGET));
+        assert_eq!(drop_refused_uses(all, full & !SUPPORT_DEPTH_STENCIL), (all & !USE_DEPTH_STENCIL, USE_DEPTH_STENCIL));
+        assert_eq!(drop_refused_uses(all, full & !SUPPORT_TYPED_UAV), (all & !USE_UNORDERED_ACCESS, USE_UNORDERED_ACCESS));
+        // sampling and copies need no flag: a format with neither use stays as the title asked
+        assert_eq!(drop_refused_uses(0, 0), (0, 0));
+        assert_eq!(drop_refused_uses(USE_RENDER_TARGET, 0), (0, USE_RENDER_TARGET));
     }
 }
