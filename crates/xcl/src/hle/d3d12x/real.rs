@@ -675,6 +675,10 @@ fn kind_of(ext: usize) -> Option<Kind> {
 /// The release path that frees `handle` once nothing in flight names it, for the kinds a
 /// recorded command list can reference (`lifetime::note`). None: not such an object.
 pub(super) unsafe fn free_fn(handle: usize) -> Option<super::lifetime::FreeFn> {
+    // a console CPU handle or a title address may be named where a resource is expected
+    if handle == 0 || !crate::gpu::shader::readable(handle, 8) {
+        return None;
+    }
     let ext = vt(handle as *mut c_void) as usize;
     if !is_ext(ext) {
         return None;
