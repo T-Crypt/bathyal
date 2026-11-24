@@ -467,13 +467,13 @@ pub fn retire_resource(res: usize) {
         write(&s, &[0; 8]);
         let Some(dev) = &dev else { continue };
         unsafe {
-            dev.CreateShaderResourceView(None::<&ID3D12Resource>, None::<&D3D12_SHADER_RESOURCE_VIEW_DESC>, D3D12_CPU_DESCRIPTOR_HANDLE { ptr: s.pc_srv as usize });
+            dev.CreateShaderResourceView(None::<&ID3D12Resource>, None::<*const D3D12_SHADER_RESOURCE_VIEW_DESC>, D3D12_CPU_DESCRIPTOR_HANDLE { ptr: s.pc_srv as usize });
             if s.pc_uav != 0 {
-                dev.CreateUnorderedAccessView(None::<&ID3D12Resource>, None::<&ID3D12Resource>, None::<&D3D12_UNORDERED_ACCESS_VIEW_DESC>, D3D12_CPU_DESCRIPTOR_HANDLE { ptr: s.pc_uav as usize });
+                dev.CreateUnorderedAccessView(None::<&ID3D12Resource>, None::<&ID3D12Resource>, None::<*const D3D12_UNORDERED_ACCESS_VIEW_DESC>, D3D12_CPU_DESCRIPTOR_HANDLE { ptr: s.pc_uav as usize });
             }
             if s.shared_srv != 0 {
-                dev.CreateShaderResourceView(None::<&ID3D12Resource>, None::<&D3D12_SHADER_RESOURCE_VIEW_DESC>, D3D12_CPU_DESCRIPTOR_HANDLE { ptr: s.shared_srv as usize });
-                dev.CreateUnorderedAccessView(None::<&ID3D12Resource>, None::<&ID3D12Resource>, None::<&D3D12_UNORDERED_ACCESS_VIEW_DESC>, D3D12_CPU_DESCRIPTOR_HANDLE { ptr: s.shared_srv + inc as u64 });
+                dev.CreateShaderResourceView(None::<&ID3D12Resource>, None::<*const D3D12_SHADER_RESOURCE_VIEW_DESC>, D3D12_CPU_DESCRIPTOR_HANDLE { ptr: s.shared_srv as usize });
+                dev.CreateUnorderedAccessView(None::<&ID3D12Resource>, None::<&ID3D12Resource>, None::<*const D3D12_UNORDERED_ACCESS_VIEW_DESC>, D3D12_CPU_DESCRIPTOR_HANDLE { ptr: s.shared_srv + inc as u64 });
             }
         }
     }
