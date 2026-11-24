@@ -87,7 +87,8 @@ fn a_resource_released_after_submit_outlives_its_submission() {
 
         let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() }).expect("queue");
         let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).expect("fence");
-        queue.ExecuteCommandLists(&[Some(list.cast().unwrap())]);
+        let wrapper = ID3D12GraphicsCommandList::from_raw_borrowed(&raw_list).expect("title list");
+        queue.ExecuteCommandLists(&[Some(wrapper.cast().unwrap())]);
 
         // the title's references go now, on a GPU that may still be running the copy
         release(src.as_raw() as usize);
