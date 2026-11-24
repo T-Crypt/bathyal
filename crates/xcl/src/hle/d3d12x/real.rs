@@ -6507,6 +6507,7 @@ mod refused_rt_gpu_tests {
                 },
             };
             list.ResourceBarrier(&[to_rt]);
+            let bound: Vec<D3D12_CPU_DESCRIPTOR_HANDLE> = bound.iter().map(|&ptr| D3D12_CPU_DESCRIPTOR_HANDLE { ptr }).collect();
             list.OMSetRenderTargets(2, Some(bound.as_ptr()), false, None);
             // a clear of the null slot would be skipped by `cl_clear_rtv`; the target's own clear
             // still runs at its index
