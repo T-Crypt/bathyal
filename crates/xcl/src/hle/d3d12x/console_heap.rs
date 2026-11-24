@@ -716,7 +716,7 @@ pub unsafe fn write_null(dev: &ID3D12Device, s: &Slot, kind: NullKind) {
             let class = class.min(2);
             if s.shared {
                 // a place of the slot's own if it has one, else the universal null
-                let index = s.shared_srv.then(|| null_view_index(dev, ty, class)).flatten().unwrap_or(NULL_INDEX);
+                let index = if s.shared_srv != 0 { null_view_index(dev, ty, class) } else { None }.unwrap_or(NULL_INDEX);
                 write(s, &crate::gpu::desc::null_image_words(index, ty, class));
             } else {
                 // the title's own CPU-only heap: a typed null at the slot's PC handle
@@ -1028,7 +1028,7 @@ mod tests {
         assert_eq!((i.ty, i.width, i.height, i.depth), (crate::gpu::desc::ImageType::D2, 1, 1, 1));
         assert_eq!(i.format, crate::gpu::desc::null_class_format(0));
         assert_eq!(w[0], NULL_INDEX, "word 0 is the null pool's SRV, not index 0 of the window UAVs");
-        let v = crate::gpu::desc::buffer(&w[..4]);
+        let v = crate::gpu::desc::buffer(&[w[0], w[1], w[2], w[3]]);
         assert_eq!(v.num_records, 0, "the same words are a V# of no records: a buffer read returns zero");
         assert_eq!(w[2], 0);
     }

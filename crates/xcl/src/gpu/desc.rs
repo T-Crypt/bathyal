@@ -661,7 +661,7 @@ mod view_tests {
                 assert_eq!(i.format, null_class_format(class));
                 assert_eq!((i.base_level, i.last_level), (0, 0));
                 assert_eq!(w[0], 77, "word 0 is the null SRV's heap index");
-                let v = buffer(&w[..4]);
+                let v = buffer(&[w[0], w[1], w[2], w[3]]);
                 assert_eq!((v.num_records, w[2]), (0, 0), "{ty:?} class {class}: a V# of no records too");
             }
         }
