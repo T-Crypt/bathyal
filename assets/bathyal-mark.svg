@@ -1,0 +1,69 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256" role="img" aria-labelledby="mt md">
+  <title id="mt">Bathyal mark</title>
+  <desc id="md">The Bathyal mark: a near-black square of night sky. One bright point sits at the top centre with a thin
+halo and a faint ring. A low horizon line crosses the lower third, and a fan of faint lines rises from that horizon and
+converges on the point, standing for translated GPU programs.</desc>
+  <defs>
+    <linearGradient id="msky" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#02040a"/>
+      <stop offset="0.6" stop-color="#070c17"/>
+      <stop offset="1" stop-color="#0e1729"/>
+    </linearGradient>
+    <radialGradient id="mhalo" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0" stop-color="#9fb4ff" stop-opacity="0.5"/>
+      <stop offset="0.35" stop-color="#8fa8ff" stop-opacity="0.16"/>
+      <stop offset="1" stop-color="#8fa8ff" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="mhz" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#9fb4ff" stop-opacity="0"/>
+      <stop offset="0.22" stop-color="#c9d5ff" stop-opacity="0.75"/>
+      <stop offset="0.5" stop-color="#ffffff" stop-opacity="1"/>
+      <stop offset="0.78" stop-color="#c9d5ff" stop-opacity="0.75"/>
+      <stop offset="1" stop-color="#9fb4ff" stop-opacity="0"/>
+    </linearGradient>
+    <linearGradient id="mbeam" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#9fb4ff" stop-opacity="0.34"/>
+      <stop offset="1" stop-color="#9fb4ff" stop-opacity="0.03"/>
+    </linearGradient>
+    <filter id="mglow" x="-200%" y="-200%" width="500%" height="500%">
+      <feGaussianBlur stdDeviation="2.2" result="b"/>
+      <feMerge>
+        <feMergeNode in="b"/>
+        <feMergeNode in="b"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+    <clipPath id="mClip">
+      <rect x="0" y="0" width="256" height="184"/>
+    </clipPath>
+  </defs>
+
+  <rect width="256" height="256" fill="url(#msky)"/>
+
+  <g clip-path="url(#mClip)" stroke="#8fa8ff" stroke-width="0.55" fill="none" stroke-opacity="0.15">
+    <line x1="6" y1="184" x2="128" y2="62"/>
+    <line x1="30" y1="184" x2="128" y2="62"/>
+    <line x1="56" y1="184" x2="128" y2="62"/>
+    <line x1="84" y1="184" x2="128" y2="62"/>
+    <line x1="110" y1="184" x2="128" y2="62"/>
+    <line x1="146" y1="184" x2="128" y2="62"/>
+    <line x1="172" y1="184" x2="128" y2="62"/>
+    <line x1="200" y1="184" x2="128" y2="62"/>
+    <line x1="226" y1="184" x2="128" y2="62"/>
+    <line x1="250" y1="184" x2="128" y2="62"/>
+  </g>
+  <g clip-path="url(#mClip)" stroke="#8fa8ff" stroke-width="0.55" fill="none" stroke-opacity="0.1">
+    <path d="M74 140 Q 128 122 182 140"/>
+    <path d="M94 106 Q 128 92 162 106"/>
+  </g>
+
+  <line x1="128" y1="62" x2="128" y2="184" stroke="url(#mbeam)" stroke-width="0.9" stroke-dasharray="2 8"/>
+  <circle cx="128" cy="62" r="62" fill="url(#mhalo)"/>
+  <circle cx="128" cy="62" r="20" fill="none" stroke="#9fb4ff" stroke-opacity="0.42" stroke-width="0.8"/>
+  <circle cx="128" cy="62" r="5.6" fill="#eaf0ff" filter="url(#mglow)"/>
+  <circle cx="128" cy="62" r="1.9" fill="#ffffff"/>
+
+  <line x1="0" y1="184" x2="256" y2="184" stroke="url(#mhz)" stroke-width="2.2" filter="url(#mglow)"/>
+  <line x1="14" y1="189" x2="242" y2="189" stroke="#9fb4ff" stroke-opacity="0.26" stroke-width="0.8"/>
+  <rect x="0" y="184" width="256" height="72" fill="#02040a" opacity="0.45"/>
+</svg>
