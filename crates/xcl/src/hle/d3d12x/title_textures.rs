@@ -662,11 +662,10 @@ pub(super) unsafe fn refresh(queue: *mut c_void) {
 
 /// GetWriteWatch with reset over `ranges`: every written page's address goes to `dirty`.
 ///
-/// When the buffer fills, the call reports the pages that fitted and leaves the rest dirty, and
-/// the next call walks the whole range again from its base (measured: a 2 GiB range with 100k
-/// dirty pages and a 16384-entry buffer costs one walk per bufferful). A look that finds more
-/// pages than the buffer holds therefore costs several walks; the buffer grows to hold what the
-/// range has, up to `MAX_WATCH_BUF` entries.
+/// A full buffer goes on after the last page it reported (`page`: the pages' size). Starting
+/// again at the range's base walked the pages already reset each time (4 GiB with every page
+/// written: 105 ms a look, 47 ms going on). The buffer also grows to hold what a range has, up to
+/// `MAX_WATCH_BUF` entries.
 unsafe fn watch_into(ranges: &[(usize, usize)], buf: &mut Vec<*mut c_void>, dirty: &mut Vec<usize>, page: &mut u32) {
     /// 4M pages (16 GiB of 4 KiB pages) held as 32 MiB of pointers
     const MAX_WATCH_BUF: usize = 4 << 20;
@@ -674,15 +673,18 @@ unsafe fn watch_into(ranges: &[(usize, usize)], buf: &mut Vec<*mut c_void>, dirt
         buf.resize(16384, std::ptr::null_mut());
     }
     for &(base, size) in ranges {
-        loop {
+        let end = base + size;
+        let mut at = base;
+        while at < end {
             let mut n = buf.len();
-            if GetWriteWatch(WRITE_WATCH_FLAG_RESET, base as *const c_void, size, buf.as_mut_ptr(), &mut n, page) != 0 {
+            if GetWriteWatch(WRITE_WATCH_FLAG_RESET, at as *const c_void, end - at, buf.as_mut_ptr(), &mut n, page) != 0 {
                 break;
             }
             dirty.extend(buf[..n].iter().map(|&p| p as usize));
-            if n < buf.len() {
+            if n == 0 || n < buf.len() {
                 break;
             }
+            at = buf[n - 1] as usize + *page as usize;
             if buf.len() < MAX_WATCH_BUF {
                 buf.resize((buf.len() * 4).min(MAX_WATCH_BUF), std::ptr::null_mut());
             }
@@ -1333,6 +1335,37 @@ mod tests {
             VirtualFree(gpu as *mut c_void, 0, MEM_RELEASE);
             assert_eq!(after, at);
             assert_eq!(before, at, "a page mapped at the address but not used yet is its source too");
+        }
+    }
+
+    /// More written pages than one call reports: each is found once, in order, and the look
+    /// resets them – a buffer that fills in the middle of the range and one that fills exactly.
+    #[test]
+    fn written_pages_past_a_full_buffer_are_all_found_once() {
+        use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE};
+        const MEM_WRITE_WATCH: u32 = 0x20_0000;
+        const PAGES: usize = 1000;
+        const PAGE: usize = 0x1000;
+        unsafe {
+            let base = VirtualAlloc(std::ptr::null(), PAGES * PAGE, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE) as usize;
+            assert!(base != 0);
+            let mut buf = vec![std::ptr::null_mut::<c_void>(); 64];
+            let (mut dirty, mut page) = (Vec::new(), 0u32);
+            take_written(base, PAGES * PAGE, &mut buf, &mut dirty, &mut page);
+            for written in [(0..PAGES).filter(|i| i % 7 != 3).collect::<Vec<_>>(), (0..128).map(|i| i * 5).collect()] {
+                let want: Vec<usize> = written.iter().map(|i| base + i * PAGE).collect();
+                for &a in &want {
+                    (a as *mut u8).write_volatile(1);
+                }
+                dirty.clear();
+                take_written(base, PAGES * PAGE, &mut buf, &mut dirty, &mut page);
+                assert_eq!(page as usize, PAGE);
+                assert_eq!(dirty, want, "{} pages written", want.len());
+                dirty.clear();
+                take_written(base, PAGES * PAGE, &mut buf, &mut dirty, &mut page);
+                assert!(dirty.is_empty(), "the look reset what it reported");
+            }
+            VirtualFree(base as *mut c_void, 0, MEM_RELEASE);
         }
     }
 
