@@ -27,7 +27,7 @@ use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_UNKNOWN, DXGI_SAMPLE_DESC};
 
 /// `D3D12_HEAP_TYPE_GPU_UPLOAD` (Agility SDK 1.613; the crate's bindings may predate it)
-const HEAP_TYPE_GPU_UPLOAD: i32 = 4;
+const HEAP_TYPE_GPU_UPLOAD: i32 = 5;
 /// granularity of an allocation in the heap (a resource placement alignment)
 const GRAIN: usize = 0x1_0000;
 /// small enough for `io` / `res` blocks and far from the card's 24 GB
