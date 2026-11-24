@@ -117,7 +117,7 @@ fn a_resource_released_after_submit_outlives_its_submission() {
 
         let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() }).expect("queue");
         let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).expect("fence");
-        if pure {
+        if pure && std::env::var_os("XCL_TEST_MIX").is_none() {
             let qdesc = D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() };
             type QF = unsafe extern "system" fn(*mut c_void, *const D3D12_COMMAND_QUEUE_DESC, *const windows::core::GUID, *mut *mut c_void) -> i32;
             let qf: QF = std::mem::transmute(real::orig_fn(dev.as_raw() as *mut c_void, 8));
