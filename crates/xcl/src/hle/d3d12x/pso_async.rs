@@ -640,8 +640,7 @@ mod tests {
         assert_eq!(resolve_wait(standin), standin);
         assert!(!p.is_active());
         assert_eq!(released(standin), 0);
-
-    use std::time::{Duration, Instant};
+    }
 
     #[test]
     fn bounded_compute_wait_times_out_then_resolves_once_worker_finishes() {
