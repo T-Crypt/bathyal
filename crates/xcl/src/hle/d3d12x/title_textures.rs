@@ -955,6 +955,41 @@ fn content_hash(b: &[u8]) -> u64 {
     h.iter().fold(tail, |a, &l| (a ^ l).wrapping_mul(K).rotate_left(27))
 }
 
+/// texture → `content_hash` of its memory at its last upload
+static LAST_CONTENT: Mutex<BTreeMap<usize, u64>> = Mutex::new(BTreeMap::new());
+static UNCHANGED: AtomicU64 = AtomicU64::new(0);
+
+/// `XCL_TEXTURE_SKIP_UNCHANGED=0` uploads a texture whenever its pages were written, as before.
+fn unchanged_skip() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XCL_TEXTURE_SKIP_UNCHANGED").map_or(true, |v| v.trim() != "0"))
+}
+
+/// Whether texture `res` was last uploaded from memory with hash `h`; `h` is remembered as its
+/// content from here on (the caller uploads it when this is false).
+fn same_as_last_upload(res: usize, h: u64) -> bool {
+    LAST_CONTENT.lock().unwrap().insert(res, h) == Some(h)
+}
+
+/// A 64-bit hash of `b` for "the same bytes as before" (four lanes of multiply-rotate over
+/// 8-byte words: gigabytes a second; not for anything adversarial).
+fn content_hash(b: &[u8]) -> u64 {
+    const K: u64 = 0x9E37_79B9_7F4A_7C15;
+    let mut h = [K, K.rotate_left(17), K.rotate_left(31), K.rotate_left(47)];
+    let mut chunks = b.chunks_exact(32);
+    for c in &mut chunks {
+        for (k, lane) in h.iter_mut().enumerate() {
+            let v = u64::from_le_bytes(c[k * 8..k * 8 + 8].try_into().unwrap());
+            *lane = (*lane ^ v).wrapping_mul(K).rotate_left(29);
+        }
+    }
+    let mut tail = b.len() as u64;
+    for (k, &x) in chunks.remainder().iter().enumerate() {
+        tail = (tail ^ ((x as u64) << (8 * (k % 8)))).wrapping_mul(K).rotate_left(23);
+    }
+    h.iter().fold(tail, |a, &l| (a ^ l).wrapping_mul(K).rotate_left(27))
+}
+
 /// staging bytes of one batch at most
 const BATCH_BYTES: usize = 256 << 20;
 

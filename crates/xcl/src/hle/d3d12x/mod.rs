@@ -24,6 +24,7 @@ pub mod null;
 pub mod present;
 pub mod pso_async;
 mod pso_disk;
+mod queue_gate;
 pub mod real;
 pub mod sparse;
 pub mod title_list;

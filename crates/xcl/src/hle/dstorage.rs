@@ -183,6 +183,70 @@ impl BcpackRefusals {
 
 static BCPACK: BcpackRefusals = BcpackRefusals::new();
 
+/// BCPack requests that upstream cannot decode (`hle::bcpack` has no rebuild for the mode on
+/// this branch), completed with a placeholder block instead of failing, by mode.
+struct BcpackPlaceholders {
+    requests: [AtomicU64; 16],
+    bytes: [AtomicU64; 16],
+}
+
+impl BcpackPlaceholders {
+    const fn new() -> Self {
+        const Z: AtomicU64 = AtomicU64::new(0);
+        Self { requests: [Z; 16], bytes: [Z; 16] }
+    }
+
+    /// Count one completed request of `mode`; the placeholders so far, this one included.
+    fn note(&self, mode: u8, bytes: usize) -> u64 {
+        let i = mode as usize & 0xF;
+        self.requests[i].fetch_add(1, Ordering::Relaxed);
+        self.bytes[i].fetch_add(bytes as u64, Ordering::Relaxed);
+        self.requests.iter().map(|r| r.load(Ordering::Relaxed)).sum()
+    }
+
+    fn summary(&self) -> String {
+        (1..16u8)
+            .filter(|&m| self.requests[m as usize].load(Ordering::Relaxed) > 0)
+            .map(|m| {
+                let i = m as usize;
+                format!(
+                    "{} {} ({} bytes)",
+                    bcpack_name(m),
+                    self.requests[i].load(Ordering::Relaxed),
+                    self.bytes[i].load(Ordering::Relaxed)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    fn stats(&self) -> BTreeMap<String, BcpackStats> {
+        (1..16u8)
+            .filter(|&m| self.requests[m as usize].load(Ordering::Relaxed) > 0)
+            .map(|m| {
+                let i = m as usize;
+                let bytes = self.bytes[i].load(Ordering::Relaxed);
+                let s = BcpackStats { requests: self.requests[i].load(Ordering::Relaxed), with_zlib: 0, destination_bytes: bytes, filled_bytes: bytes };
+                (bcpack_name(m), s)
+            })
+            .collect()
+    }
+}
+
+static PLACEHOLDERS: BcpackPlaceholders = BcpackPlaceholders::new();
+
+/// Count one completed placeholder, and log one line with the running total and its breakdown
+/// by mode on the first 16 and every power of two, as the refusals counter does.
+fn log_bcpack_placeholder(r: &Request) {
+    let k = PLACEHOLDERS.note(r.bcpack(), r.destination_size as usize);
+    if k <= 16 || k.is_power_of_two() {
+        crate::xlog_info!(
+            "DirectStorage: BCPack placeholders so far: {k} requests completed with a solid block (S_OK): {}",
+            PLACEHOLDERS.summary()
+        );
+    }
+}
+
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct BcpackStats {
     pub requests: u64,
@@ -190,7 +254,8 @@ pub struct BcpackStats {
     pub with_zlib: u64,
     /// bytes the title's destinations were to receive
     pub destination_bytes: u64,
-    /// bytes written by `XCL_DSTORAGE_BCPACK_FILL`
+    /// bytes written to the destinations: by `XCL_DSTORAGE_BCPACK_FILL` for a refusal, and by the
+    /// placeholder block for `bcpack_placeholder`
     pub filled_bytes: u64,
 }
 
@@ -297,7 +362,8 @@ fn log_bcpack_refusal(r: &Request, k: u64) {
 
 /// `XCL_DSTORAGE_BCPACK_FILL=1`: a refused BCPack destination gets solid blocks of its BCn
 /// format (magenta; red for BC4/BC5) instead of staying as it was, so the title's textures
-/// that wait on BCPack show where they are. The request still fails.
+/// that wait on BCPack show where they are. The request still fails. Only a refusal reaches it
+/// (with `XCL_BCPACK_PLACEHOLDER=0`; otherwise the request completes with a placeholder).
 fn bcpack_fill_from_env() -> bool {
     std::env::var("XCL_DSTORAGE_BCPACK_FILL").is_ok_and(|v| !v.trim().is_empty() && v.trim() != "0")
 }
@@ -328,6 +394,28 @@ fn bcpack_fill_block(mode: u8) -> Option<Vec<u8>> {
     })
 }
 
+/// `XCL_BCPACK_PLACEHOLDER=0`: a BCPack request whose mode has no decoder fails with
+/// E_DECOMPRESSION as before. Any other value, or no variable, completes it with a placeholder
+/// block.
+fn bcpack_placeholder_enabled() -> bool {
+    !std::env::var("XCL_BCPACK_PLACEHOLDER").is_ok_and(|v| v.trim() == "0")
+}
+
+/// A solid BC7 mode-6 block: every texel (127, 127, 127, 255), opaque mid grey. Mode 6, one
+/// subset; the endpoints are 7-bit r/g/b 63 with p-bit 1 (127 in 8 bits) and 7-bit alpha 127
+/// with p-bit 1 (255); every index is 0, the first stored as 3 bits (its high bit is dropped).
+const BC7_GREY: [u8; 16] = [0xC0, 0xDF, 0xEF, 0xF7, 0xFB, 0xFD, 0xFE, 0xFF, 0x01, 0, 0, 0, 0, 0, 0, 0];
+
+/// One solid block of `mode`'s BCn format for a placeholder texture: BC7 mid grey, the other
+/// modes the same solid blocks `XCL_DSTORAGE_BCPACK_FILL` uses. `None` for a mode whose block
+/// size is not known (`DSTORAGE_BCPACK_MODE` 8..=15).
+fn bcpack_placeholder_block(mode: u8) -> Option<Vec<u8>> {
+    match mode {
+        7 => Some(BC7_GREY.to_vec()),
+        _ => bcpack_fill_block(mode),
+    }
+}
+
 /// Where a refused BCPack request's fill goes: its virtual destination, or the physical pages
 /// it named (snapshot at enqueue, as for a request that runs).
 enum FillTarget {
@@ -356,6 +444,27 @@ unsafe fn bcpack_fill(r: &Request, target: &FillTarget) -> bool {
         BCPACK.filled_bytes[r.bcpack() as usize & 0xF].fetch_add(n as u64, Ordering::Relaxed);
     }
     ok
+}
+
+/// Fill `r`'s destination (exactly `destination_size` bytes) with the placeholder block of its
+/// mode. `false` when the mode has no block or the destination cannot be written.
+unsafe fn bcpack_placeholder_write(r: &Request, dest_pages: Option<&[usize]>) -> bool {
+    let Some(block) = bcpack_placeholder_block(r.bcpack()) else { return false };
+    let n = r.destination_size as usize;
+    let bytes: Vec<u8> = block.iter().copied().cycle().take(n).collect();
+    if r.dest_physical_pages() {
+        let Some(snapshot) = dest_pages else { return false };
+        let pages = destination_pages_at_turn(r, snapshot);
+        crate::hle::kernelx::write_physical_pages(&pages, r.destination_page_offset as usize, &bytes)
+    } else {
+        if !writable(r.destination as usize, n) {
+            return false;
+        }
+        if n > 0 {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), r.destination as *mut u8, n);
+        }
+        true
+    }
 }
 
 /// A vtable: the listed methods, then logged E_NOTIMPL stubs up to `total` entries.
@@ -883,8 +992,16 @@ pub fn counters() -> (u64, u64, u64) {
     (REQUESTS.load(Ordering::Relaxed), BYTES.load(Ordering::Relaxed), FAILED.load(Ordering::Relaxed))
 }
 
+/// Tests: a request with this destination unwinds in `execute`.
+#[cfg(test)]
+static TEST_PANIC_DEST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Run a request; the destination gets the bytes or nothing.
 unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[usize]>, src_pages: Option<&[usize]>) -> Result<(), HRESULT> {
+    #[cfg(test)]
+    if r.destination == TEST_PANIC_DEST.load(Ordering::Relaxed) {
+        panic!("test: a request's execution unwinds");
+    }
     let n = r.destination_size as usize;
     {
         // the first requests: where a title's data goes and how it is packed
@@ -937,6 +1054,16 @@ unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[us
     let bc = r.bcpack();
     if r.swizzle() != 0 || (bc != 0 && !super::bcpack::can_decode(bc)) {
         return Err(E_DECOMPRESSION);
+    }
+    // No BCPack mode has a decoder on this branch: the queue routes such a request to
+    // `Entry::Placeholder`, and one that reaches here anyway completes with a placeholder
+    // block, or fails as before.
+    if r.bcpack() != 0 {
+        if !bcpack_placeholder_enabled() || !bcpack_placeholder_write(r, dest_pages) {
+            return Err(E_DECOMPRESSION);
+        }
+        log_bcpack_placeholder(r);
+        return Ok(());
     }
 
     // the stages in the console's order: zlib, then BCPack
@@ -1014,6 +1141,13 @@ enum Entry {
         /// a refused BCPack request under `XCL_DSTORAGE_BCPACK_FILL`: where its solid blocks go
         fill: Option<FillTarget>,
     },
+    /// a BCPack request whose mode has no decoder, under `XCL_BCPACK_PLACEHOLDER`: the worker
+    /// fills the destination with a placeholder block and the request succeeds
+    Placeholder {
+        seq: u64,
+        req: Request,
+        dest_pages: Option<Vec<usize>>,
+    },
     Status(Arc<StatusInner>, u32),
     /// a fence (one reference held) and the value it gets
     Signal(FenceRef, u64),
@@ -1051,8 +1185,14 @@ struct QueueInner {
     closed: AtomicBool,
     error_event: usize,
     errors: Mutex<(u32, Option<FirstError>)>,
+    /// the first failure of the requests since the last status entry (the console's record), in
+    /// the queue rather than in one worker: a status entry still reports a failure recorded
+    /// before the worker was replaced. `S_OK` when no request failed.
+    failed_since_status: AtomicI32,
     /// `XCL_DSTORAGE_BCPACK_FILL` when the queue was made
     bcpack_fill: AtomicBool,
+    /// `XCL_BCPACK_PLACEHOLDER` when the queue was made
+    bcpack_placeholder: AtomicBool,
 }
 
 impl QueueInner {
@@ -1078,33 +1218,50 @@ impl QueueInner {
     fn submit(self: &Arc<Self>) {
         // Lock `worker` before `pending` so concurrent `Submit()` calls always enqueue
         // batches to the channel in strict `seq` order.
-        let mut w = self.worker.lock().unwrap();
-        if self.closed.load(Ordering::Acquire) {
-            return;
-        }
-        let batch = std::mem::take(&mut self.pending.lock().unwrap().entries);
-        if batch.is_empty() {
-            return;
-        }
-        if w.is_none() {
-            let (tx, rx) = mpsc::channel::<Vec<Entry>>();
-            let q = Arc::clone(self);
-            *self.worker_active.0.lock().unwrap() = true;
-            let started = std::thread::Builder::new().name("xcl-dstorage".into()).spawn(move || q.run(rx));
-            if started.is_err() {
-                *self.worker_active.0.lock().unwrap() = false;
-                self.worker_active.1.notify_all();
-                // Release `worker` before dropping `batch` so fence `Release` cannot re-enter under lock.
-                drop(w);
-                drop(batch);
+        let orphan = {
+            let mut w = self.worker.lock().unwrap();
+            if self.closed.load(Ordering::Acquire) {
                 return;
             }
-            *w = Some(tx);
+            let batch = std::mem::take(&mut self.pending.lock().unwrap().entries);
+            if batch.is_empty() {
+                return;
+            }
+            self.hand_over(&mut w, batch)
+        };
+        // A batch no worker took runs here, so its status entries and fence signals still
+        // complete instead of staying pending for the rest of the session.
+        if let Some(batch) = orphan {
+            self.run_inline(batch);
         }
-        let sent = w.as_ref().unwrap().send(batch);
-        // Release `worker` before dropping any unsent `batch` returned in `Err`.
-        drop(w);
-        drop(sent);
+    }
+
+    /// Hands `batch` to the queue's worker, starting one when there is none or when the last
+    /// one's thread is gone. Returns the batch when no worker could be started.
+    fn hand_over(self: &Arc<Self>, w: &mut Option<mpsc::Sender<Vec<Entry>>>, batch: Vec<Entry>) -> Option<Vec<Entry>> {
+        let mut batch = batch;
+        for _ in 0..2 {
+            if w.is_none() {
+                let (tx, rx) = mpsc::channel::<Vec<Entry>>();
+                let q = Arc::clone(self);
+                *self.worker_active.0.lock().unwrap() = true;
+                if std::thread::Builder::new().name("xcl-dstorage".into()).spawn(move || q.run(rx)).is_err() {
+                    *self.worker_active.0.lock().unwrap() = false;
+                    self.worker_active.1.notify_all();
+                    return Some(batch);
+                }
+                *w = Some(tx);
+            }
+            match w.as_ref().unwrap().send(batch) {
+                Ok(()) => return None,
+                // the worker's thread has gone: a new one takes this batch
+                Err(mpsc::SendError(unsent)) => {
+                    *w = None;
+                    batch = unsent;
+                }
+            }
+        }
+        Some(batch)
     }
 
     fn run(&self, rx: mpsc::Receiver<Vec<Entry>>) {
@@ -1116,57 +1273,93 @@ impl QueueInner {
             }
         }
         let _active = ActiveGuard(self);
-        // the first failure of the requests since the last status entry
-        let mut since_status = S_OK;
         for batch in rx {
-            for e in batch {
-                if self.closed.load(Ordering::Acquire) {
-                    if let Entry::Status(s, i) = e {
-                        if let Some(slot) = s.slots.get(i as usize) {
-                            slot.store(E_QUEUE_CLOSED, Ordering::Release);
-                        }
+            self.run_batch(batch);
+        }
+    }
+
+    /// Runs a batch on the calling thread. `Close` waits for it like for the worker's batches.
+    fn run_inline(self: &Arc<Self>, batch: Vec<Entry>) {
+        *self.worker_active.0.lock().unwrap() = true;
+        self.run_batch(batch);
+        *self.worker_active.0.lock().unwrap() = false;
+        self.worker_active.1.notify_all();
+    }
+
+    fn run_batch(&self, batch: Vec<Entry>) {
+        for e in batch {
+            if self.closed.load(Ordering::Acquire) {
+                if let Entry::Status(s, i) = e {
+                    if let Some(slot) = s.slots.get(i as usize) {
+                        slot.store(E_QUEUE_CLOSED, Ordering::Release);
                     }
-                    continue;
                 }
-                match e {
-                    Entry::Request { seq, req, file, dest_pages, src_pages } => {
-                        if self.is_cancelled(seq, req.tag) {
-                            // Cancelled requests are skipped without affecting status or error record.
-                            continue;
-                        }
-                        if let Err(hr) = unsafe { execute(&req, file.as_deref(), dest_pages.as_deref(), src_pages.as_deref()) } {
-                            self.fail(hr, req, file.as_deref());
-                            if since_status >= 0 {
-                                since_status = hr;
-                            }
-                        }
+                continue;
+            }
+            match e {
+                Entry::Request { seq, req, file, dest_pages, src_pages } => {
+                    if self.is_cancelled(seq, req.tag) {
+                        // Cancelled requests are skipped without affecting status or error record.
+                        continue;
                     }
-                    Entry::Refused { hr, req, file, fill } => {
-                        if let Some(t) = &fill {
-                            // the destination gets solid blocks; the request still fails
-                            unsafe { bcpack_fill(&req, t) };
-                        }
+                    let run = || unsafe { execute(&req, file.as_deref(), dest_pages.as_deref(), src_pages.as_deref()) };
+                    // A request that unwinds fails like one that returns an error: the failure
+                    // reaches the queue's error record and status entries, and the requests
+                    // queued behind it still run.
+                    let hr = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(run)) {
+                        Ok(Ok(())) => None,
+                        Ok(Err(hr)) => Some(hr),
+                        Err(_) => Some(E_ABORT),
+                    };
+                    if let Some(hr) = hr {
                         self.fail(hr, req, file.as_deref());
-                        if since_status >= 0 {
-                            since_status = hr;
-                        }
+                        self.note_failure(hr);
                     }
-                    Entry::Status(s, i) => {
-                        if let Some(slot) = s.slots.get(i as usize) {
-                            slot.store(since_status, Ordering::Release);
-                        }
-                        since_status = S_OK;
+                }
+                Entry::Placeholder { seq, req, dest_pages } => {
+                    if self.is_cancelled(seq, req.tag) {
+                        continue;
                     }
-                    Entry::Signal(fence, value) => unsafe {
-                        fence.signal(value);
-                    },
-                    #[cfg(test)]
-                    Entry::Gate(b) => {
-                        b.wait();
+                    // a destination pages array filled in after Submit gets the same grace
+                    if unsafe { bcpack_placeholder_write(&req, dest_pages.as_deref()) } {
+                        log_bcpack_placeholder(&req);
+                    } else {
+                        self.fail(E_ACCESS_VIOLATION, req, None);
+                        self.note_failure(E_ACCESS_VIOLATION);
                     }
+                }
+                Entry::Refused { hr, req, file, fill } => {
+                    if let Some(t) = &fill {
+                        // the destination gets solid blocks; the request still fails
+                        unsafe { bcpack_fill(&req, t) };
+                    }
+                    self.fail(hr, req, file.as_deref());
+                    self.note_failure(hr);
+                }
+                Entry::Status(s, i) => {
+                    if let Some(slot) = s.slots.get(i as usize) {
+                        slot.store(self.take_failure(), Ordering::Release);
+                    }
+                }
+                Entry::Signal(fence, value) => unsafe {
+                    fence.signal(value);
+                },
+                #[cfg(test)]
+                Entry::Gate(b) => {
+                    b.wait();
                 }
             }
         }
+    }
+
+    /// Remembers the first failure of the requests since the last status entry.
+    fn note_failure(&self, hr: HRESULT) {
+        let _ = self.failed_since_status.compare_exchange(S_OK, hr, Ordering::AcqRel, Ordering::Relaxed);
+    }
+
+    /// The first failure since the last status entry, clearing it.
+    fn take_failure(&self) -> HRESULT {
+        self.failed_since_status.swap(S_OK, Ordering::AcqRel)
     }
 
     fn enqueue(self: &Arc<Self>, e: Entry) {
@@ -1198,6 +1391,22 @@ impl QueueInner {
             let seq = p.next_seq;
             p.next_seq += 1;
             p.entries.push(Entry::Request { seq, req, file, dest_pages, src_pages });
+            p.entries.len()
+        };
+        if n >= (self.capacity / 2).max(1) {
+            self.submit();
+        }
+    }
+
+    fn enqueue_placeholder(self: &Arc<Self>, req: Request, dest_pages: Option<Vec<usize>>) {
+        let n = {
+            let mut p = self.pending.lock().unwrap();
+            if self.closed.load(Ordering::Acquire) {
+                return;
+            }
+            let seq = p.next_seq;
+            p.next_seq += 1;
+            p.entries.push(Entry::Placeholder { seq, req, dest_pages });
             p.entries.len()
         };
         if n >= (self.capacity / 2).max(1) {
@@ -1272,7 +1481,9 @@ unsafe extern "system" fn factory_create_queue(_p: *mut c_void, desc: *const u8,
         closed: AtomicBool::new(false),
         error_event: ev as usize,
         errors: Mutex::new((0, None)),
+        failed_since_status: AtomicI32::new(S_OK),
         bcpack_fill: AtomicBool::new(bcpack_fill_from_env()),
+        bcpack_placeholder: AtomicBool::new(bcpack_placeholder_enabled()),
     });
     let o = new_object(queue_vtbl(), inner);
     let hr = queue_qi(o, riid, out);
@@ -1315,6 +1526,26 @@ unsafe extern "system" fn queue_enqueue_request(p: *mut c_void, req: *const u8) 
     }
     let r = Request::parse(&*(req as *const [u8; REQUEST_BYTES]));
     if let Err(hr) = r.check(q.source_memory) {
+        // Nothing on this branch rebuilds BCPack blocks, so a request for one fails `check` at
+        // its stage with E_DECOMPRESSION. Under the default switch it completes with a solid
+        // block of its mode instead: a title that waits on the request got its data on the
+        // console, and a request it never sees complete ended its session.
+        if hr == E_DECOMPRESSION
+            && r.bcpack() != 0
+            && r.swizzle() == 0
+            && bcpack_placeholder_block(r.bcpack()).is_some()
+            && q.bcpack_placeholder.load(Ordering::Relaxed)
+        {
+            let dest_pages = if r.dest_physical_pages() {
+                match snapshot_page_array(r.destination, r.destination_page_offset, r.destination_size) {
+                    Ok(pages) => Some(pages),
+                    Err(hr) => return q.enqueue(Entry::Refused { hr, req: r, file: None, fill: None }),
+                }
+            } else {
+                None
+            };
+            return q.enqueue_placeholder(r, dest_pages);
+        }
         warn_once("EnqueueRequest", format_args!("refused ({hr:#x}): {r:x?}"));
         let mut fill = None;
         if hr == E_DECOMPRESSION && r.bcpack() != 0 {
@@ -1403,7 +1634,7 @@ unsafe extern "system" fn queue_cancel(p: *mut c_void, mask: u64, value: u64) {
     let q = queue(p);
     let cutoff = {
         let mut pend = q.pending.lock().unwrap();
-        pend.entries.retain(|e| !matches!(e, Entry::Request { req, .. } if req.tag & mask == value));
+        pend.entries.retain(|e| !matches!(e, Entry::Request { req, .. } | Entry::Placeholder { req, .. } if req.tag & mask == value));
         pend.next_seq.saturating_sub(1)
     };
     if cutoff == 0 {
@@ -1513,6 +1744,35 @@ unsafe extern "system" fn queue_query(p: *mut c_void, out: *mut u8) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One test at a time changes the process environment.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// An environment variable set for the lifetime, restored on drop.
+    struct EnvVar(&'static str, Option<std::ffi::OsString>);
+
+    impl EnvVar {
+        fn set(k: &'static str, v: &str) -> EnvVar {
+            let old = std::env::var_os(k);
+            std::env::set_var(k, v);
+            EnvVar(k, old)
+        }
+
+        fn clear(k: &'static str) -> EnvVar {
+            let old = std::env::var_os(k);
+            std::env::remove_var(k);
+            EnvVar(k, old)
+        }
+    }
+
+    impl Drop for EnvVar {
+        fn drop(&mut self) {
+            match self.1.take() {
+                Some(v) => std::env::set_var(self.0, v),
+                None => std::env::remove_var(self.0),
+            }
+        }
+    }
 
     fn request(options: u64, dst: u64, dst_size: u32, src: u64, offset: u64, src_size: u32) -> [u8; REQUEST_BYTES] {
         let mut b = [0u8; REQUEST_BYTES];
@@ -2001,6 +2261,101 @@ mod tests {
             assert!(queue(q).pending.lock().unwrap().entries.is_empty());
             assert!(queue(q).worker.lock().unwrap().is_none());
 
+            queue_release(q);
+            status_release(s);
+        }
+    }
+
+    /// A request whose execution unwinds fails like one that returns an error: its status entry
+    /// reports the failure and the requests queued behind it still run.
+    #[test]
+    fn a_request_that_unwinds_still_completes_its_status() {
+        unsafe {
+            let mut f = std::ptr::null_mut();
+            assert_eq!(DStorageGetFactory(&IID_FACTORY, &mut f), S_OK);
+            let vt = *(f as *const *const usize);
+            let create_queue: unsafe extern "system" fn(*mut c_void, *const u8, *const GUID, *mut *mut c_void) -> HRESULT = std::mem::transmute(*vt.add(3));
+            let create_status: unsafe extern "system" fn(*mut c_void, u32, *const u8, *const GUID, *mut *mut c_void) -> HRESULT = std::mem::transmute(*vt.add(5));
+            let mut desc = [0u8; 0x18];
+            desc[0..4].copy_from_slice(&1u32.to_le_bytes());
+            desc[8..10].copy_from_slice(&8u16.to_le_bytes());
+            desc[10] = 2;
+            let mut q = std::ptr::null_mut();
+            assert_eq!(create_queue(f, desc.as_ptr(), &IID_QUEUE, &mut q), S_OK);
+            let mut s = std::ptr::null_mut();
+            assert_eq!(create_status(f, 2, std::ptr::null(), &IID_STATUS_ARRAY, &mut s), S_OK);
+
+            let data = [7u8; 8];
+            let mut dst = [0u8; 8];
+            TEST_PANIC_DEST.store(u64::MAX, Ordering::Relaxed);
+            queue_enqueue_request(q, request(SOURCE_MEMORY_BIT, u64::MAX, 8, data.as_ptr() as u64, 0, 8).as_ptr());
+            queue_enqueue_status(q, s, 0);
+            queue_enqueue_request(q, request(SOURCE_MEMORY_BIT, dst.as_mut_ptr() as u64, 8, data.as_ptr() as u64, 0, 8).as_ptr());
+            queue_enqueue_status(q, s, 1);
+            queue_submit(q);
+            let start = std::time::Instant::now();
+            while !status_is_complete(s, 1) && start.elapsed().as_secs() < 5 {
+                std::thread::yield_now();
+            }
+            TEST_PANIC_DEST.store(0, Ordering::Relaxed);
+            assert_eq!(status_get_hresult(s, 0), E_ABORT, "a request that unwinds fails");
+            assert_eq!(status_get_hresult(s, 1), S_OK, "the requests behind it still run");
+            assert_eq!(dst, [7u8; 8]);
+            queue_close(q);
+            queue_release(q);
+            status_release(s);
+        }
+    }
+
+    /// A batch handed to a worker whose thread is gone is not dropped: a new worker takes it, so
+    /// the status entry completes and the request's bytes land.
+    #[test]
+    fn a_batch_for_a_gone_worker_is_still_run() {
+        unsafe {
+            let mut f = std::ptr::null_mut();
+            assert_eq!(DStorageGetFactory(&IID_FACTORY, &mut f), S_OK);
+            let vt = *(f as *const *const usize);
+            let create_queue: unsafe extern "system" fn(*mut c_void, *const u8, *const GUID, *mut *mut c_void) -> HRESULT = std::mem::transmute(*vt.add(3));
+            let create_status: unsafe extern "system" fn(*mut c_void, u32, *const u8, *const GUID, *mut *mut c_void) -> HRESULT = std::mem::transmute(*vt.add(5));
+            let mut desc = [0u8; 0x18];
+            desc[0..4].copy_from_slice(&1u32.to_le_bytes());
+            desc[8..10].copy_from_slice(&8u16.to_le_bytes());
+            desc[10] = 2;
+            let mut q = std::ptr::null_mut();
+            assert_eq!(create_queue(f, desc.as_ptr(), &IID_QUEUE, &mut q), S_OK);
+            let mut s = std::ptr::null_mut();
+            assert_eq!(create_status(f, 2, std::ptr::null(), &IID_STATUS_ARRAY, &mut s), S_OK);
+
+            // the first batch starts the worker
+            queue_enqueue_status(q, s, 0);
+            queue_submit(q);
+            let start = std::time::Instant::now();
+            while !status_is_complete(s, 0) && start.elapsed().as_secs() < 5 {
+                std::thread::yield_now();
+            }
+            assert_eq!(status_get_hresult(s, 0), S_OK);
+
+            // the worker's channel and thread are gone (as after its thread ended)
+            {
+                let mut w = queue(q).worker.lock().unwrap();
+                let (tx, rx) = mpsc::channel::<Vec<Entry>>();
+                drop(rx);
+                *w = Some(tx);
+            }
+
+            let data = [3u8; 8];
+            let mut dst = [0u8; 8];
+            queue_enqueue_request(q, request(SOURCE_MEMORY_BIT, dst.as_mut_ptr() as u64, 8, data.as_ptr() as u64, 0, 8).as_ptr());
+            queue_enqueue_status(q, s, 1);
+            queue_submit(q);
+            let start = std::time::Instant::now();
+            while !status_is_complete(s, 1) && start.elapsed().as_secs() < 5 {
+                std::thread::yield_now();
+            }
+            assert!(status_is_complete(s, 1), "a batch for a gone worker must not stay pending");
+            assert_eq!(status_get_hresult(s, 1), S_OK);
+            assert_eq!(dst, [3u8; 8]);
+            queue_close(q);
             queue_release(q);
             status_release(s);
         }
@@ -2571,6 +2926,9 @@ mod tests {
     #[test]
     fn a_refused_bcpack_request_is_filled_only_under_the_switch() {
         unsafe {
+            // this test wants the refusal itself: turn off the placeholder for its queues
+            let _env = ENV_LOCK.lock().unwrap();
+            let _off = EnvVar::set("XCL_BCPACK_PLACEHOLDER", "0");
             let mut f = std::ptr::null_mut();
             assert_eq!(DStorageGetFactory(&IID_FACTORY, &mut f), S_OK);
             let vt = *(f as *const *const usize);
@@ -2617,6 +2975,102 @@ mod tests {
             assert!(dst[..n].chunks(16).all(|c| c == &block[..c.len()]), "solid BC7 blocks up to the destination size");
             assert!(dst[n..].iter().all(|&b| b == 0xCD), "nothing past the destination size");
             assert!(BCPACK.filled_bytes[7].load(Ordering::Relaxed) >= before + n as u64);
+            queue_close(q);
+            queue_release(q);
+            status_release(s);
+        }
+    }
+
+    /// A BC7 BCPack request (no decoder, no game data) completes under the default switch:
+    /// S_OK, the fence after it signals, and the destination holds the placeholder block. With
+    /// `XCL_BCPACK_PLACEHOLDER=0` it fails as before.
+    #[test]
+    fn an_undecodable_bcpack_request_completes_with_a_placeholder_block() {
+        let _env = ENV_LOCK.lock().unwrap();
+        // the block decodes as one mid-grey, opaque colour in the reference BC7 decoder
+        let block = bcpack_placeholder_block(7).unwrap();
+        assert_eq!(block, BC7_GREY.to_vec());
+        assert!(bc7_mode6_texels(&block).iter().all(|t| *t == [127, 127, 127, 255]), "BC7 placeholder: mid grey, opaque");
+        assert_eq!((bcpack_placeholder_block(8), bcpack_placeholder_block(0)), (None, None), "no block size: still refused");
+        unsafe {
+            let mut f = std::ptr::null_mut();
+            assert_eq!(DStorageGetFactory(&IID_FACTORY, &mut f), S_OK);
+            let vt = *(f as *const *const usize);
+            let create_queue: unsafe extern "system" fn(*mut c_void, *const u8, *const GUID, *mut *mut c_void) -> HRESULT = std::mem::transmute(*vt.add(3));
+            let create_status: unsafe extern "system" fn(*mut c_void, u32, *const u8, *const GUID, *mut *mut c_void) -> HRESULT = std::mem::transmute(*vt.add(5));
+            let mut desc = [0u8; 0x18];
+            desc[0..4].copy_from_slice(&1u32.to_le_bytes());
+            desc[8..10].copy_from_slice(&8u16.to_le_bytes());
+            desc[10] = 2;
+            let new_queue = |f: *mut c_void, cap: u32| {
+                let mut q = std::ptr::null_mut();
+                assert_eq!(create_queue(f, desc.as_ptr(), &IID_QUEUE, &mut q), S_OK);
+                let mut s = std::ptr::null_mut();
+                assert_eq!(create_status(f, cap, std::ptr::null(), &IID_STATUS_ARRAY, &mut s), S_OK);
+                (q, s)
+            };
+            let packed = [0x5Au8; 64];
+            let table = |q: *mut c_void| {
+                let qv = *(q as *const *const usize);
+                (
+                    std::mem::transmute::<usize, unsafe extern "system" fn(*mut c_void, *const u8)>(*qv.add(3)),
+                    std::mem::transmute::<usize, unsafe extern "system" fn(*mut c_void, *mut c_void, u32)>(*qv.add(4)),
+                    std::mem::transmute::<usize, unsafe extern "system" fn(*mut c_void)>(*qv.add(6)),
+                )
+            };
+            // one request of `mode` blocks through q/s; its status once the worker got there
+            let run = |q: *mut c_void, s: *mut c_void, dst: &mut [u8], n: u32, mode: u64, index: u32| {
+                let (enqueue, status, submit) = table(q);
+                let r = request(SOURCE_MEMORY_BIT | mode << BCPACK_SHIFT, dst.as_mut_ptr() as u64, n, packed.as_ptr() as u64, 0, packed.len() as u32);
+                enqueue(q, r.as_ptr());
+                status(q, s, index);
+                submit(q);
+                let sv = *(s as *const *const usize);
+                let complete: unsafe extern "system" fn(*mut c_void, u32) -> bool = std::mem::transmute(*sv.add(3));
+                let hresult: unsafe extern "system" fn(*mut c_void, u32) -> HRESULT = std::mem::transmute(*sv.add(4));
+                let t = std::time::Instant::now();
+                while !complete(s, index) && t.elapsed().as_secs() < 5 {
+                    std::thread::yield_now();
+                }
+                hresult(s, index)
+            };
+
+            // default: the destination gets the block, the request succeeds and counts
+            let _on = EnvVar::clear("XCL_BCPACK_PLACEHOLDER");
+            let (q, s) = new_queue(f, 8);
+            let n = 0x1008usize; // a part block at the end
+            let mut dst = vec![0xCDu8; n + 64];
+            let before = PLACEHOLDERS.requests[7].load(Ordering::Relaxed);
+            assert_eq!(run(q, s, &mut dst, n as u32, 7, 0), S_OK, "the placeholder completes");
+            assert!(dst[..n].chunks(16).all(|c| c == &block[..c.len()]), "solid BC7 blocks up to the destination size");
+            assert!(dst[n..].iter().all(|&b| b == 0xCD), "nothing past the destination size");
+            assert!(PLACEHOLDERS.requests[7].load(Ordering::Relaxed) > before, "the placeholder is counted");
+
+            // the signal enqueued after it reaches the fence, as for a normal request
+            let (_, _, submit) = table(q);
+            let fence = MockFence { vtbl: mock_fence_vtbl().as_ptr(), refs: AtomicU32::new(1), signalled: AtomicU64::new(0) };
+            queue_enqueue_signal(q, &fence as *const MockFence as *mut c_void, 41);
+            submit(q);
+            let t = std::time::Instant::now();
+            while fence.signalled.load(Ordering::Acquire) != 41 && t.elapsed().as_secs() < 5 {
+                std::thread::yield_now();
+            }
+            assert_eq!(fence.signalled.load(Ordering::Acquire), 41, "the fence signals after the placeholder");
+
+            // a mode whose block size is not known is still refused
+            let mut dst8 = vec![0xCDu8; n + 64];
+            assert_eq!(run(q, s, &mut dst8, n as u32, 8, 1), E_DECOMPRESSION, "mode 8 has no block");
+            assert!(dst8.iter().all(|&b| b == 0xCD), "mode 8 writes nothing");
+            queue_close(q);
+            queue_release(q);
+            status_release(s);
+
+            // opt-out: the same BC7 request fails as before and writes nothing
+            let _off = EnvVar::set("XCL_BCPACK_PLACEHOLDER", "0");
+            let (q, s) = new_queue(f, 4);
+            let mut dst0 = vec![0xCDu8; n + 64];
+            assert_eq!(run(q, s, &mut dst0, n as u32, 7, 0), E_DECOMPRESSION, "with XCL_BCPACK_PLACEHOLDER=0 it fails");
+            assert!(dst0.iter().all(|&b| b == 0xCD), "with XCL_BCPACK_PLACEHOLDER=0 the destination is left as it was");
             queue_close(q);
             queue_release(q);
             status_release(s);

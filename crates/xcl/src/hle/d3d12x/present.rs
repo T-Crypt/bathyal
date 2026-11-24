@@ -73,6 +73,10 @@ unsafe fn present_x_frame(queue: *mut c_void, plane_count: u32, planes: *const u
         let now = std::time::Instant::now();
         if let Some(t) = LAST.lock().unwrap().replace(now) {
             crate::xlog_info!("D3D12.X: {frames} frames presented, {:.1} fps over the last 300", 300.0 / (now - t).as_secs_f64());
+            let (gated, longest, timeouts) = super::queue_gate::report();
+            if gated > 0 || timeouts > 0 {
+                crate::xlog_info!("D3D12.X: queue gate over the last 300 frames: {gated} held submissions, longest hold {longest} ms, {timeouts} timeout(s)");
+            }
         }
     }
     super::real::stop_if_device_removed();
@@ -757,6 +761,10 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, usize)>) {
         let Some(src) = ID3D12Resource::from_raw_borrowed(&raw) else { return };
         (queue, src.clone(), guard)
     };
+    // the title's held work on this queue runs first: the copy must not owe a gated write
+    if super::queue_gate::has_pending(queue) {
+        return;
+    }
     // PresentX on another queue than the presenter was made for (the fallback presented once from
     // a queue before the title's first PresentX, issue #103): the swap chain belongs to a queue –
     // a new presenter for the title's present queue, after the old one's copy is done
