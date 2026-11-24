@@ -500,6 +500,65 @@ pub fn stream_key(buf: &[u8], samplers: &[([u32; 4], bool)]) -> u64 {
     h
 }
 
+/// A console pipeline description, as the title hands it over before any translation.
+pub enum ConsoleDesc<'a> {
+    Graphics(&'a D3D12_GRAPHICS_PIPELINE_STATE_DESC),
+    Compute(&'a D3D12_COMPUTE_PIPELINE_STATE_DESC),
+    /// a `CreatePipelineState` stream: whole subobjects in one buffer
+    Stream(&'a [u8]),
+}
+
+/// The identity of a console pipeline before it is translated: the shader code and every state
+/// byte of the description, with this run's pointer values left out (shader and input layout
+/// pointers are read, a root signature object is not part of it – the translated pipeline gets
+/// XCL's own root signature, built from the samplers the shaders declare). Two equal
+/// descriptions give an equal key, so the pipeline is built once.
+pub fn console_desc_key(d: ConsoleDesc<'_>) -> u64 {
+    match d {
+        ConsoleDesc::Graphics(g) => graphics_key(g, &[]),
+        ConsoleDesc::Compute(c) => compute_key(c, &[]),
+        ConsoleDesc::Stream(s) => console_stream_key(s),
+    }
+}
+
+/// [`console_desc_key`] for a pipeline state stream. Unlike [`stream_key`], each shader and
+/// input layout subobject mixes its type too: the same code in the VS and the CS slots is not
+/// the same pipeline.
+fn console_stream_key(buf: &[u8]) -> u64 {
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    mix(&mut h, b"cstr1");
+    let mut off = 0usize;
+    while off + 8 <= buf.len() {
+        let ty = u32::from_le_bytes(buf[off..off + 4].try_into().unwrap());
+        let Some((psize, palign)) = super::null::subobject_payload(ty) else { break };
+        let poff = if palign == 8 { 8 } else { 4 };
+        let Some(payload) = buf.get(off + poff..off + poff + psize) else { break };
+        match ty {
+            // the root signature object and a cached blob are not the pipeline
+            0 | 19 => {}
+            // shaders (VS PS DS HS GS CS AS MS: 1..=6, 24, 25): the code, not the pointer
+            1..=6 | 24 | 25 if psize >= 16 => {
+                let p = u64::from_le_bytes(payload[0..8].try_into().unwrap()) as usize;
+                let n = u64::from_le_bytes(payload[8..16].try_into().unwrap()) as usize;
+                mix_u32(&mut h, ty);
+                mix_shader(&mut h, &D3D12_SHADER_BYTECODE { pShaderBytecode: p as *const _, BytecodeLength: n });
+            }
+            // an input layout's elements are behind a pointer too
+            12 if psize >= 16 => {
+                let p = u64::from_le_bytes(payload[0..8].try_into().unwrap()) as *const D3D12_INPUT_ELEMENT_DESC;
+                mix_u32(&mut h, ty);
+                mix_input(&mut h, &D3D12_INPUT_LAYOUT_DESC { pInputElementDescs: p, NumElements: u32::from_le_bytes(payload[8..12].try_into().unwrap()) });
+            }
+            _ => {
+                mix_u32(&mut h, ty);
+                mix(&mut h, payload);
+            }
+        }
+        off += (poff + psize + 7) & !7;
+    }
+    h
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -657,5 +716,93 @@ mod tests {
         super::forget(key);
         let (h1, m1) = counts();
         assert!(h1 > h0 && m1 > m0, "hit {h0}->{h1}, miss {m0}->{m1}");
+    }
+
+    fn rs(v: usize) -> std::mem::ManuallyDrop<Option<ID3D12RootSignature>> {
+        std::mem::transmute::<usize, std::mem::ManuallyDrop<Option<ID3D12RootSignature>>>(v)
+    }
+
+    fn console_graphics(vs: &[u8], elements: &[D3D12_INPUT_ELEMENT_DESC], root: usize) -> D3D12_GRAPHICS_PIPELINE_STATE_DESC {
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC {
+            VS: D3D12_SHADER_BYTECODE { pShaderBytecode: vs.as_ptr() as _, BytecodeLength: vs.len() },
+            InputLayout: D3D12_INPUT_LAYOUT_DESC { pInputElementDescs: elements.as_ptr(), NumElements: elements.len() as u32 },
+            pRootSignature: rs(root),
+            ..Default::default()
+        }
+    }
+
+    fn element(name: &[u8]) -> D3D12_INPUT_ELEMENT_DESC {
+        D3D12_INPUT_ELEMENT_DESC { SemanticName: windows::core::PCSTR(name.as_ptr()), Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32G32B32_FLOAT, ..Default::default() }
+    }
+
+    /// A console description's key is its bytes, not this run's pointers: the same shader code
+    /// and input layout at other addresses, and another root signature object, give the same
+    /// pipeline. Any changed state byte or shader byte gives another one.
+    #[test]
+    fn a_console_desc_key_leaves_out_pointer_values_and_keeps_the_bytes() {
+        let (vs_a, vs_again) = ([1u8, 2, 3, 4, 5, 6, 7, 8], [1u8, 2, 3, 4, 5, 6, 7, 8]);
+        let mut vs_b = vs_a;
+        vs_b[0] = 9;
+        let (elems_a, elems_again) = ([element(b"POSITION\0")], [element(b"POSITION\0")]);
+        let elems_other = [element(b"POSITION1\0")];
+        let key = |g: &D3D12_GRAPHICS_PIPELINE_STATE_DESC| console_desc_key(ConsoleDesc::Graphics(g));
+        let a = console_graphics(&vs_a, &elems_a, 0x1000);
+        let again = console_graphics(&vs_again, &elems_again, 0x2000);
+        assert_eq!(key(&a), key(&again), "pointers are not the pipeline");
+        assert_ne!(key(&a), key(&console_graphics(&vs_b, &elems_a, 0x1000)), "the code is");
+        let mut state = console_graphics(&vs_a, &elems_a, 0x1000);
+        state.RasterizerState.CullMode = D3D12_CULL_MODE_BACK;
+        assert_ne!(key(&a), key(&state), "a state byte is");
+        assert_ne!(key(&a), key(&console_graphics(&vs_a, &elems_other, 0x1000)), "the input layout is");
+        let mut targets = console_graphics(&vs_a, &elems_a, 0x1000);
+        targets.NumRenderTargets = 1;
+        assert_ne!(key(&a), key(&targets), "the render targets are");
+    }
+
+    /// A compute description is the same: its CS code and flags count, its root signature
+    /// object does not.
+    #[test]
+    fn a_console_compute_key_is_the_code_not_the_root_signature() {
+        let (cs_a, cs_again) = ([3u8; 16], [3u8; 16]);
+        let mut cs_b = cs_a;
+        cs_b[1] = 4;
+        let desc = |cs: &[u8], root: usize| D3D12_COMPUTE_PIPELINE_STATE_DESC {
+            CS: D3D12_SHADER_BYTECODE { pShaderBytecode: cs.as_ptr() as _, BytecodeLength: cs.len() },
+            pRootSignature: rs(root),
+            ..Default::default()
+        };
+        let key = |c: &D3D12_COMPUTE_PIPELINE_STATE_DESC| console_desc_key(ConsoleDesc::Compute(c));
+        assert_eq!(key(&desc(&cs_a, 0x10)), key(&desc(&cs_again, 0x20)), "the root signature object is not the pipeline");
+        assert_ne!(key(&desc(&cs_a, 0x10)), key(&desc(&cs_b, 0x10)), "the code is");
+    }
+
+    /// A stream's console key reads the subobjects' bytes, not their pointers, and counts the
+    /// slot: the same code as a VS and as a CS is two pipelines.
+    #[test]
+    fn a_console_stream_key_counts_the_slot_and_not_the_pointer() {
+        let code_a = [7u8; 24];
+        let code_again = [7u8; 24];
+        let mut code_b = code_a;
+        code_b[3] = 8;
+        let stream = |ty: u32, code: &[u8], rs: usize| -> Vec<u8> {
+            let mut v = Vec::new();
+            v.extend_from_slice(&0u32.to_le_bytes());
+            v.extend_from_slice(&[0u8; 4]);
+            v.extend_from_slice(&(rs as u64).to_le_bytes());
+            v.extend_from_slice(&ty.to_le_bytes());
+            v.extend_from_slice(&[0u8; 4]);
+            v.extend_from_slice(&(code.as_ptr() as u64).to_le_bytes());
+            v.extend_from_slice(&(code.len() as u64).to_le_bytes());
+            v.extend_from_slice(&9u32.to_le_bytes());
+            v.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+            v
+        };
+        let key = |b: &[u8]| console_desc_key(ConsoleDesc::Stream(b));
+        assert_eq!(key(&stream(1, &code_a, 0x1000)), key(&stream(1, &code_again, 0x2000)), "pointers are not the pipeline");
+        assert_ne!(key(&stream(1, &code_a, 0x1000)), key(&stream(1, &code_b, 0x1000)), "the code is");
+        assert_ne!(key(&stream(1, &code_a, 0x1000)), key(&stream(2, &code_a, 0x1000)), "the slot is");
+        let mut mask = stream(1, &code_a, 0x1000);
+        *mask.last_mut().unwrap() = 0;
+        assert_ne!(key(&stream(1, &code_a, 0x1000)), key(&mask), "a state byte is");
     }
 }

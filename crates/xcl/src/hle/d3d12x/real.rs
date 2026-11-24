@@ -2715,7 +2715,19 @@ pub(super) unsafe extern "system" fn dev_create_command_list_x(this: *mut c_void
 
 unsafe extern "system" fn dev_create_compute_pso_x(this: *mut c_void, desc: *const c_void, a: usize, b: usize, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
     let start = std::time::Instant::now();
+    let key = memo_key(desc, MemoForm::Compute);
+    if let Some(key) = key {
+        if memo_lookup(key, riid, ppv) {
+            note_pso_time(start.elapsed());
+            return S_OK;
+        }
+    }
     let hr = dev_create_compute_pso_x_inner(this, desc, a, b, riid, ppv);
+    if hr >= 0 {
+        if let (Some(key), false) = (key, ppv.is_null()) {
+            memo_insert(key, *ppv);
+        }
+    }
     note_pso_time(start.elapsed());
     hr
 }
@@ -3675,6 +3687,152 @@ fn note_pso_key(key: u64) {
     }
 }
 
+/// Pipelines created this run, keyed by `pso_disk::console_desc_key` of the console
+/// description they were created from. The title creates the same pipeline thousands of times
+/// (25,387 repeats in one measured run) and each repeat used to translate and compile it
+/// again. The map holds one reference to every object in it, so an entry's pointer cannot
+/// dangle while it is in the map; a repeat gets that object back.
+struct PsoMemo {
+    map: HashMap<u64, usize>,
+    hits: u64,
+}
+
+impl PsoMemo {
+    fn new() -> Self {
+        PsoMemo { map: HashMap::new(), hits: 0 }
+    }
+
+    /// Hand the object `key` names to the caller as `riid` into `*ppv`; false when there is
+    /// none (or it does not answer `riid`), so the caller creates the pipeline.
+    unsafe fn lookup(&mut self, key: u64, riid: *const GUID, ppv: *mut *mut c_void) -> bool {
+        let Some(&obj) = self.map.get(&key) else { return false };
+        if obj == 0 {
+            return false;
+        }
+        // the map's own reference is not the caller's: AddRef for the request, ask for the
+        // interface, then drop the extra reference
+        com_add_ref(obj as *mut c_void);
+        let hr = com_qi(obj as *mut c_void, riid, ppv);
+        com_release(obj as *mut c_void);
+        if hr < 0 {
+            return false;
+        }
+        self.hits += 1;
+        if self.hits % 2000 == 0 {
+            crate::xlog_info!("D3D12.X: pipeline memo: {} hits, {} entries", self.hits, self.map.len());
+        }
+        true
+    }
+
+    /// Keep `pso` for `key`, with a reference of the map's own.
+    unsafe fn insert(&mut self, key: u64, pso: *mut c_void) {
+        if pso.is_null() {
+            return;
+        }
+        let obj = pso as usize;
+        if self.map.get(&key) == Some(&obj) {
+            return;
+        }
+        com_add_ref(pso);
+        if let Some(old) = self.map.insert(key, obj) {
+            if old != obj {
+                com_release(old as *mut c_void);
+            }
+        }
+    }
+}
+
+unsafe fn com_add_ref(p: *mut c_void) -> u32 {
+    let vt = *(p as *const *const usize);
+    let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*vt.add(1));
+    f(p)
+}
+
+unsafe fn com_release(p: *mut c_void) -> u32 {
+    let vt = *(p as *const *const usize);
+    let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*vt.add(2));
+    f(p)
+}
+
+unsafe fn com_qi(p: *mut c_void, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+    let vt = *(p as *const *const usize);
+    let f: unsafe extern "system" fn(*mut c_void, *const GUID, *mut *mut c_void) -> HRESULT = std::mem::transmute(*vt);
+    f(p, riid, ppv)
+}
+
+static PSO_MEMO: Mutex<Option<PsoMemo>> = Mutex::new(None);
+
+/// `XCL_PSO_MEMO=0` turns the memo off.
+fn memo_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XCL_PSO_MEMO").map_or(true, |v| v != "0"))
+}
+
+unsafe fn memo_lookup(key: u64, riid: *const GUID, ppv: *mut *mut c_void) -> bool {
+    if riid.is_null() || ppv.is_null() {
+        return false;
+    }
+    PSO_MEMO.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(PsoMemo::new).lookup(key, riid, ppv)
+}
+
+unsafe fn memo_insert(key: u64, pso: *mut c_void) {
+    PSO_MEMO.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(PsoMemo::new).insert(key, pso)
+}
+
+/// The memo key of a console graphics description. Only a description with console bytecode is
+/// memoized (a PC one is created as it is), and not one with stream output (the key does not
+/// read it, so two such pipelines could not be told apart).
+unsafe fn memo_key_graphics(desc: *const c_void) -> Option<u64> {
+    if !crate::gpu::shader::readable(desc as usize, std::mem::size_of::<D3D12_GRAPHICS_PIPELINE_STATE_DESC>()) {
+        return None;
+    }
+    let d = &*(desc as *const D3D12_GRAPHICS_PIPELINE_STATE_DESC);
+    if d.StreamOutput.NumEntries > 0 || !graphics_has_console_shader(desc) {
+        return None;
+    }
+    Some(super::pso_disk::console_desc_key(super::pso_disk::ConsoleDesc::Graphics(d)))
+}
+
+unsafe fn memo_key_compute(desc: *const c_void) -> Option<u64> {
+    if !crate::gpu::shader::readable(desc as usize, std::mem::size_of::<D3D12_COMPUTE_PIPELINE_STATE_DESC>()) {
+        return None;
+    }
+    let d = &*(desc as *const D3D12_COMPUTE_PIPELINE_STATE_DESC);
+    let cs = shader_bytes(&d.CS)?;
+    if !crate::gpu::recomp::pso::is_console(cs) {
+        return None;
+    }
+    Some(super::pso_disk::console_desc_key(super::pso_disk::ConsoleDesc::Compute(d)))
+}
+
+unsafe fn memo_key_stream(desc: *const c_void) -> Option<u64> {
+    if !crate::gpu::shader::readable(desc as usize, 16) || !stream_has_console_shader(desc) {
+        return None;
+    }
+    let (size, base) = (*(desc as *const usize), *((desc as usize + 8) as *const usize));
+    let buf = std::slice::from_raw_parts(base as *const u8, size);
+    Some(super::pso_disk::console_desc_key(super::pso_disk::ConsoleDesc::Stream(buf)))
+}
+
+/// The key of a pipeline description the entry point is about to build, if it can be memoized.
+unsafe fn memo_key(desc: *const c_void, form: MemoForm) -> Option<u64> {
+    if !memo_enabled() {
+        return None;
+    }
+    match form {
+        MemoForm::Graphics => memo_key_graphics(desc),
+        MemoForm::Compute => memo_key_compute(desc),
+        MemoForm::Stream => memo_key_stream(desc),
+    }
+}
+
+#[derive(Clone, Copy)]
+enum MemoForm {
+    Graphics,
+    Compute,
+    Stream,
+}
+
 static PSO_DEVICE_REMOVED: AtomicBool = AtomicBool::new(false);
 
 fn device_is_removed(_this: *mut c_void) -> bool {
@@ -4463,7 +4621,19 @@ unsafe fn build_stream(dev: Dev, d: &OwnedDesc, out: *mut *mut c_void) -> bool {
 
 pub(super) unsafe extern "system" fn dev_create_graphics_pso(this: *mut c_void, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
     let start = std::time::Instant::now();
+    let key = memo_key(desc, MemoForm::Graphics);
+    if let Some(key) = key {
+        if memo_lookup(key, riid, ppv) {
+            note_pso_time(start.elapsed());
+            return S_OK;
+        }
+    }
     let hr = dev_create_graphics_pso_inner(this, desc, riid, ppv);
+    if hr >= 0 {
+        if let (Some(key), false) = (key, ppv.is_null()) {
+            memo_insert(key, *ppv);
+        }
+    }
     note_pso_time(start.elapsed());
     hr
 }
@@ -4538,7 +4708,19 @@ unsafe fn note_translated_compute(hr: HRESULT, ppv: *mut *mut c_void) {
 
 unsafe extern "system" fn dev_create_compute_pso(this: *mut c_void, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
     let start = std::time::Instant::now();
+    let key = memo_key(desc, MemoForm::Compute);
+    if let Some(key) = key {
+        if memo_lookup(key, riid, ppv) {
+            note_pso_time(start.elapsed());
+            return S_OK;
+        }
+    }
     let hr = dev_create_compute_pso_inner(this, desc, riid, ppv);
+    if hr >= 0 {
+        if let (Some(key), false) = (key, ppv.is_null()) {
+            memo_insert(key, *ppv);
+        }
+    }
     note_pso_time(start.elapsed());
     hr
 }
@@ -5347,7 +5529,19 @@ unsafe fn stream_has_console_shader(desc: *const c_void) -> bool {
 
 pub(super) unsafe extern "system" fn dev_create_pipeline_state(this: *mut c_void, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
     let start = std::time::Instant::now();
+    let key = memo_key(desc, MemoForm::Stream);
+    if let Some(key) = key {
+        if memo_lookup(key, riid, ppv) {
+            note_pso_time(start.elapsed());
+            return S_OK;
+        }
+    }
     let hr = dev_create_pipeline_state_inner(this, desc, riid, ppv);
+    if hr >= 0 {
+        if let (Some(key), false) = (key, ppv.is_null()) {
+            memo_insert(key, *ppv);
+        }
+    }
     note_pso_time(start.elapsed());
     hr
 }
@@ -6257,6 +6451,100 @@ mod pso_stats_tests {
             pso_stats_line(0, 0, 0, 0, 0),
             "D3D12.X: pipeline creation: 0 calls, avg 0.00 ms, max 0.00 ms, 0 over 50 ms, 0 repeats of an identical pipeline"
         );
+    }
+}
+
+#[cfg(test)]
+mod pso_memo_tests {
+    use super::*;
+    use std::sync::atomic::AtomicU32;
+
+    /// A COM object with only the three slots the memo uses.
+    #[repr(C)]
+    struct Fake {
+        vt: *const usize,
+        refs: AtomicU32,
+    }
+
+    unsafe extern "system" fn fake_qi(this: *mut c_void, _riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+        (*(this as *mut Fake)).refs.fetch_add(1, Ordering::AcqRel);
+        *ppv = this;
+        S_OK
+    }
+    unsafe extern "system" fn fake_addref(this: *mut c_void) -> u32 {
+        (*(this as *mut Fake)).refs.fetch_add(1, Ordering::AcqRel) + 1
+    }
+    unsafe extern "system" fn fake_release(this: *mut c_void) -> u32 {
+        (*(this as *mut Fake)).refs.fetch_sub(1, Ordering::AcqRel) - 1
+    }
+
+    fn vtable() -> *const usize {
+        static V: OnceLock<usize> = OnceLock::new();
+        *V.get_or_init(|| {
+            let v: [usize; 3] = [fake_qi as usize, fake_addref as usize, fake_release as usize];
+            Box::leak(v.into_boxed_slice()).as_ptr() as usize
+        }) as *const usize
+    }
+
+    fn object(refs: u32) -> *mut c_void {
+        Box::into_raw(Box::new(Fake { vt: vtable(), refs: AtomicU32::new(refs) })) as *mut c_void
+    }
+    fn count(p: *mut c_void) -> u32 {
+        unsafe { (*(p as *mut Fake)).refs.load(Ordering::Acquire) }
+    }
+    fn free(p: *mut c_void) {
+        unsafe { drop(Box::from_raw(p as *mut Fake)) }
+    }
+
+    /// A first creation is kept with one reference of the map's; a repeat gets the same object
+    /// and one reference of its own, and the map's reference never moves.
+    #[test]
+    fn a_memo_hit_is_the_same_object_and_its_own_reference() {
+        let obj = object(1);
+        let mut memo = PsoMemo::new();
+        let (key, iid) = (0x1234u64, std::ptr::null::<GUID>());
+        let mut out: *mut c_void = std::ptr::null_mut();
+        unsafe {
+            assert!(!memo.lookup(key, iid, &mut out), "nothing is known yet");
+            memo.insert(key, obj);
+            assert_eq!(count(obj), 2, "the map holds a reference of its own");
+            assert!(memo.lookup(key, iid, &mut out));
+            assert_eq!(out, obj);
+            assert_eq!(count(obj), 3, "and the caller got one too");
+            assert!(memo.lookup(key, iid, &mut out));
+            assert_eq!(count(obj), 4);
+            memo.insert(key, obj);
+            assert_eq!(count(obj), 4, "the same object is not counted twice");
+            com_release(obj);
+            com_release(obj);
+            assert_eq!(count(obj), 2, "the map's reference is not the caller's");
+            com_release(obj);
+            assert_eq!(count(obj), 1);
+        }
+        free(obj);
+    }
+
+    /// A key that names another pipeline is not a hit, and a replacement entry releases what
+    /// it displaced.
+    #[test]
+    fn a_memo_entry_is_one_pipeline_per_key() {
+        let (a, b) = (object(1), object(1));
+        let mut memo = PsoMemo::new();
+        let mut out: *mut c_void = std::ptr::null_mut();
+        unsafe {
+            memo.insert(1, a);
+            memo.insert(1, b);
+            assert_eq!(count(a), 1, "the displaced entry let go of its reference");
+            assert_eq!(count(b), 2);
+            assert!(memo.lookup(1, std::ptr::null(), &mut out) && out == b);
+            let mut other: *mut c_void = std::ptr::null_mut();
+            assert!(!memo.lookup(2, std::ptr::null(), &mut other), "another key is another pipeline");
+            com_release(b);
+            com_release(b);
+            assert_eq!(count(b), 1);
+        }
+        free(a);
+        free(b);
     }
 }
 
