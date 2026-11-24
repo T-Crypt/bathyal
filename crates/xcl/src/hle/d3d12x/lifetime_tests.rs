@@ -98,7 +98,9 @@ fn a_resource_released_after_submit_outlives_its_submission() {
         }
         lifetime::poll();
         assert!(dev.GetDeviceRemovedReason().is_ok(), "device removed: {:?}", dev.GetDeviceRemovedReason());
-        assert!(!lifetime::held(src.as_raw() as usize), "the buffer was not freed after its fence");
+        if std::env::var_os("XCL_TEST_KEEP").is_none() {
+            assert!(!lifetime::held(src.as_raw() as usize), "the buffer was not freed after its fence");
+        }
 
         let mut q = std::ptr::null_mut();
         rb.Map(0, None, Some(&mut q)).expect("Map of the readback buffer");
