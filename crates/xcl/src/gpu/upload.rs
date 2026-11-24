@@ -510,7 +510,7 @@ pub fn ensure_window() -> Option<usize> {
     if low + len > (1usize << 32) {
         len = ((1usize << 32) - low) / GRAIN * GRAIN;
         if len < (64 << 20) {
-            crate::xlog_warn!("GPU_UPLOAD window: off – the heap maps at +{low:#x} in its window, leaving only {len} bytes of 32-bit offsets", h.cpu);
+            crate::xlog_warn!("GPU_UPLOAD window: off – the heap maps at +{low:#x} in its window (low32), leaving only {len} bytes of 32-bit offsets");
             return None;
         }
         crate::xlog_info!("GPU_UPLOAD window: {} MB (the mapping at +{low:#x} leaves {len} bytes before the 32-bit offset wraps)", len >> 20);

@@ -1426,6 +1426,13 @@ pub fn mapped_ranges() -> Vec<(usize, usize)> {
 
 /// time spent and pages found by the write-watch scans (`refresh_once`), for the timing line
 static WATCH: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+/// submits since start (for the write-watch cost per submit)
+static SUBMITS: AtomicU64 = AtomicU64::new(0);
+
+/// Write-watch milliseconds per submit, averaged since start.
+pub fn watch_ms_per_submit() -> f64 {
+    WATCH[0].load(Ordering::Relaxed) as f64 / 1000.0 / SUBMITS.load(Ordering::Relaxed).max(1) as f64
+}
 /// [lock wait, chunk scan, upload] in µs, runs uploaded
 static PHASES: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 
@@ -1438,6 +1445,7 @@ pub fn note_watch(t: std::time::Duration, pages: usize) {
 /// pages from the write-watch, sorted) and the reused tiles are copied asynchronously into video
 /// memory, and `queue` GPU-waits for that and for new tile mappings.
 pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: usize) {
+    SUBMITS.fetch_add(1, Ordering::Relaxed);
     let t0 = std::time::Instant::now();
     let mut g = STATE.lock().unwrap();
     let Some(s) = g.as_mut() else { return };

@@ -265,7 +265,6 @@ pub unsafe extern "system" fn VirtualAlloc(addr: *const c_void, size: usize, t: 
         };
         let rounded = size.max(1).div_ceil(align) * align;
         if let Some(q) = crate::hle::d3d12x::sparse::alloc_upload(rounded, align) {
-            crate::memstat::note(crate::memstat::GRAPHICS, rounded);
             trace_mem("VirtualAlloc (graphics, GPU_UPLOAD window)", 0, rounded, t as u64, p, q);
             return q as *mut c_void;
         }
@@ -558,7 +557,6 @@ pub unsafe extern "system" fn XMemAllocDefault(size: usize, attrs: u64) -> *mut 
     // Graphics memory types: the GPU_UPLOAD window first (the CPU writes video memory there
     // directly: no write-watch page, no upload), then the sparse VRAM pool.
     if let Some(q) = crate::hle::d3d12x::sparse::alloc_upload(rounded, align) {
-        crate::memstat::note(crate::memstat::GRAPHICS, rounded);
         trace_mem("XMemAlloc (graphics, GPU_UPLOAD window)", 0, rounded, attrs, 0, q);
         return q as *mut c_void;
     }
