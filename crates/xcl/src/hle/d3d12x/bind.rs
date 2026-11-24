@@ -1075,12 +1075,14 @@ fn note_skipped(what: std::fmt::Arguments) {
     }
 }
 
-/// #126 (#128 on the newer console layout: `real::NEWER_LIST_SLOTS`) DispatchMesh(x, y, z):
-/// with a console mesh pipeline bound, its two passes. The slot is inferred, not seen in a
-/// title yet: the console list keeps the PC's ID3D12GraphicsCommandList1 at #104–#109 and
+/// #126 on the older console layout (`real::console_slots`) DispatchMesh(x, y, z): with a
+/// console mesh pipeline bound, its two passes. The slot is inferred, not seen in a title yet:
+/// the console list keeps the PC's ID3D12GraphicsCommandList1 at #104–#109 and
 /// RSSetShadingRate / RSSetShadingRateImage at #124 / #125, and on the PC DispatchMesh follows
-/// them. With any other pipeline bound the call is logged with its arguments (they tell what
-/// the method is) and dropped, as by the stub that was there.
+/// them. A title on the newer layout calls RSSetShadingRate at #126 instead, so nothing there
+/// reaches this (`real::NEWER_SHADING_RATE_SLOTS`); #128 and #129 are stubs on both layouts.
+/// With any other pipeline bound the call is logged with its arguments (they tell what the
+/// method is) and dropped, as by the stub that was there.
 pub(super) unsafe extern "system" fn dispatch_mesh(this: *mut c_void, x: u32, y: u32, z: u32) {
     let Some((real, tp)) = bound_two_pass(this).filter(|(_, tp)| tp.kind == "MS") else {
         static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);

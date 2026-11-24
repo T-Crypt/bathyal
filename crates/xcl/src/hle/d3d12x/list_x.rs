@@ -1381,6 +1381,55 @@ pub(super) unsafe extern "system" fn dispatch_x(this: *mut c_void, x: u32, y: u3
     super::bind::dispatch(this, x, y, z);
 }
 
+/// PC #77 RSSetShadingRate(rate, combiners*)
+const PC_RSSET_SHADING_RATE: usize = 77;
+/// PC #78 RSSetShadingRateImage(shading rate image)
+const PC_RSSET_SHADING_RATE_IMAGE: usize = 78;
+
+/// `RSSetShadingRate` on the PC list (the caller checks that the device has VRS).
+unsafe fn rsset_shading_rate_pc(list: *mut c_void, rate: u32, combiners: *const i32) {
+    pc::<unsafe extern "system" fn(*mut c_void, i32, *const i32)>(list, PC_RSSET_SHADING_RATE)(list, rate as i32, combiners);
+}
+
+/// `RSSetShadingRateImage` on the PC list.
+unsafe fn rsset_shading_rate_image_pc(list: *mut c_void, image: usize) {
+    pc::<unsafe extern "system" fn(*mut c_void, usize)>(list, PC_RSSET_SHADING_RATE_IMAGE)(list, image);
+}
+
+/// Whether the list's device has variable-rate shading; the device is asked once.
+unsafe fn shading_rate_supported(list: *mut c_void) -> bool {
+    if let Some(v) = device_x::cached_variable_shading_rate() {
+        return v;
+    }
+    let dev = device_of(list).map_or(std::ptr::null_mut(), |d| d.as_raw() as *mut c_void);
+    device_x::variable_shading_rate_supported(dev)
+}
+
+/// command list #124 (older layout) / #126 (newer layout) RSSetShadingRate(rate, combiners*):
+/// a device without variable-rate shading gets nothing.
+pub(super) unsafe extern "system" fn rsset_shading_rate_x(this: *mut c_void, rate: u32, combiners: *const i32) {
+    if !shading_rate_supported(this) {
+        static N: AtomicU64 = AtomicU64::new(0);
+        if once(&N, 4) {
+            crate::xlog_warn!("D3D12.X: RSSetShadingRate({rate}, …) dropped: the device has no variable-rate shading");
+        }
+        return;
+    }
+    rsset_shading_rate_pc(this, rate, combiners);
+}
+
+/// command list #125 (older layout) / #127 (newer layout) RSSetShadingRateImage(image).
+pub(super) unsafe extern "system" fn rsset_shading_rate_image_x(this: *mut c_void, image: usize) {
+    if !shading_rate_supported(this) {
+        static N: AtomicU64 = AtomicU64::new(0);
+        if once(&N, 4) {
+            crate::xlog_warn!("D3D12.X: RSSetShadingRateImage({image:#x}) dropped: the device has no variable-rate shading");
+        }
+        return;
+    }
+    rsset_shading_rate_image_pc(this, image);
+}
+
 /// command list #146 console compute/UAV barrier (used by `XboxBvhBuilder.dll` between BVH
 /// build passes): emits a global UAV barrier so UMA writes become visible to the next pass
 pub(super) unsafe extern "system" fn uav_barrier_x(this: *mut c_void, _n: u32, _barriers: *const c_void) {
