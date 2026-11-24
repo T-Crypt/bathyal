@@ -2134,11 +2134,11 @@ impl Em {
         self.line(&format!("int2 {t}_g11 = clamp({t}_gb + int2(1, 1), int2(0, 0), {t}_gm);"));
         self.line(&format!("int2 {t}_g10 = clamp({t}_gb + int2(1, 0), int2(0, 0), {t}_gm);"));
         let at = |xy: &str| match layer {
-            Some(l) => format!("int3({xy}, {l})"),
-            None => format!("int3({xy}, 0)"),
+            Some(l) => format!("int4({xy}, {l}, {t}_gl)"),
+            None => format!("int3({xy}, {t}_gl)"),
         };
         self.line(&format!(
-            "float4 {t}_g = float4({t}_T.Load({}, {t}_gl).{comp}, {t}_T.Load({}, {t}_gl).{comp}, {t}_T.Load({}, {t}_gl).{comp}, {t}_T.Load({}, {t}_gl).{comp});",
+            "float4 {t}_g = float4({t}_T.Load({}).{comp}, {t}_T.Load({}).{comp}, {t}_T.Load({}).{comp}, {t}_T.Load({}).{comp});",
             at(&format!("{t}_g01")),
             at(&format!("{t}_g11")),
             at(&format!("{t}_g10")),
