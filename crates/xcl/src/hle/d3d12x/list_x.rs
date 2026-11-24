@@ -54,10 +54,6 @@ const BOTTOM_TIMESTAMPS: u32 = 0x3;
 const TOP_TIMESTAMPS: u32 = 0xC;
 /// fills larger than this are not done (one pattern buffer per value, up to this size)
 const MAX_FILL: u64 = 256 << 20;
-/// Bounded spin in `wait_until_satisfied` (tests and `KickoffX`'s helper); submissions to a
-/// queue are never waited on the title's thread (see `queue_gate`).
-#[cfg(test)]
-const WAIT_TIMEOUT: Duration = Duration::from_secs(2);
 /// Cap on tracked per-list written UMA ranges (for same-list write-then-wait detection).
 const MAX_WRITTEN_RANGES: usize = 256;
 
