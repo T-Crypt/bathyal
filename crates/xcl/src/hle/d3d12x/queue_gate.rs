@@ -449,6 +449,7 @@ pub(super) unsafe fn submit_now(queue: usize, lists: &[*mut c_void]) -> i32 {
     // title queued them: what they name stays alive until this queue's Signal (`lifetime::signal`)
     super::lifetime::submit(queue, lists);
     exec(q_raw, lists.len() as u32, lists.as_ptr());
+    super::list_x::copy_scratch_submitted(q_raw, lists);
     super::list_x::readback_sparse_writes(q_raw, lists);
     super::list_x::cpu_writes_after(q_raw, lists);
     super::title_textures::submitted(lists);
