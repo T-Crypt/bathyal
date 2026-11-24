@@ -31,6 +31,8 @@ use windows_sys::Win32::System::Memory::{
     PAGE_NOACCESS, PAGE_READWRITE,
 };
 
+use super::tile_check;
+
 const TILE: usize = 0x1_0000;
 /// tiles of a video-memory pool heap (64 MiB)
 const POOL_TILES: u32 = 1024;
@@ -52,6 +54,44 @@ const PAGE: usize = 0x1000;
 const PAGES_PER_TILE: usize = TILE / PAGE;
 const CHUNK: usize = 64;
 const CHUNKS: usize = PAGE / CHUNK;
+
+/// invalid tile mapping calls skipped, for the log-rate limit
+static TILE_CALLS_REJECTED: AtomicU64 = AtomicU64::new(0);
+
+/// The mapping call's regions and ranges as `tile_check` reads them: the region starts are
+/// overall tile indices (a sparse window is a buffer, so `X` is the tile index), and the
+/// resource's tile count is its byte size over 64 KiB.
+fn check_mapping(
+    res: &ID3D12Resource,
+    coords: &[D3D12_TILED_RESOURCE_COORDINATE],
+    regions: &[D3D12_TILE_REGION_SIZE],
+    offsets: Option<&[u32]>,
+    counts: &[u32],
+    flag: tile_check::RangeFlag,
+    heap_tiles: Option<u64>,
+) -> Result<(), tile_check::Reject> {
+    let regions: Vec<tile_check::Region> = coords
+        .iter()
+        .zip(regions)
+        .map(|(c, s)| tile_check::Region { start: c.X as u64, kind: tile_check::RegionKind::Tiles(s.NumTiles as u64) })
+        .collect();
+    let ranges: Vec<tile_check::Range> = counts
+        .iter()
+        .enumerate()
+        .map(|(i, &n)| tile_check::Range { flag, offset: offsets.map_or(0, |o| o[i] as u64), count: n as u64 })
+        .collect();
+    // SAFETY: a descriptor read of a live reserved buffer; a buffer's Width is its bytes.
+    let total = unsafe { res.GetDesc().Width } / TILE as u64;
+    tile_check::check(&tile_check::Request {
+        reserved: true,
+        resource_present: true,
+        null_mapping: false,
+        total_tiles: Some(total),
+        heap_tiles,
+        regions: &regions,
+        ranges: &ranges,
+    })
+}
 
 /// Fast non-cryptographic integer hasher for page/tile lookup maps on the hot submit path.
 #[derive(Default)]
@@ -676,6 +716,10 @@ impl State {
                 counts.push(run);
                 i += run as usize;
             }
+            if let Err(r) = check_mapping(res, &coords, &regions, Some(&offsets), &counts, tile_check::RangeFlag::None, Some(POOL_TILES as u64)) {
+                tile_check::log_reject("sparse map_tiles", &TILE_CALLS_REJECTED, &r);
+                continue;
+            }
             self.queue.UpdateTileMappings(
                 res,
                 coords.len() as u32,
@@ -713,6 +757,10 @@ impl State {
             flags.push(D3D12_TILE_RANGE_FLAG_NULL);
             counts.push(run);
             i += run as usize;
+        }
+        if let Err(r) = check_mapping(res, &coords, &regions, None, &counts, tile_check::RangeFlag::Null, None) {
+            tile_check::log_reject("sparse unmap_tiles", &TILE_CALLS_REJECTED, &r);
+            return;
         }
         self.queue.UpdateTileMappings(
             res,
