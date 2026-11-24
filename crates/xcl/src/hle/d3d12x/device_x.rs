@@ -819,6 +819,15 @@ fn standin_texture(x: &[u8; 0x38]) -> Option<crate::hle::xg::Texture> {
 /// A PC format whose console layout stands in for one that the PC has none for, of the same
 /// bits per texel: R1 (8), the packed 4:2:2 pair (16 a pixel), and the 96-bit ones, which take
 /// the smallest the PC has above them (128). None: not one of those.
+/// Note the format the title named for the texture just made (a later shader view of it that
+/// names none takes it: `real::title_format`).
+pub(super) unsafe fn record_title_format(ppv: *mut *mut std::ffi::c_void, x: &[u8; 0x38]) {
+    if ppv.is_null() || (*ppv).is_null() || u32::from_le_bytes(x[0..4].try_into().unwrap()) == windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_DIMENSION_BUFFER.0 as u32 {
+        return;
+    }
+    super::real::note_title_format(*ppv as usize, u32::from_le_bytes(x[0x20..0x24].try_into().unwrap()));
+}
+
 pub fn pc_standin_format(f: u32) -> Option<u32> {
     Some(match f {
         5..=8 => 2,    // R32G32B32 family: R32G32B32A32_FLOAT
