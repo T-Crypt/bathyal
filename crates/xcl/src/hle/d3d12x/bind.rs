@@ -54,6 +54,16 @@ const DRAWS_PC: usize = 2;
 const DISPATCHES: usize = 3;
 const DISPATCHES_SKIPPED: usize = 4;
 
+/// `XCL_NO_DRAWS=1` / `XCL_NO_DISPATCH=1`: leave one half of the GPU work out, to name the
+/// half that a device removal comes from (diagnostic; the draws or dispatches are counted as
+/// skipped).
+fn phase_off(name: &str) -> bool {
+    static D: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static P: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let cell = if name == "XCL_NO_DRAWS" { &D } else { &P };
+    *cell.get_or_init(|| std::env::var(name).is_ok_and(|v| v != "0" && !v.is_empty()))
+}
+
 fn count(k: usize) {
     let n = COUNTS[k].fetch_add(1, Ordering::Relaxed) + 1;
     if n.is_power_of_two() && n >= 64 {
@@ -564,6 +574,10 @@ fn cpu_rect_expansion(pso: usize) -> bool {
 
 /// #12 DrawInstanced
 pub(super) unsafe extern "system" fn draw_instanced(this: *mut c_void, vertices: u32, instances: u32, first_vertex: u32, first_instance: u32) {
+    if phase_off("XCL_NO_DRAWS") {
+        count(DRAWS_SKIPPED);
+        return;
+    }
     DRAW_ARGS.with(|d| d.set((false, vertices, instances, first_vertex, 0)));
     if gs_draw(this, vertices, instances, first_vertex, None, first_instance).is_some() {
         return;
@@ -584,6 +598,10 @@ thread_local! {
 
 /// #13 DrawIndexedInstanced
 pub(super) unsafe extern "system" fn draw_indexed_instanced(this: *mut c_void, indices: u32, instances: u32, first_index: u32, base_vertex: i32, first_instance: u32) {
+    if phase_off("XCL_NO_DRAWS") {
+        count(DRAWS_SKIPPED);
+        return;
+    }
     DRAW_ARGS.with(|d| d.set((true, indices, instances, first_index, base_vertex)));
     if gs_draw(this, indices, instances, first_index, Some(base_vertex), first_instance).is_some() {
         return;
@@ -940,6 +958,10 @@ pub(super) unsafe extern "system" fn set_pipeline_state(this: *mut c_void, pso: 
 
 /// #14 Dispatch: with a translated pipeline, on XCL's ABI with the kept root arguments
 pub(super) unsafe extern "system" fn dispatch(this: *mut c_void, x: u32, y: u32, z: u32) {
+    if phase_off("XCL_NO_DISPATCH") {
+        count(DISPATCHES_SKIPPED);
+        return;
+    }
     let pso = super::pso_async::resolve_for_indirect(with(this, |s| s.pso));
     let Some(list) = ID3D12GraphicsCommandList::from_raw_borrowed(&this) else { return };
     if !super::real::is_translated_compute(pso) {
