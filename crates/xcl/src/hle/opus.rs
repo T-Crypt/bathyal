@@ -407,7 +407,7 @@ fn vorbis_mapping(channels: u8) -> Option<(u8, u8, &'static [u8])> {
         4 => Some((2, 2, &[0, 1, 2, 3])),
         5 => Some((3, 2, &[0, 4, 1, 2, 3])),
         6 => Some((4, 2, &[0, 4, 1, 2, 3, 5])),
-        7 => Some((4, 3, &[0, 4, 1, 2, 3, 5, 6])),
+        7 => Some((5, 2, &[0, 4, 1, 2, 3, 5, 6])),
         8 => Some((5, 3, &[0, 6, 1, 2, 3, 4, 5, 7])),
         _ => None,
     }
@@ -1609,6 +1609,12 @@ pub(crate) mod tests {
             assert_eq!(h.output_gain, -256);
             assert_eq!(h.mapping_family, if ch <= 2 { 0 } else { 1 });
         }
+        // RFC 7845 Vorbis mappings: 6.1 is 5 streams / 2 coupled, 7.1 is 5 / 3.
+        let h7 = parse_opus_head(&build_opus_head(7, 48_000, 0, 0)).unwrap();
+        assert_eq!((h7.stream_count, h7.coupled_count), (5, 2));
+        assert_eq!(h7.mapping, [0, 4, 1, 2, 3, 5, 6]);
+        let h8 = parse_opus_head(&build_opus_head(8, 48_000, 0, 0)).unwrap();
+        assert_eq!((h8.stream_count, h8.coupled_count), (5, 3));
     }
 
     /// A sound of the game (`XCL_SAMPLE_AWC`: an AWC with one Opus stream, its data chunk as
