@@ -1806,9 +1806,11 @@ to an outside server at every crash (`hle/netoff.rs`: the title's WinHTTP / Wins
     copies what it reads (`list_x::gpu_va`); rect lists are drawn as two triangles a rectangle (fourth corner on the
     CPU, `bind::draw_rects`); a committed texture asked for its GPU address gets lazily committed memory at one
     (`real::texture_memory`); stand-in streams carry null pointers for missing shaders.
-  - Pipelines whose console MS container sits in the AS slot (no MS subobject; its minimap) are **refused**:
-    translated as the mesh shader they are, the title rendered nothing from then on (black every run). Open: what
-    it expects of them.
+  - Pipelines whose console MS container sits in the AS slot (no MS subobject; its minimap) are now
+    **translated** (2026-11-23): the mesh program is found by the kind in its container (MS, in subobject
+    24 or 25), not by the slot number, and only a console AS container is still refused. Earlier, translated
+    as the mesh shader they are, the title rendered nothing from then on (black every run) – that run was
+    before the two-pass draws of #215; it is not retested with a title since.
   - `XCL_ACTIVITY` logs the process's commit, local / non-local video memory, target pages, arenas and sparse pools.
   - Open: arenas for D32S8 targets still take 2.8 GB (one per 256 MB of addresses; a D32S8 → R32 + separate stencil
     split, or exact-size heaps, would cut it); the debug layer's resource-state errors (538) and sparse
