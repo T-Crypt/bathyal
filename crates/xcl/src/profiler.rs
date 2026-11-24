@@ -559,11 +559,18 @@ mod tests {
 
     #[test]
     fn samples_a_busy_thread_and_ranks_it_first() {
+        // 1. the cost: the same work before and after the sampler starts
+        let base = spin_for(Duration::from_millis(200));
         let s = Settings { hz: 500, top: 10, every: None };
         let Some(sh) = start(s) else {
             eprintln!("profile: the sampler did not start; skipped");
             return;
         };
+        let with = spin_for(Duration::from_millis(200));
+        eprintln!("profile: throughput {} -> {} work units in 200 ms ({:.1}% cost, {} Hz)", base, with, (base as f64 - with as f64) * 100.0 / base as f64, s.hz);
+
+        // 2. the ranking: a thread that spins in this function while the others wait. It is
+        // created after the sampler started, so the thread list has to be refreshed first.
         let stop = Arc::new(AtomicBool::new(false));
         let (tx, rx) = std::sync::mpsc::channel();
         let stop2 = stop.clone();
@@ -580,7 +587,7 @@ mod tests {
             })
             .unwrap();
         let busy_tid = rx.recv().unwrap();
-        std::thread::sleep(Duration::from_millis(300));
+        std::thread::sleep(Duration::from_millis(700));
         stop.store(true, Ordering::Relaxed);
         let _ = busy.join().unwrap();
         let (total, threads) = sh.counts();
@@ -592,11 +599,23 @@ mod tests {
             return;
         }
         assert!(threads.contains_key(&busy_tid), "the busy thread ({busy_tid}) is in the table: {threads:?}");
-        let busy_samples = threads[&busy_tid].samples;
-        let top_other = threads.iter().filter(|(&t, _)| t != busy_tid).map(|(_, t)| t.samples).max().unwrap_or(0);
-        assert!(busy_samples > 0, "the busy thread has samples: {busy_samples}");
-        assert!(busy_samples >= top_other, "the busy thread ({busy_samples}) is not first (another has {top_other})");
-        assert!(!text.contains("profile: 0 samples"), "the report names the samples: {text}");
+        let working = |t: &ThreadCount| t.samples - t.waiting;
+        let busy_work = working(&threads[&busy_tid]);
+        let top_other = threads.iter().filter(|(&t, _)| t != busy_tid).map(|(_, t)| working(t)).max().unwrap_or(0);
+        assert!(busy_work > 0, "the busy thread has samples of its own work: {busy_work}");
+        assert!(busy_work > top_other, "the busy thread ({busy_work}) is not first (another has {top_other})");
+        assert!(text.contains("busy-loop"), "the report names the busy thread: {text}");
+    }
+
+    /// work units done in `d` (a unit is one `spin_work` call)
+    fn spin_for(d: Duration) -> u64 {
+        let t = Instant::now();
+        let mut n = 0u64;
+        while t.elapsed() < d {
+            n += 1;
+            std::hint::black_box(spin_work());
+        }
+        n
     }
 
     #[test]
