@@ -1046,13 +1046,14 @@ pub(super) unsafe extern "system" fn dispatch(this: *mut c_void, x: u32, y: u32,
         note_skipped_over(pso, [x, y, z], threads);
         return;
     }
-    let (x, y, z) = match clamp_groups([x, y, z], threads, work_budget()) {
+    let g = match clamp_groups([x, y, z], threads, work_budget()) {
         Some(c) => {
             note_clamped(pso, [x, y, z], c);
             c
         }
         None => [x, y, z],
     };
+    let (x, y, z) = (g[0], g[1], g[2]);
     match translated_dispatch(this, list, pso, x, y, z) {
         Ok(()) => count(DISPATCHES),
         Err(e) => {
