@@ -852,10 +852,9 @@ pub(super) unsafe extern "system" fn get_resource_allocation_info_x(a: *mut c_vo
     let (this, ret) = if real::this_first(a, b) { (a, b as *mut [u64; 2]) } else { (b, a as *mut [u64; 2]) };
     type F = unsafe extern "system" fn(*mut c_void, *mut [u64; 2], u32, u32, *const [u8; 0x38]) -> *mut [u64; 2];
     let pc: F = std::mem::transmute(real::orig_fn(this, 25));
-    let (mut size, mut align) = (0u64, 0u64);
-    for k in 0..n as usize {
+    let parts = (0..n as usize).map(|k| {
         let x = if descs.is_null() { [0u8; 0x38] } else { descs.add(k).read_unaligned() };
-        let (s, a) = match crate::hle::xg::Texture::new(&x).ok().filter(|_| u32::from_le_bytes(x[0..4].try_into().unwrap()) != D3D12_RESOURCE_DIMENSION_BUFFER.0 as u32) {
+        match crate::hle::xg::Texture::new(&x).ok().filter(|_| u32::from_le_bytes(x[0..4].try_into().unwrap()) != D3D12_RESOURCE_DIMENSION_BUFFER.0 as u32) {
             Some(t) => (t.size(), t.alignment()),
             None => {
                 let d = pc_resource_desc(&x);
@@ -870,14 +869,9 @@ pub(super) unsafe extern "system" fn get_resource_allocation_info_x(a: *mut c_vo
                 }
                 (r[0], r[1])
             }
-        };
-        if s == u64::MAX || a == 0 {
-            size = u64::MAX;
-            break;
         }
-        size = size.div_ceil(a) * a + s;
-        align = align.max(a);
-    }
+    });
+    let (size, align) = allocation_of(parts, |_, _, _, _| {});
     if !ret.is_null() {
         *ret = [size, align];
     }
@@ -959,29 +953,49 @@ pub(super) unsafe fn format_support1(this: *mut c_void, format: u32) -> Option<u
     Some(d.Support1.0 as u32)
 }
 
+/// The {size, alignment} of resources of these {size, alignment}s laid out one after another,
+/// as GetResourceAllocationInfo does for several: each at a multiple of its own alignment, the
+/// whole padded to the largest – a C++ structure's layout (the PC's docs: 64 KiB-, 4 MiB- and
+/// 64 KiB-aligned resources take 12 MiB). `placed(index, offset, size, alignment)` for each; a
+/// size u64::MAX (or no alignment) stops there with size u64::MAX.
+fn allocation_of(parts: impl IntoIterator<Item = (u64, u64)>, mut placed: impl FnMut(usize, u64, u64, u64)) -> (u64, u64) {
+    let (mut size, mut align, mut n) = (0u64, 0u64, 0);
+    for (k, (s, a)) in parts.into_iter().enumerate() {
+        if s == u64::MAX || a == 0 {
+            return (u64::MAX, align);
+        }
+        let offset = size.next_multiple_of(a);
+        placed(k, offset, s, a);
+        size = offset + s;
+        align = align.max(a);
+        n += 1;
+    }
+    // (one resource: its own size, as the driver or XG gives it)
+    if n > 1 {
+        size = size.next_multiple_of(align);
+    }
+    (size, align)
+}
+
+
 /// device #108 (a retail game) GetResourceAllocationInfo2(visible mask, count, D3D12_RESOURCE_DESC1s,
 /// D3D12_RESOURCE_ALLOCATION_INFO1* each) -> {size, alignment} of them all, returned like #25's;
 /// each resource's {offset, alignment, size} goes to the last argument when there is one.
 pub(super) unsafe extern "system" fn get_resource_allocation_info2_x(a: *mut c_void, b: *mut c_void, mask: u32, n: u32, descs: *const [u8; 0x48], infos: *mut [u64; 3]) -> *mut [u64; 2] {
     real::note_newer_device_method(108);
     let ret = if real::this_first(a, b) { b } else { a } as *mut [u64; 2];
-    let (mut size, mut align) = (0u64, 0u64);
-    for k in 0..n as usize {
+    let parts = (0..n as usize).map(|k| {
         let mut r = [0u64; 2];
         let d = if descs.is_null() { std::ptr::null() } else { descs.add(k) as *const [u8; 0x38] };
         let (x, y) = if real::this_first(a, b) { (a, &mut r as *mut _ as *mut c_void) } else { (&mut r as *mut _ as *mut c_void, b) };
         get_resource_allocation_info_x(x, y, mask, 1, d);
-        if r[0] == u64::MAX || r[1] == 0 {
-            size = u64::MAX;
-            break;
-        }
-        let offset = size.next_multiple_of(r[1]);
+        (r[0], r[1])
+    });
+    let (size, align) = allocation_of(parts, |k, offset, s, a| {
         if !infos.is_null() {
-            *infos.add(k) = [offset, r[1], r[0]];
+            *infos.add(k) = [offset, a, s];
         }
-        size = offset + r[0];
-        align = align.max(r[1]);
-    }
+    });
     if !ret.is_null() {
         *ret = [size, align];
     }
@@ -1503,5 +1517,26 @@ mod tests {
         // sampling and copies need no flag: a format with neither use stays as the title asked
         assert_eq!(drop_refused_uses(0, 0), (0, 0));
         assert_eq!(drop_refused_uses(USE_RENDER_TARGET, 0), (0, USE_RENDER_TARGET));
+
+    /// Several resources' allocation info: each at its alignment, the total padded to the largest
+    /// (the PC's docs: the 4 MiB-aligned one in the middle takes 12 MiB, first 8 MiB).
+    #[test]
+    fn allocation_info_of_several_is_padded_to_the_largest_alignment() {
+        const K64: u64 = 0x1_0000;
+        const M4: u64 = 0x40_0000;
+        let mut offsets = Vec::new();
+        assert_eq!(allocation_of([(K64, K64), (M4, M4), (K64, K64)], |k, o, s, a| offsets.push((k, o, s, a))), (3 * M4, M4));
+        assert_eq!(offsets, [(0, 0, K64, K64), (1, M4, M4, M4), (2, 2 * M4, K64, K64)]);
+        assert_eq!(allocation_of([(M4, M4), (K64, K64), (K64, K64)], |_, _, _, _| {}), (2 * M4, M4));
+        assert_eq!(allocation_of([(K64, K64), (K64, K64), (M4, M4)], |_, _, _, _| {}), (2 * M4, M4));
+        // one resource: its own info, as the PC driver or XG gives it
+        assert_eq!(allocation_of([(0x1000, K64)], |_, _, _, _| {}), (0x1000, K64));
+        assert_eq!(allocation_of([(M4, M4)], |_, _, _, _| {}), (M4, M4));
+        // one that fails: u64::MAX, nothing after it placed
+        let mut placed = 0;
+        assert_eq!(allocation_of([(K64, K64), (u64::MAX, 0), (M4, M4)], |_, _, _, _| placed += 1), (u64::MAX, K64));
+        assert_eq!(placed, 1);
+        assert_eq!(allocation_of(std::iter::empty(), |_, _, _, _| {}), (0, 0));
+    }
     }
 }
