@@ -18,6 +18,7 @@ mod cpu_writes;
 mod fence_x;
 pub mod frame;
 pub mod guard;
+pub mod indirect;
 pub mod layout;
 mod lifetime;
 pub mod list_x;
@@ -31,6 +32,8 @@ pub mod title_textures;
 pub mod vram;
 #[cfg(test)]
 mod lifetime_tests;
+#[cfg(test)]
+mod two_pass_tests;
 
 use std::ffi::c_void;
 use std::sync::OnceLock;

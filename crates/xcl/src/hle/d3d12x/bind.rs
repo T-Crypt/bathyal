@@ -34,6 +34,9 @@ struct State {
     uma: Vec<usize>,
     /// where the next draw's io and argument table go (blocks in `uma`)
     arena: crate::gpu::uma::Arena,
+    /// indirect work this recording may still charge (see `indirect::work_budget`); `None`
+    /// until the first indirect execution
+    budget: Option<u64>,
 }
 
 static STATES: Mutex<Option<HashMap<usize, State>>> = Mutex::new(None);
@@ -82,6 +85,7 @@ pub(super) fn reset(list: *mut c_void, allocator: usize, initial_pso: usize) {
         s.layout_gfx = None;
         s.args_gfx.clear();
         s.rs_gfx = 0;
+        s.budget = Some(super::indirect::work_budget());
         (old, std::mem::take(&mut s.uma))
     });
     console_list::hold_until_reset(old, blocks);
@@ -220,9 +224,28 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
     let pc: F = std::mem::transmute(super::real::orig_fn(this, 59));
     let pso = super::pso_async::resolve_wait(with(this, |s| s.pso));
     let (gfx, compute) = (super::real::is_translated_graphics(pso), super::real::is_translated_compute(pso));
-    let (args_off, count_off) = (args_off + super::real::buffer_delta(args), count_off + super::real::buffer_delta(count_buf));
+    let (args_off_pc, count_off_pc) = (args_off + super::real::buffer_delta(args), count_off + super::real::buffer_delta(count_buf));
+    if let Some(tp) = super::real::two_pass_of(pso) {
+        // each record runs the console program (compute) and then its second pass
+        match two_pass_indirect(this, pso, &tp, sig, max, args, args_off, count_buf, count_off) {
+            Ok(n) => {
+                for _ in 0..n {
+                    count(DRAWS);
+                }
+                if n == 0 {
+                    count(DRAWS_SKIPPED);
+                }
+            }
+            Err(e) => {
+                count(DRAWS_SKIPPED);
+                note_skipped(format_args!("ExecuteIndirect with a console {} pipeline (two passes) skipped: {e}", tp.kind));
+            }
+        }
+        return;
+    }
+>>>>>>> b73e109 (D3D12.X: indirect draws run two-pass pipelines and every record is bounded)
     if !gfx && !compute {
-        return pc(this, sig, max, args, args_off, count_buf, count_off);
+        return pc(this, sig, max, args, args_off_pc, count_buf, count_off_pc);
     }
     if ROOT_SIGNATURES.lock().unwrap().as_ref().is_some_and(|s| s.contains(&sig)) {
         static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -234,8 +257,15 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
     let Some(list) = ID3D12GraphicsCommandList::from_raw_borrowed(&this) else { return };
     match bind_abi(this, list, pso, gfx) {
         Ok(()) => {
+            // every record is clamped on the CPU into a scratch copy before the driver sees
+            // it; one that cannot be read is not run (see `clamp_for_gpu`)
+            let Some((args, args_off)) = clamp_for_gpu(this, sig, max, args, args_off, count_buf, count_off) else {
+                count(if gfx { DRAWS_SKIPPED } else { DISPATCHES_SKIPPED });
+                note_skipped(format_args!("ExecuteIndirect with a translated pipeline dropped: its argument records cannot be bounded"));
+                return;
+            };
             count(if gfx { DRAWS } else { DISPATCHES });
-            pc(this, sig, max, args, args_off, count_buf, count_off)
+            pc(this, sig, max, args, args_off, count_buf, count_off_pc)
         }
         Err(e) => {
             count(if gfx { DRAWS_SKIPPED } else { DISPATCHES_SKIPPED });
@@ -245,6 +275,140 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
             }
         }
     }
+}
+
+/// Readable bytes at `offset` in the title buffer `res` (console memory: unified memory or a
+/// placed resource), or None when the CPU cannot see them.
+unsafe fn buffer_at(res: usize, offset: u64, len: usize) -> Option<usize> {
+    if res == 0 || len == 0 || len > 256 << 20 || offset > u32::MAX as u64 {
+        return None;
+    }
+    let at = if let Some((p, n)) = super::real::console_buffer(res) {
+        if offset + len as u64 > n as u64 {
+            return None;
+        }
+        p.checked_add(offset as usize)?
+    } else {
+        super::real::title_address(res)?.checked_add(offset as usize)?
+    };
+    crate::gpu::shader::readable(at, len).then_some(at)
+}
+
+/// How many records the caller's arguments describe: the count buffer's value at its offset
+/// (None: unreadable), bounded by the caller's maximum.
+unsafe fn record_count(max: u32, count_buf: usize, count_off: u64) -> Option<u32> {
+    if count_buf == 0 {
+        return Some(max);
+    }
+    let at = buffer_at(count_buf, count_off, 4)?;
+    let n = (at as *const u32).read_unaligned();
+    Some(n.min(max))
+}
+
+/// Parse and clamp a signature's records from title memory, charging this list's budget.
+unsafe fn clamped_records(this: *mut c_void, sig: &super::indirect::Signature, max: u32, args: usize, args_off: u64, count_buf: usize, count_off: u64) -> Option<(Vec<super::indirect::Record>, usize)> {
+    let n = record_count(max, count_buf, count_off)?;
+    let len = (n as usize).checked_mul(sig.stride as usize)?;
+    let base = buffer_at(args, args_off, len)?;
+    let bytes = std::slice::from_raw_parts(base as *const u8, len);
+    let mut records = super::indirect::parse_records(sig, bytes, n);
+    let mut budget = with(this, |s| *s.budget.get_or_insert_with(super::indirect::work_budget));
+    for r in records.iter_mut() {
+        super::indirect::clamp_record(r, &mut budget);
+    }
+    with(this, |s| s.budget = Some(budget));
+    #[cfg(test)]
+    super::indirect::remember_for_test(&records);
+    Some((records, base))
+}
+
+/// Clamp the records of a translated (non-two-pass) indirect execution into a scratch buffer
+/// the driver runs. Returns the argument buffer and its offset, or None when the records
+/// cannot be read (they are then not run, rather than passed unbounded).
+unsafe fn clamp_for_gpu(this: *mut c_void, sig: usize, max: u32, args: usize, args_off: u64, count_buf: usize, count_off: u64) -> Option<(usize, u64)> {
+    let Some(sig) = super::indirect::signature_of(sig) else {
+        // no layout: cannot bound it. Keep the old behaviour for a signature XCL did not make.
+        return Some((args, args_off + super::real::buffer_delta(args)));
+    };
+    let (records, base) = clamped_records(this, &sig, max, args, args_off, count_buf, count_off)?;
+    if records.is_empty() {
+        return Some((args, args_off + super::real::buffer_delta(args)));
+    }
+    let len = records.len() * sig.stride as usize;
+    let p = allocate_upload_memory(this, len, 256);
+    if p.is_null() {
+        return None;
+    }
+    std::ptr::copy_nonoverlapping(base as *const u8, p, len);
+    let dst = std::slice::from_raw_parts_mut(p, len);
+    for (i, r) in records.iter().enumerate() {
+        super::indirect::write_record(&sig, dst, i * sig.stride as usize, r);
+    }
+    let (res, off) = super::real::uma_window_buffer(p as usize, len)?;
+    Some((res, off))
+}
+
+/// Replay the root-argument changes a command signature describes for one record.
+unsafe fn replay_root_args(this: *mut c_void, sig: &super::indirect::Signature, bytes: &[u8]) {
+    for a in sig.root_args() {
+        let at = a.offset as usize;
+        match a.kind {
+            super::indirect::ARG_CONSTANT => {
+                let n = a.count as usize * 4;
+                if let Some(v) = bytes.get(at..at + n) {
+                    put_in(this, true, a.root, a.dest * 4, v);
+                }
+            }
+            super::indirect::ARG_CBV | super::indirect::ARG_SRV | super::indirect::ARG_UAV => {
+                if let Some(v) = bytes.get(at..at + 8) {
+                    let va = u64::from_le_bytes(v.try_into().unwrap());
+                    put_in(this, true, a.root, 0, &va.to_le_bytes());
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// ExecuteIndirect of a pipeline in two passes: each record is read from title memory (with
+/// the count buffer and the caller's maximum honoured), clamped, and run through its two
+/// passes, with the record's root-argument changes replayed first. Returns how many records
+/// ran.
+unsafe fn two_pass_indirect(this: *mut c_void, pso: usize, tp: &super::real::TwoPassPso, sig: usize, max: u32, args: usize, args_off: u64, count_buf: usize, count_off: u64) -> Result<u32, String> {
+    let sig = super::indirect::signature_of(sig).ok_or("command signature layout unknown")?;
+    let (records, base) = clamped_records(this, &sig, max, args, args_off, count_buf, count_off).ok_or("argument records not readable on the CPU")?;
+    let Some(list) = ID3D12GraphicsCommandList::from_raw_borrowed(&this) else { return Err("no command list".into()) };
+    let bytes = std::slice::from_raw_parts(base as *const u8, records.len() * sig.stride as usize);
+    let mut ran = 0u32;
+    for (i, r) in records.iter().enumerate() {
+        let rec = &bytes[i * sig.stride as usize..];
+        replay_root_args(this, &sig, rec);
+        if r.counts.iter().all(|&c| c == 0) {
+            continue;
+        }
+        if tp.kind == "GS" {
+            let (count_, instances, first, indexed, first_instance) = match r.kind {
+                super::indirect::Kind::Draw => (r.counts[0], r.counts[1].max(1), r.counts[2], None, r.counts[3]),
+                super::indirect::Kind::DrawIndexed => (r.counts[0], r.counts[1].max(1), r.counts[2], Some(r.counts[3] as i32), r.counts[4]),
+                _ => return Err("a dispatch record against a geometry pipeline".into()),
+            };
+            gs_fetch_and_draw(this, &list, pso, tp, count_, instances, first, indexed, first_instance).map_err(|e| format!("record {i}: {e}"))?;
+            ran += 1;
+            continue;
+        }
+        let groups = r.groups(tp.record.max_vertices);
+        let cap = (MAX_GROUPS / tp.mesh_groups_per_record.max(1)).max(1);
+        let groups = groups.min(cap);
+        if groups == 0 {
+            continue;
+        }
+        if matches!(r.kind, super::indirect::Kind::Draw | super::indirect::Kind::DrawIndexed) && r.counts[1] > 1 {
+            note_skipped(format_args!("an indirect draw of {} instances with a console {} pipeline – the first only", r.counts[1], tp.kind));
+        }
+        two_pass(this, &list, pso, tp, groups, &[]).map_err(|e| format!("record {i}: {e}"))?;
+        ran += 1;
+    }
+    Ok(ran)
 }
 
 /// A DrawInstanced of the console's rect list (three corners of each rectangle, the fourth

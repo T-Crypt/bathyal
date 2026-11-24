@@ -186,6 +186,19 @@ pub fn console_buffer(res: usize) -> Option<(usize, usize)> {
 pub fn console_buffers() -> usize {
     UMA_BUFFERS.lock().unwrap().as_ref().map_or(0, |m| m.len())
 }
+
+/// A test's title buffer: `res` reads as `bytes` at unified-memory address `addr`.
+#[cfg(test)]
+pub(super) fn note_test_console_buffer(res: usize, addr: usize, bytes: usize) {
+    UMA_BUFFERS.lock().unwrap().get_or_insert_with(HashMap::new).insert(res, (addr, bytes, false));
+}
+
+#[cfg(test)]
+pub(super) fn forget_test_console_buffer(res: usize) {
+    if let Some(m) = UMA_BUFFERS.lock().unwrap().as_mut() {
+        m.remove(&res);
+    }
+}
 static UMA_ERROR: Mutex<String> = Mutex::new(String::new());
 
 /// GPU virtual address of the unified memory buffer of window 0 (0: not available).

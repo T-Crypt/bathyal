@@ -1030,8 +1030,15 @@ pub(super) unsafe extern "system" fn create_command_signature_x(this: *mut c_voi
     let needs_root = list.iter().any(|a| (5..=8).contains(&a[0]));
     pc[8..16].copy_from_slice(&(if list.is_empty() { 0 } else { list.as_ptr() as u64 }).to_le_bytes());
     let hr = real::dev_create_command_signature(this, pc.as_ptr() as usize, if needs_root { root } else { 0 }, riid, ppv);
-    if hr >= 0 && !ppv.is_null() && needs_root {
-        super::bind::note_root_changing_signature(*ppv as usize);
+    if hr >= 0 && !ppv.is_null() {
+        // keep the record layout so ExecuteIndirect can read and bound its arguments
+        let stride = u32::from_le_bytes(pc[0..4].try_into().unwrap());
+        if let Some(sig) = super::indirect::Signature::from_args(stride, &list) {
+            super::indirect::note_signature(*ppv as usize, sig);
+        }
+        if needs_root {
+            super::bind::note_root_changing_signature(*ppv as usize);
+        }
     }
     hr
 }
