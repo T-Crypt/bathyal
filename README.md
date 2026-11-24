@@ -134,6 +134,14 @@ bathyal disasm <shader.bin> [--hex]            # RDNA2 disassembler (console con
 bathyal shaders D:\data\shaders --top 50      # corpus statistics; --recomp / --compile N
 ```
 
+Fill the reusable DXIL cache ahead of a run with the read-only package wrapper. Add
+`-Pipelines` to warm the GPU driver's compute-pipeline cache too (slower and GPU/driver-specific):
+
+```powershell
+.\scripts\precompile-shaders.ps1 -Package 'D:\data\shaders.rpf'
+.\scripts\precompile-shaders.ps1 -Package 'D:\data\shaders.rpf' -Pipelines
+```
+
 - **Without a command line** (bathyal.exe opened from Explorer) Bathyal shows a small menu: *Choose a
   game…* (pick its exe or `MicrosoftGame.config`) or *Run again* (the last one). On an error the
   window stays open until Enter.
