@@ -113,12 +113,15 @@ fn dec(file: &str) -> String {
     let mut out = Vec::new();
     let mut i = 0;
     while i < b.len() {
-        if b[i] == b'%' && i + 2 < b.len() {
-            if let Ok(v) = u8::from_str_radix(&file[i + 1..i + 3], 16) {
-                out.push(v);
-                i += 3;
-                continue;
-            }
+        // Decode %XX from bytes only (#325): slicing `&file[i+1..i+3]` panics when a
+        // multi-byte UTF-8 character straddles the escape, and `from_str_radix` accepted
+        // signed forms like "%+1".
+        if b[i] == b'%' && i + 2 < b.len() && b[i + 1].is_ascii_hexdigit() && b[i + 2].is_ascii_hexdigit() {
+            let hi = hex_nibble(b[i + 1]);
+            let lo = hex_nibble(b[i + 2]);
+            out.push((hi << 4) | lo);
+            i += 3;
+            continue;
         }
         out.push(b[i]);
         i += 1;
@@ -159,6 +162,15 @@ fn stored_container_name(dir: &Path) -> String {
         }
     }
     dec(&dir.file_name().unwrap_or_default().to_string_lossy())
+}
+
+fn hex_nibble(b: u8) -> u8 {
+    match b {
+        b'0'..=b'9' => b - b'0',
+        b'a'..=b'f' => b - b'a' + 10,
+        b'A'..=b'F' => b - b'A' + 10,
+        _ => 0,
+    }
 }
 
 fn blobs_of(dir: &Path) -> Vec<(String, PathBuf, u64)> {
@@ -1366,6 +1378,17 @@ mod tests {
             XGameSaveCloseProvider(p);
             let _ = std::fs::remove_dir_all(root);
         }
+    /// #325: `%` + ASCII + multi-byte UTF-8 must not panic; `%+1` stays literal.
+    #[test]
+    fn dec_handles_percent_before_non_ascii_and_rejects_signed_hex() {
+        assert_eq!(dec("%a\u{e9}"), "%a\u{e9}");
+        assert_eq!(dec("%+1"), "%+1");
+        assert_eq!(dec("%2F"), "/");
+        assert_eq!(dec("%2f"), "/");
+        assert_eq!(dec("a%2Fb"), "a/b");
+        // Round-trip with enc for a name that needs escaping.
+        let name = "slot/1";
+        assert_eq!(dec(&enc(name)), name);
     }
 
 }
