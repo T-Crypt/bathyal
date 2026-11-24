@@ -980,7 +980,7 @@ mod tests {
         for ty in [T::D1, T::D2, T::D3, T::Cube, T::D1Array, T::D2Array, T::D2Msaa, T::D2MsaaArray] {
             for class in 0..3 {
                 let d = null_srv_desc(ty, class);
-                assert_eq!(d.Format.0, null_dxgi_format(class) as i32, "{ty:?} class {class}");
+                assert_eq!(d.Format, null_dxgi_format(class), "{ty:?} class {class}");
                 assert_ne!(d.Format.0, 0, "a null SRV names a format");
                 assert_eq!(d.ViewDimension, null_view_dimension(ty));
                 assert_eq!(d.Shader4ComponentMapping, D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING);
