@@ -43,10 +43,21 @@ unsafe fn tracked_buffer(dev: &ID3D12Device, heap: D3D12_HEAP_TYPE, state: D3D12
         Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
         ..Default::default()
     };
-    let mut r: Option<ID3D12Resource> = None;
-    dev.CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: heap, ..Default::default() }, D3D12_HEAP_FLAG_NONE, &desc, state, None, &mut r)
-        .expect("CreateCommittedResource");
-    r.unwrap()
+    let hp = D3D12_HEAP_PROPERTIES { Type: heap, ..Default::default() };
+    let mut r: *mut c_void = std::ptr::null_mut();
+    let iid = ID3D12Resource::IID;
+    let hr = real::dev_create_committed_resource(
+        dev.as_raw() as *mut c_void,
+        &hp as *const _ as usize,
+        D3D12_HEAP_FLAG_NONE.0 as usize,
+        &desc as *const _ as usize,
+        state.0 as usize,
+        0,
+        &iid,
+        &mut r,
+    );
+    assert!(hr >= 0 && !r.is_null(), "CreateCommittedResource: {hr:#x}");
+    ID3D12Resource::from_raw(r)
 }
 
 /// The title's `Release` of an object: slot 2 of its vtable.
