@@ -4,7 +4,10 @@
 //! * lane 0 is a distance `d` back to the block whose endpoints predict this one's: symbol 0 is
 //!   "none" (predict zeros), an even symbol `v` is `v / 2`, an odd one `255 - v / 2`. Block
 //!   `i - d` is meant, and before block 0 a built-in history of 255 endpoint sets, the same for
-//!   every stream ([`Tables::history`]),
+//!   every stream ([`Tables::history`]). A stream never refers to the blocks of the previous
+//!   request, and a slot the table lacks is read as zeros (as bcpack-rs, this table's source,
+//!   does), so a fit that never saw the slot costs its blocks, not the whole chunk: real BC1
+//!   chunks do read slot 4, which bcpack-rs's fit lacks (its issue 4).
 //! * lane 1 was 0 in every stream the format notes describe,
 //! * lanes 2–7 are the differences of R0, G0, B0, R1, G1, B1 from the prediction, 0, -1, 1,
 //!   -2, 2 … for the symbols 0, 1, 2, 3, 4 …, modulo the channel's range (5, 6, 5 bits),
@@ -25,7 +28,7 @@ use super::{lanes, lane_widths, Error};
 pub struct Tables {
     /// The endpoints `[R0, G0, B0, R1, G1, B1]` of the blocks before a stream's first:
     /// `history[256 - k]` is the block `k` before block 0 (k = 1..=255; entry 0 is never read).
-    /// `None`: not known.
+    /// `None`: not known, and read as zeros.
     pub history: [Option<[u8; 6]>; 256],
     /// The selectors of each quadrant symbol, 2 bits a texel: bits 0–1 the top-left texel,
     /// 2–3 top-right, 4–5 bottom-left, 6–7 bottom-right.
@@ -37,6 +40,11 @@ const RANGE: [u8; 6] = [32, 64, 32, 32, 64, 32];
 
 /// Unpack a BC1 stream to its `out_len` bytes of blocks.
 pub fn decode(src: &[u8], out_len: usize, tables: &Tables) -> Result<Vec<u8>, Error> {
+    Ok(decode_counted(src, out_len, tables)?.0)
+}
+
+/// [`decode`], and how many blocks read a history entry `tables` lacks.
+pub fn decode_counted(src: &[u8], out_len: usize, tables: &Tables) -> Result<(Vec<u8>, usize), Error> {
     let widths = lane_widths(1).unwrap();
     if out_len % 8 != 0 {
         return Err(Error::OutputSize);
@@ -45,7 +53,7 @@ pub fn decode(src: &[u8], out_len: usize, tables: &Tables) -> Result<Vec<u8>, Er
     if src[consumed..].iter().any(|&b| b != 0) {
         return Err(Error::Trailing { consumed });
     }
-    assemble(&symbols, tables)
+    assemble_counted(&symbols, tables)
 }
 
 /// The endpoints `[R0, G0, B0, R1, G1, B1]` of a block.
@@ -57,7 +65,14 @@ fn endpoints(block: &[u8]) -> [u8; 6] {
 
 /// The blocks of `symbols` (12 per block, in [`super::decode_lanes`]'s order).
 pub fn assemble(symbols: &[u8], tables: &Tables) -> Result<Vec<u8>, Error> {
+    Ok(assemble_counted(symbols, tables)?.0)
+}
+
+/// [`assemble`], and how many blocks read a history entry `tables` lacks (those blocks are
+/// rebuilt from zeros, so they are probably wrong).
+pub fn assemble_counted(symbols: &[u8], tables: &Tables) -> Result<(Vec<u8>, usize), Error> {
     let blocks = symbols.len() / 12;
+    let mut unfitted = 0usize;
     let mut out = Vec::new();
     out.try_reserve_exact(blocks * 8).map_err(|_| Error::OutputSize)?;
     out.resize(blocks * 8, 0u8);
@@ -73,7 +88,13 @@ pub fn assemble(symbols: &[u8], tables: &Tables) -> Result<Vec<u8>, Error> {
             endpoints(&out[(i - d) * 8..])
         } else {
             let slot = 256 + i - d;
-            tables.history[slot].ok_or(Error::History { block: i, slot })?
+            match tables.history[slot] {
+                Some(e) => e,
+                None => {
+                    unfitted += 1;
+                    [0; 6]
+                }
+            }
         };
         let mut e = [0u16; 6];
         for c in 0..6 {
@@ -91,5 +112,5 @@ pub fn assemble(symbols: &[u8], tables: &Tables) -> Result<Vec<u8>, Error> {
         b[6] = (bl & 15) | (br & 15) << 4;
         b[7] = (bl >> 4) | (br >> 4) << 4;
     }
-    Ok(out)
+    Ok((out, unfitted))
 }

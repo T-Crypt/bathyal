@@ -142,10 +142,15 @@ fn bc1_block_rebuild() {
     let mut odd = b0;
     odd[1] = 1;
     assert_eq!(bc1::assemble(&odd, t), Err(Error::Lane1 { block: 0 }));
-    // an unknown history entry stops the stream instead of guessing
+    // a missing history entry is read as zeros, as its source decodes an unfitted slot: the
+    // block that read it is zeros here (nothing written before it), the rest is unchanged
     let mut holes = bc1::Tables { history: t.history, quadrants: t.quadrants };
     holes.history[3] = None;
-    assert_eq!(bc1::assemble(&[b0, b1, b2].concat(), &holes), Err(Error::History { block: 2, slot: 3 }));
+    let (hole_out, unfitted) = bc1::assemble_counted(&[b0, b1, b2].concat(), &holes).unwrap();
+    assert_eq!(unfitted, 1);
+    assert_eq!(hole_out[..16], out[..16]);
+    assert_eq!(hole_out[16..], [0; 8]);
+    assert_eq!(bc1::assemble(&[b0, b1, b2].concat(), &holes).as_deref(), Ok(&hole_out[..]));
 }
 
 /// The 8-bit model 11 as US 11,234,023 prints it (its `base_table[8][12]`, counted from 1).
@@ -378,12 +383,35 @@ fn fitted_bc1_tables_are_well_formed() {
     let row = |left: usize, right: usize| uniform(left) * 5 | uniform(right) * 5 << 4;
     assert_eq!(b[4..], [row(0, 1), row(0, 1), row(2, 3), row(2, 3)]);
 
-    // an entry the estimate does not have ends the rebuild
-    if let Some(slot) = (1..256).find(|&k| t.history[k].is_none()) {
-        let d = 256 - slot;
-        s[0] = if d < 128 { 2 * d } else { 2 * (255 - d) + 1 } as u8;
-        assert_eq!(bc1::assemble(&s, t), Err(Error::History { block: 0, slot }));
-    }
+    // the one readable entry the estimate lacks (4) is read as zeros: real chunks do read it,
+    // and one such block must not cost the whole chunk
+    assert!(t.history[0].is_none());
+    assert_eq!(t.history.iter().flatten().count(), 254);
+    let slot = (1..256).find(|&k| t.history[k].is_none()).expect("slot 4 is still unfitted");
+    assert_eq!(slot, 4);
+    let d = 256 - slot;
+    s[0] = if d < 128 { 2 * d } else { 2 * (255 - d) + 1 } as u8;
+    assert_eq!(s[0], 7);
+    s[2] = 2; // R0 +1, so the block is not all zeros
+    s[8..].copy_from_slice(&[0, 1, 2, 3]);
+    let b = bc1::assemble(&s, t).unwrap();
+    assert_eq!(b[..2], (1u16 << 11).to_le_bytes());
+    assert_eq!(&b[2..4], &[0, 0]);
+    assert_eq!(b[4..], [row(0, 1), row(0, 1), row(2, 3), row(2, 3)]);
+
+    // and through the entropy stage: a two-block stream whose block 0 refers 252 blocks back
+    // (slot 4) and whose block 1 takes block 0's endpoints
+    let symbols = [7u8, 0, 2, 4, 6, 0, 2, 2, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    let stream = stream_from_symbols(lane_widths(1).unwrap(), &symbols);
+    let (blocks, unfitted) = bc1::decode_counted(&stream, 16, t).expect("the format allows it");
+    assert_eq!(unfitted, 1);
+    // block 0 from zeros: (1, 2, 3) and (0, 1, 1); quadrant symbol 0 is a uniform quadrant
+    assert_eq!(blocks[..2], (1u16 << 11 | 2 << 5 | 3).to_le_bytes());
+    assert_eq!(blocks[2..4], (1u16 << 5 | 1).to_le_bytes());
+    assert_eq!(blocks[4..8], [uniform(0) * 0x55; 4]);
+    // block 1 one block back, no change
+    assert_eq!(blocks[8..10], blocks[..2]);
+    assert_eq!(blocks[10..12], blocks[2..4]);
 }
 
 // ---------------------------------------------------------------------------------------

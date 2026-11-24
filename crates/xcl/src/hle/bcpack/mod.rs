@@ -10,7 +10,9 @@
 //!   is published for BC2,
 //! * the rebuild of BC1 blocks ([`bc1`]), which needs two tables of constants that are not in
 //!   the stream ([`bc1::Tables`]). XCL has the estimates bcpack-rs made of them
-//!   (`bc1_fitted.rs`), so its BC1 blocks are an approximation wherever an estimate is off,
+//!   (`bc1_fitted.rs`), so its BC1 blocks are an approximation wherever an estimate is off, and
+//!   a block that reads an entry bcpack-rs never fitted is built from zeros (as bcpack-rs does)
+//!   instead of losing its whole chunk; the first such read of a process is logged,
 //! * the rebuild of BC5 blocks ([`bc5`]), which also needs constants that are not in the
 //!   stream ([`bc5::Tables`]). XCL has the index-pair table and the estimates
 //!   leonida-asset-pipeline made of the history (`bc5_tables.rs`), so its BC5 blocks are an
@@ -97,7 +99,7 @@ impl std::fmt::Display for Error {
             Error::Stuck => write!(f, "the lanes cannot go on"),
             Error::Trailing { consumed } => write!(f, "data follows the stream's {consumed} bytes"),
             Error::Lane1 { block } => write!(f, "BC1 block {block} has a non-zero lane 1 symbol"),
-            Error::History { block, slot } => write!(f, "BC1 block {block} refers to the unknown history entry {slot}"),
+            Error::History { block, slot } => write!(f, "block {block} refers to the unknown history entry {slot}"),
         }
     }
 }
@@ -165,11 +167,27 @@ pub fn can_decode(mode: u8) -> bool {
 /// Unpack a stream of `mode` to its `out_len` bytes of BCn blocks.
 pub fn decode(mode: u8, src: &[u8], out_len: usize) -> Result<Vec<u8>, Error> {
     match (mode, bc1_tables()) {
-        (1, Some(t)) => bc1::decode(src, out_len, t),
+        (1, Some(t)) => {
+            let (blocks, unfitted) = bc1::decode_counted(src, out_len, t)?;
+            report_unfitted(unfitted);
+            Ok(blocks)
+        }
         (5, _) => bc5::decode(src, out_len, bc5_tables()),
         _ => Err(Error::Unsupported),
     }
 }
+
+/// One line the first time a BC1 block reads a history entry the fitted table lacks: such a
+/// block is rebuilt from zeros and is probably wrong, the rest of its chunk is not.
+fn report_unfitted(blocks: usize) {
+    if blocks > 0 && !UNFITTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        crate::xlog_info!(
+            "DirectStorage: BCPack BC1: {blocks} blocks of this chunk read a history entry the fitted table lacks; they are rebuilt from zeros"
+        );
+    }
+}
+
+static UNFITTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 #[cfg(test)]
 pub(crate) mod tests;
