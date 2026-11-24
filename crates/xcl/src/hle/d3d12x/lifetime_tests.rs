@@ -91,13 +91,20 @@ fn a_resource_released_after_submit_outlives_its_submission() {
         std::ptr::copy_nonoverlapping(pattern.as_ptr(), p as *mut u8, BYTES as usize);
         src.Unmap(0, None);
 
+        let pure = std::env::var_os("XCL_TEST_PURE").is_some();
         let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).expect("allocator");
         let mut raw_list: *mut c_void = std::ptr::null_mut();
         let iid = windows_sys::core::GUID::from_u128(0x5b160d0f_ac1b_4185_8ba8_b3ae42a5a455);
-        let hr = device_x::create_command_list_pc(dev.as_raw(), 0, D3D12_COMMAND_LIST_TYPE_DIRECT.0 as u32, alloc.as_raw() as usize, 0, &iid, &mut raw_list);
-        assert!(hr >= 0 && !raw_list.is_null(), "CreateCommandList: {hr:#x}");
-        // the PC list that runs the records (the title's console list is its wrapper)
-        let backing = title_list::backing(raw_list).expect("a title's list");
+        let (hr, backing) = if pure {
+            type F = unsafe extern "system" fn(*mut c_void, u32, i32, *mut c_void, *mut c_void, *const windows::core::GUID, *mut *mut c_void) -> i32;
+            let f: F = std::mem::transmute(real::orig_fn(dev.as_raw() as *mut c_void, 12));
+            let hr = f(dev.as_raw() as *mut c_void, 0, D3D12_COMMAND_LIST_TYPE_DIRECT.0, alloc.as_raw() as *mut c_void, std::ptr::null_mut(), &iid, &mut raw_list);
+            (hr, raw_list)
+        } else {
+            let hr = device_x::create_command_list_pc(dev.as_raw(), 0, D3D12_COMMAND_LIST_TYPE_DIRECT.0 as u32, alloc.as_raw() as usize, 0, &iid, &mut raw_list);
+            (hr, title_list::backing(raw_list).expect("a title's list"))
+        };
+        assert!(hr >= 0 && !backing.is_null(), "CreateCommandList: {hr:#x}");
         let list = ID3D12GraphicsCommandList::from_raw_borrowed(&backing).expect("PC list");
 
         // two copies name the source, the destination and the readback buffer
@@ -110,8 +117,21 @@ fn a_resource_released_after_submit_outlives_its_submission() {
 
         let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() }).expect("queue");
         let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).expect("fence");
-        let wrapper = ID3D12GraphicsCommandList::from_raw_borrowed(&raw_list).expect("title list");
-        queue.ExecuteCommandLists(&[Some(wrapper.cast().unwrap())]);
+        if pure {
+            let qdesc = D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() };
+            type QF = unsafe extern "system" fn(*mut c_void, *const D3D12_COMMAND_QUEUE_DESC, *const windows::core::GUID, *mut *mut c_void) -> i32;
+            let qf: QF = std::mem::transmute(real::orig_fn(dev.as_raw() as *mut c_void, 8));
+            let mut qraw: *mut c_void = std::ptr::null_mut();
+            let qiid = windows::Win32::Graphics::Direct3D12::ID3D12CommandQueue::IID;
+            assert!(qf(dev.as_raw() as *mut c_void, &qdesc, &qiid, &mut qraw) >= 0);
+            type EF = unsafe extern "system" fn(*mut c_void, u32, *const *mut c_void);
+            let ef: EF = std::mem::transmute(real::orig_fn(qraw, 10));
+            let one = [backing];
+            ef(qraw, 1, one.as_ptr());
+        } else {
+            let wrapper = ID3D12GraphicsCommandList::from_raw_borrowed(&raw_list).expect("title list");
+            queue.ExecuteCommandLists(&[Some(wrapper.cast().unwrap())]);
+        }
 
         // the title's references go now, on a GPU that may still be running the copy
         release(src.as_raw() as usize);
