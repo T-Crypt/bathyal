@@ -1017,8 +1017,19 @@ pub(super) unsafe extern "system" fn copy_memory_x(this: *mut c_void, dst: u64, 
     }
     note_write(this as usize, dst, size);
     if d == s {
-        // one window: the buffer is the source and the destination (the ranges do not overlap)
-        as_copy_dest(this, d, || copy_buffer_region(this, d, doff, s, soff, size));
+        // one window: one buffer cannot be in COPY_SOURCE and COPY_DEST at once (#958), so the
+        // bytes go through a scratch buffer of the list
+        let Some(t) = copy_scratch(this, size) else {
+            // none to be had: within the buffer, as D3D12 does not define it (the ranges do not overlap)
+            as_copy_dest(this, d, || copy_buffer_region(this, d, doff, s, soff, size));
+            return;
+        };
+        transition(this, s, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        as_copy_dest(this, t, || copy_buffer_region(this, t, 0, s, soff, size));
+        transition(this, s, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
+        transition(this, t, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        as_copy_dest(this, d, || copy_buffer_region(this, d, doff, t, 0, size));
+        transition(this, t, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
         return;
     }
     transition(this, s, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
@@ -1049,6 +1060,42 @@ unsafe fn cpu_copy(this: *mut c_void, dst: u64, src: u64, size: u64, what: &str)
             if crate::gpu::uma::get().is_some_and(|u| u.is_sparse(dp)) { ", into the destination window's video memory" } else { "" }
         );
     }
+/// the largest copy within one window that goes through a scratch buffer
+const MAX_COPY_SCRATCH: u64 = 64 << 20;
+
+/// scratch buffers of copies within one window: (command list, buffer, bytes). A list's own: its
+/// executions run one after another and its barriers order its copies. Kept for the process, as
+/// pattern buffers are: an earlier recording of the list may still run when it needs a larger one.
+static COPY_SCRATCH: Mutex<Vec<(usize, ID3D12Resource, u64)>> = Mutex::new(Vec::new());
+
+/// A scratch buffer of at least `n` bytes of `list` (the device's default heap, COMMON).
+unsafe fn copy_scratch(list: *mut c_void, n: u64) -> Option<usize> {
+    let mut cache = COPY_SCRATCH.lock().unwrap();
+    if let Some((_, b, _)) = cache.iter().find(|(l, _, len)| *l == list as usize && *len >= n) {
+        return Some(b.as_raw() as usize);
+    }
+    if n > MAX_COPY_SCRATCH || cache.len() >= 256 {
+        return None;
+    }
+    let len = n.next_power_of_two().max(0x1_0000);
+    let desc = D3D12_RESOURCE_DESC {
+        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+        Width: len,
+        Height: 1,
+        DepthOrArraySize: 1,
+        MipLevels: 1,
+        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+        ..Default::default()
+    };
+    let mut b: Option<ID3D12Resource> = None;
+    device_of(list)?
+        .CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() }, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut b)
+        .ok()?;
+    let b = b?;
+    let raw = b.as_raw() as usize;
+    cache.push((list as usize, b, len));
+    Some(raw)
 }
 
 unsafe fn device_of(list: *mut c_void) -> Option<ID3D12Device> {
