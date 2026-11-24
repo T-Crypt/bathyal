@@ -393,7 +393,7 @@ mod tests {
         assert!(load(key).is_none());
         note_lookup(false);
         store(key, b"a driver blob");
-        assert_eq!(load(key).as_deref(), Some(&b"a driver blob"[..]));
+        assert_eq!(load(key).map(|b| b.to_vec()), Some(b"a driver blob".to_vec()));
         note_lookup(true);
         super::forget(key);
         let (h1, m1) = counts();
