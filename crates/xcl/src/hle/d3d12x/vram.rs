@@ -718,9 +718,13 @@ mod tests {
         let first = b.claim(Space::Textures, 1, a, 16, 16, t, &mut grow).unwrap();
         assert_eq!(b.claim(Space::Textures, 2, a, 16, 16, t, &mut grow).unwrap(), first, "placed again at the same address: the same memory");
         assert_eq!(b.pages_of(Space::Textures), 16 * PAGE);
-        // a texture over it one page further on shares none of its tiles …
+        // a tile counts for the address it starts at, whatever the placement's base: one page
+        // further on is the next of the same texture's tiles
         let over = b.claim(Space::Textures, 3, a + PAGE, 4, 4, t, &mut grow).unwrap();
-        assert!(over.iter().all(|x| !first.contains(x)), "tiles of another offset are its own");
+        assert_eq!(over[..], first[1..5], "the tiles of the addresses it starts at");
+        // another sub-page offset starts at other addresses: tiles of its own
+        let shifted = b.claim(Space::Textures, 7, a + 0x1000, 4, 4, t, &mut grow).unwrap();
+        assert!(shifted.iter().all(|x| !first.contains(x)), "another offset of the page: another tile");
         // … and two page-aligned ones share every page: one address, one tile
         let aligned = b.claim(Space::Textures, 4, va, 4, 4, t, &mut grow).unwrap();
         assert!(aligned.iter().all(|x| !first.contains(x)), "a page-aligned base is another set of addresses");
@@ -737,7 +741,8 @@ mod tests {
         let pages = b.pages_of(Space::Textures);
         println!("{placed} bytes placed, {pages} bytes of pages");
         assert!(pages <= placed / 8, "{pages} bytes of pages for {placed} bytes placed");
-        assert!(pages <= 4 * SPAN, "{pages} bytes of pages for a span of {SPAN}");
+        // one tile per title address per sub-page offset the title packed at
+        assert_eq!(pages, (SPAN / PAGE + 8) * 4 * PAGE, "{pages} bytes of pages for a span of {SPAN}");
     }
 
     /// A page no resource uses keeps its tile (and what it holds) for 2 s, then the tile cools
