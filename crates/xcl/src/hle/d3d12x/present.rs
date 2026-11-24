@@ -70,6 +70,8 @@ unsafe fn present_x_frame(queue: *mut c_void, plane_count: u32, planes: *const u
         if let Some(t) = LAST.lock().unwrap().replace(now) {
             crate::xlog_info!("D3D12.X: {frames} frames presented, {:.1} fps over the last 300", 300.0 / (now - t).as_secs_f64());
         }
+        // what this run drew with, for the next run to build during load
+        super::pso_disk::flush_drawn();
     }
     super::real::stop_if_device_removed();
     if !PRESENTX.swap(true, Ordering::Relaxed) {

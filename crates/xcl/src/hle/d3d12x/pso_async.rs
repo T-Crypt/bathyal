@@ -23,6 +23,8 @@ struct Pending {
     compute: bool,
     /// the stand-in was released before the real pipeline was built
     orphan: std::sync::atomic::AtomicBool,
+    /// its shaders are in the prewarm record (marked once)
+    noted: std::sync::atomic::AtomicBool,
 }
 
 /// stand-in handed to the title → its real pipeline
@@ -118,6 +120,7 @@ const NVIDIA_WORKERS: usize = 4;
 /// Release a pipeline state XCL owns (raw pointer, 0 = none).
 pub fn release(p: usize) {
     if p != 0 {
+        super::pso_disk::forget_pso(p);
         unsafe { drop(<windows::Win32::Graphics::Direct3D12::ID3D12PipelineState as windows::core::Interface>::from_raw(p as *mut std::ffi::c_void)) };
     }
 }
@@ -151,6 +154,7 @@ fn submit_as(standin: usize, compute: bool, job: Job, send: bool) {
         cv: Condvar::new(),
         compute,
         orphan: Default::default(),
+        noted: Default::default(),
     });
     PENDING.lock().unwrap().get_or_insert_with(HashMap::new).insert(standin, p.clone());
     static ONCE: std::sync::Once = std::sync::Once::new();
@@ -181,6 +185,21 @@ pub fn resolve(pso: usize) -> usize {
     }
 }
 
+/// Whether a pipeline whose build was put off is built now, while the title loads, or on its
+/// first use. One whose shaders were drawn with in an earlier run is prewarmed: the title
+/// creates its pipelines while it loads, so the build starts then instead of at the first draw.
+pub fn build_during_load(lazy: bool, drawn_before: bool) -> bool {
+    !lazy || drawn_before
+}
+
+/// A pipeline drawn with in an earlier run went to the workers at its creation (logged once).
+pub fn note_prewarmed() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        crate::xlog_info!("D3D12.X: pipelines drawn with in an earlier run are built while the title loads");
+    });
+}
+
 /// `resolve`, waiting for a pipeline still being built – built here if no worker has started
 /// it yet (a queue of a title's hundreds of pipelines must not hold up the one it binds now).
 pub fn resolve_wait(pso: usize) -> usize {
@@ -193,7 +212,12 @@ pub fn resolve_wait(pso: usize) -> usize {
     while !*done {
         done = p.cv.wait(done).unwrap();
     }
-    match p.real.load(Ordering::Acquire) {
+    let real = p.real.load(Ordering::Acquire);
+    drop(done);
+    if real != 0 && !p.noted.swap(true, Ordering::Relaxed) {
+        super::pso_disk::note_drawn(real);
+    }
+    match real {
         0 => pso,
         r => r,
     }
@@ -204,7 +228,11 @@ pub fn resolve_for_bind(pso: usize) -> usize {
     match entry(pso) {
         Some(p) if p.compute => resolve_wait(pso),
         Some(_) => resolve(pso),
-        None => pso,
+        None => {
+            // a pipeline built in the call (no stand-in): drawn with, so prewarmed next run
+            super::pso_disk::note_drawn(pso);
+            pso
+        }
     }
 }
 

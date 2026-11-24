@@ -3853,6 +3853,7 @@ unsafe fn translated_compute_pso(this: *mut c_void, f: PsoFn, desc: *const c_voi
     }
     TRANSLATED_PSO.fetch_add(1, Ordering::Relaxed);
     note_pso_rs(*ppv, rs);
+    super::pso_disk::note_pso_shader(*ppv as usize, super::pso_disk::shaders_sig(&[cs]));
     if let Some(n) = crate::gpu::recomp::pso::compute_user_sgprs(cs) {
         PSO_USER_SGPRS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, n);
     }
@@ -3948,6 +3949,13 @@ unsafe fn translated_graphics_pso(this: *mut c_void, f: PsoFn, desc: *const c_vo
     }
     let n = TRANSLATED_PSO.fetch_add(1, Ordering::Relaxed);
     note_pso_rs(*ppv, rs);
+    let mut stages = Vec::new();
+    for b in [&d.VS, &d.PS, &d.DS, &d.HS, &d.GS] {
+        if let Some(code) = shader_bytes(b) {
+            stages.push(code);
+        }
+    }
+    super::pso_disk::note_pso_shader(*ppv as usize, super::pso_disk::shaders_sig(&stages));
     TRANSLATED_GRAPHICS.lock().unwrap().get_or_insert_with(HashSet::new).insert(*ppv as usize);
     note_rect_list_gs(*ppv as usize, &copy, rect_gs.is_some());
     if super::present::trace_frame() {
@@ -4026,6 +4034,16 @@ enum OwnedDesc {
 unsafe impl Send for OwnedDesc {}
 
 impl OwnedDesc {
+    /// The console shaders this pipeline is built from, in `pso_disk::shaders_sig` order: what
+    /// the pipeline is known by before it has a translation (`pso_disk::note_pso_shader`
+    /// records the same at creation).
+    fn shader_sig(&self) -> u64 {
+        let blobs = match self {
+            OwnedDesc::Compute(_, b) | OwnedDesc::Graphics(_, b, ..) | OwnedDesc::Stream(_, _, b) => b,
+        };
+        super::pso_disk::shaders_sig(&blobs.iter().map(Vec::as_slice).collect::<Vec<_>>())
+    }
+
     fn ptr(&self) -> *const c_void {
         match self {
             OwnedDesc::Compute(d, _) => &**d as *const _ as *const c_void,
@@ -4167,7 +4185,13 @@ unsafe fn go_background(
         return None;
     }
     let dev = Dev(this as usize, f as usize);
-    let submit = if super::pso_async::lazy() { super::pso_async::submit_lazy } else { super::pso_async::submit };
+    // a pipeline drawn with in an earlier run is built now, while the title loads: its first
+    // draw then does not wait
+    let eager = super::pso_async::build_during_load(super::pso_async::lazy(), super::pso_disk::wanted_shader(owned.shader_sig()));
+    if eager && super::pso_async::lazy() {
+        super::pso_async::note_prewarmed();
+    }
+    let submit = if eager { super::pso_async::submit } else { super::pso_async::submit_lazy };
     submit(
         *ppv as usize,
         compute,
