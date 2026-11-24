@@ -30,8 +30,8 @@ fn ready() -> Option<ID3D12Device> {
     unsafe { ID3D12Device::from_raw_borrowed(&raw) }.cloned()
 }
 
-/// A buffer from the PC device's own `CreateCommittedResource` entry point.
-unsafe fn pc_buffer(dev: *mut c_void, heap: D3D12_HEAP_TYPE, state: D3D12_RESOURCE_STATES) -> ID3D12Resource {
+/// A buffer through the D3D12.X device (an object a recorded list can hold).
+unsafe fn tracked_buffer(dev: &ID3D12Device, heap: D3D12_HEAP_TYPE, state: D3D12_RESOURCE_STATES) -> ID3D12Resource {
     let desc = D3D12_RESOURCE_DESC {
         Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
         Width: BYTES,
@@ -43,13 +43,10 @@ unsafe fn pc_buffer(dev: *mut c_void, heap: D3D12_HEAP_TYPE, state: D3D12_RESOUR
         Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
         ..Default::default()
     };
-    type F = unsafe extern "system" fn(*mut c_void, *const D3D12_HEAP_PROPERTIES, D3D12_HEAP_FLAGS, *const D3D12_RESOURCE_DESC, D3D12_RESOURCE_STATES, *const D3D12_CLEAR_VALUE, *const windows::core::GUID, *mut *mut c_void) -> i32;
-    let f: F = std::mem::transmute(real::orig_fn(dev, 27));
-    let mut r: *mut c_void = std::ptr::null_mut();
-    let hp = D3D12_HEAP_PROPERTIES { Type: heap, ..Default::default() };
-    let iid = ID3D12Resource::IID;
-    assert!(f(dev, &hp, D3D12_HEAP_FLAG_NONE, &desc, state, std::ptr::null(), &iid, &mut r) >= 0, "CreateCommittedResource");
-    ID3D12Resource::from_raw(r)
+    let mut r: Option<ID3D12Resource> = None;
+    dev.CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: heap, ..Default::default() }, D3D12_HEAP_FLAG_NONE, &desc, state, None, &mut r)
+        .expect("CreateCommittedResource");
+    r.unwrap()
 }
 
 /// The title's `Release` of an object: slot 2 of its vtable.
@@ -65,9 +62,9 @@ fn a_resource_released_after_submit_outlives_its_submission() {
     let Some(dev) = ready() else { return };
     unsafe {
         let d = dev.as_raw() as *mut c_void;
-        let src = pc_buffer(d, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
-        let dst = pc_buffer(d, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COPY_DEST);
-        let rb = pc_buffer(d, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
+        let src = tracked_buffer(&dev, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
+        let dst = tracked_buffer(&dev, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COPY_DEST);
+        let rb = tracked_buffer(&dev, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
         let pattern: Vec<u8> = (0..BYTES).map(|k| (k as u8).wrapping_mul(7).wrapping_add(3)).collect();
         let mut p = std::ptr::null_mut();
         src.Map(0, None, Some(&mut p)).expect("Map of the upload buffer");
