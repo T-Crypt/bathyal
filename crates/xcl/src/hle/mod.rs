@@ -148,6 +148,7 @@ fn build(config: &Config) -> Registry {
         "kernel32legacy.dll",
         "advapi32legacy.dll",
         "minappmodelx.dll",
+        "xmem.dll",
         "api-ms-win-core-*",
         "ext-ms-win-core-*",
     ] {
