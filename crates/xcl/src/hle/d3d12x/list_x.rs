@@ -730,6 +730,8 @@ pub unsafe fn on_create(list: *mut c_void, alloc: usize, pso: usize, ty: D3D12_C
     }
     super::lifetime::forget_list(list as usize);
     let key = list as usize;
+    // (of a list that was here before and whose release was not seen: the GPU may still use it)
+    release_copy_scratch(key);
     let old = {
         let mut g = LISTS.lock().unwrap();
         let m = g.get_or_insert_with(HashMap::new);
