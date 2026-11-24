@@ -1,14 +1,14 @@
-//! A resource released right after its submission: the GPU's work still reads it, and the
-//! PC object must stay alive until the fence the submission is covered by has signalled.
+//! A resource released right after its submission: the GPU's copy still reads it, and the PC
+//! object must stay alive until the fence the submission is covered by has signalled.
 //!
-//! Skipped (passing) without a real D3D12 device or without unified memory open on the GPU.
+//! Skipped (passing) without a real D3D12 device.
 
 use std::ffi::c_void;
 
 use windows::core::Interface;
 use windows::Win32::Graphics::Direct3D12::*;
 
-use super::{fence_x, lifetime, list_x, real};
+use super::{device_x, fence_x, lifetime, real, title_list};
 
 const BYTES: u64 = 64;
 
@@ -24,8 +24,7 @@ fn ready() -> Option<ID3D12Device> {
         return None;
     }
     let raw = real::device_raw();
-    let dev = unsafe { ID3D12Device::from_raw_borrowed(&raw) }?.clone();
-    Some(dev)
+    unsafe { ID3D12Device::from_raw_borrowed(&raw) }.cloned()
 }
 
 fn buffer(dev: &ID3D12Device, heap: D3D12_HEAP_TYPE, state: D3D12_RESOURCE_STATES) -> ID3D12Resource {
@@ -54,8 +53,8 @@ unsafe fn release(obj: usize) -> u32 {
     f(obj as *mut c_void)
 }
 
-/// A title releases a buffer it just submitted a copy from; the copy and the released bytes
-/// are both still right, and the device stays up.
+/// A title releases a buffer it just submitted a copy from; the copy's bytes are right and the
+/// device stays up.
 #[test]
 fn a_resource_released_after_submit_outlives_its_submission() {
     let Some(dev) = ready() else { return };
@@ -68,44 +67,32 @@ fn a_resource_released_after_submit_outlives_its_submission() {
         src.Map(0, None, Some(&mut p)).expect("Map of the upload buffer");
         std::ptr::copy_nonoverlapping(pattern.as_ptr(), p as *mut u8, BYTES as usize);
         src.Unmap(0, None);
-        if std::env::var_os("XCL_TEST_KEEP").is_some() {
-            let mut c = std::ptr::null_mut();
-            src.Map(0, None, Some(&mut c)).expect("re-Map of the upload buffer");
-            let back = std::slice::from_raw_parts(c as *const u8, 8).to_vec();
-            src.Unmap(0, None);
-            eprintln!("src after fill: {back:?}");
-        }
 
         let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).expect("allocator");
-        let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None::<&ID3D12PipelineState>).expect("CreateCommandList");
-        let raw_list = list.as_raw() as *mut c_void;
+        let mut raw_list: *mut c_void = std::ptr::null_mut();
+        let iid = windows_sys::core::GUID::from_u128(0x5b160d0f_ac1b_4185_8ba8_b3ae42a5a455);
+        let hr = device_x::create_command_list_pc(dev.as_raw(), 0, D3D12_COMMAND_LIST_TYPE_DIRECT.0 as u32, alloc.as_raw() as usize, 0, &iid, &mut raw_list);
+        assert!(hr >= 0 && !raw_list.is_null(), "CreateCommandList: {hr:#x}");
+        // the PC list that runs the records (the title's console list is its wrapper)
+        let backing = title_list::backing(raw_list).expect("a title's list");
+        let list = ID3D12GraphicsCommandList::from_raw_borrowed(&backing).expect("PC list");
 
-        // the two copies name the source, the destination and the readback buffer
-        if std::env::var_os("XCL_TEST_PC").is_some() {
-            list.CopyBufferRegion(&dst, 0, &src, 0, BYTES);
-            list.CopyBufferRegion(&rb, 0, &dst, 0, BYTES);
-        } else {
-            list_x::copy_buffer_region_x(raw_list, dst.as_raw() as usize, 0, src.as_raw() as usize, 0, BYTES);
-            list_x::copy_buffer_region_x(raw_list, rb.as_raw() as usize, 0, dst.as_raw() as usize, 0, BYTES);
+        // two copies name the source, the destination and the readback buffer
+        list.CopyBufferRegion(&dst, 0, &src, 0, BYTES);
+        list.CopyBufferRegion(&rb, 0, &dst, 0, BYTES);
+        for r in [&src, &dst] {
+            lifetime::note(backing as usize, r.as_raw() as usize);
         }
         list.Close().expect("Close");
 
         let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() }).expect("queue");
         let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).expect("fence");
-        if std::env::var_os("XCL_TEST_RAWEXEC").is_some() {
-            let f: unsafe extern "system" fn(*mut c_void, u32, *const *mut c_void) = std::mem::transmute(real::orig_fn(queue.as_raw() as *mut c_void, 10));
-            let one = [list.as_raw() as *mut c_void];
-            f(queue.as_raw() as *mut c_void, 1, one.as_ptr());
-        } else {
-            queue.ExecuteCommandLists(&[Some(list.cast().unwrap())]);
-        }
+        queue.ExecuteCommandLists(&[Some(list.cast().unwrap())]);
 
         // the title's references go now, on a GPU that may still be running the copy
-        if std::env::var_os("XCL_TEST_KEEP").is_none() {
-            release(src.as_raw() as usize);
-            release(dst.as_raw() as usize);
-            assert!(lifetime::held(src.as_raw() as usize), "a buffer a submitted list names must still be held");
-        }
+        release(src.as_raw() as usize);
+        release(dst.as_raw() as usize);
+        assert!(lifetime::held(src.as_raw() as usize), "a buffer a submitted list names must still be held");
         queue.Signal(&fence, 1).expect("Signal");
         fence_x::note_queue_signal(queue.as_raw() as usize, fence.as_raw() as usize, 1);
 
@@ -116,9 +103,7 @@ fn a_resource_released_after_submit_outlives_its_submission() {
         }
         lifetime::poll();
         assert!(dev.GetDeviceRemovedReason().is_ok(), "device removed: {:?}", dev.GetDeviceRemovedReason());
-        if std::env::var_os("XCL_TEST_KEEP").is_none() {
-            assert!(!lifetime::held(src.as_raw() as usize), "the buffer was not freed after its fence");
-        }
+        assert!(!lifetime::held(src.as_raw() as usize), "the buffer was not freed after its fence");
 
         let mut q = std::ptr::null_mut();
         rb.Map(0, None, Some(&mut q)).expect("Map of the readback buffer");
@@ -127,8 +112,8 @@ fn a_resource_released_after_submit_outlives_its_submission() {
         assert_eq!(got, pattern, "the copy read memory that was not the source's");
         release(rb.as_raw() as usize);
 
-        // the list goes last (its allocator is what keeps its unified memory)
-        drop(list);
+        // the title's list goes last (its allocator is what keeps its unified memory)
+        release(raw_list as usize);
         drop(alloc);
     }
 }
