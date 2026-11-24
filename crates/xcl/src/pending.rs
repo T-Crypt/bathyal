@@ -155,6 +155,20 @@ pub fn enabled() -> bool {
     ENABLED.load(Ordering::Relaxed)
 }
 
+/// A test that checks the registry turns it on, and off again when it ends.
+#[cfg(test)]
+pub(crate) fn set_enabled(on: bool) {
+    ENABLED.store(on, Ordering::Release);
+}
+
+/// How many items of `kind` were begun for `size` (`Meta::size`, the identity the site
+/// recorded). The registry is one per process and the suite runs its tests in parallel, so a
+/// test counts its own items rather than a category.
+#[cfg(test)]
+pub(crate) fn count_matching(kind: Kind, size: u64) -> usize {
+    registry(kind as usize).lock().unwrap_or_else(|e| e.into_inner()).values().filter(|i| i.meta.size == size).count()
+}
+
 /// Record an outstanding item (cheap: one short mutex).
 pub fn begin(kind: Kind, meta: Meta) -> Ticket {
     let ki = kind as usize;
