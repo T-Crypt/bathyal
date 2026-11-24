@@ -3916,7 +3916,21 @@ unsafe fn payload_shader<'a>(p: &[u8]) -> Option<&'a [u8]> {
     shader_bytes(&b)
 }
 
-/// The console PS of a two-pass pipeline (a PC PS passes as it is).
+/// The console mesh program of a stream and a console amplification program, if any:
+/// (mesh, amplification). Both are found by the DXIL program kind in the shader subobjects 24
+/// and 25, not by the slot number: the console's streams put their mesh program in subobject
+/// 24 (the PC's AS slot) and have no 25. A PC shader in either slot is not one of these.
+fn console_mesh_programs<'a>(subs: &'a [(u32, &'a [u8])]) -> (Option<&'a [u8]>, Option<&'a [u8]>) {
+    use crate::gpu::recomp::pso::is_console;
+    let slot = |ty: D3D12_PIPELINE_STATE_SUBOBJECT_TYPE| subs.iter().find(|s| s.0 == ty.0 as u32).and_then(|s| unsafe { payload_shader(s.1) });
+    let kind = |code: &[u8]| if is_console(code) { crate::gpu::xbox::parse(code).map(|s| s.stage) } else { None };
+    // the PC's slot first, so a PC stream keeps its meaning, then the console's
+    let pick = |order: [D3D12_PIPELINE_STATE_SUBOBJECT_TYPE; 2], want: &str| order.iter().filter_map(|&t| slot(t)).find(|c| kind(c).as_deref() == Some(want));
+    let mesh = pick([D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS], "MS");
+    let amp = pick([D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS], "AS");
+    (mesh, amp)
+}
+
 /// The PS of a two-pass pipeline (DXIL, static samplers – a PC PS passes as it is).
 fn two_pass_ps(ps: Option<&[u8]>, split_wave64: bool) -> Result<(Option<Vec<u8>>, Vec<crate::gpu::recomp::pso::StaticSampler>), String> {
     use crate::gpu::recomp::pso::{console_to_dxil_for, is_console, Stage};
@@ -3974,30 +3988,21 @@ unsafe fn translated_mesh_stream(this: *mut c_void, desc: *const c_void, riid: *
         return None;
     }
     let subs = stream_subobjects(std::slice::from_raw_parts(base as *const u8, size))?;
-    let as_slot = subs.iter().find(|s| s.0 == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS.0 as u32).and_then(|s| payload_shader(s.1));
-    let ms_slot = subs.iter().find(|s| s.0 == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS.0 as u32).and_then(|s| payload_shader(s.1));
-    // A console MS container in the AS slot and no MS subobject (a retail game's minimap
-    // pipelines): refused. Translated as the mesh shader they are, the title rendered nothing
-    // from then on (a black screen every run); refused, it goes on to its menus. What it
-    // expects of them is not known yet.
-    if let (None, Some(a)) = (ms_slot, as_slot) {
-        if is_console(a) && crate::gpu::xbox::parse(a).is_some_and(|sh| sh.stage == "MS") {
-            note_translation_error(format!("mesh pipeline with its MS {:016x} in the AS slot – refused", crate::gpu::shader::fnv64(a)));
-            return Some(E_INVALIDARG);
-        }
-    }
-    let ms = ms_slot?;
-    if !is_console(ms) {
-        return None;
-    }
-    if let Some(a) = as_slot {
+    // the mesh program by the kind in its container: the console writes it in subobject 24
+    // (the PC's AS slot) and no 25 – read by the slot number, such a stream looks like an AS
+    let (mesh, amp) = console_mesh_programs(&subs);
+    if let Some(a) = amp {
         let types: Vec<u32> = subs.iter().map(|s| s.0).collect();
         note_translation_error(format!(
             "mesh pipeline with AS {:016x} (MS {:016x}) – not supported yet; subobjects {types:?}",
             crate::gpu::shader::fnv64(a),
-            crate::gpu::shader::fnv64(ms)
+            mesh.map_or(0, crate::gpu::shader::fnv64)
         ));
         return Some(E_INVALIDARG);
+    }
+    let ms = mesh?;
+    if !is_console(ms) {
+        return None;
     }
     let ps = subs.iter().find(|s| s.0 == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS.0 as u32).and_then(|s| payload_shader(s.1));
     let (tp, (ps, ps_samplers)) = match (console_mesh(ms, ps, wave32_only(this)), two_pass_ps(ps, graphics_wave32(this))) {
@@ -5422,5 +5427,51 @@ mod console_format_query_tests {
             let pc = unsafe { dev.GetResourceAllocationInfo(0, &[d]) };
             assert!(pc.SizeInBytes != u64::MAX && pc.SizeInBytes >= 1920 * 1080 * 4 && pc.Alignment > 0, "PC {format} as {}: {:#x}", d.Format.0, pc.SizeInBytes);
         }
+    }
+}
+
+#[cfg(test)]
+mod mesh_program_slot_tests {
+    use super::*;
+
+    /// One shader subobject (types 24 and 25): type, 4 bytes of padding, D3D12_SHADER_BYTECODE.
+    fn shader_subobject(ty: u32, code: &[u8]) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend_from_slice(&ty.to_le_bytes());
+        b.extend_from_slice(&[0u8; 4]);
+        b.extend_from_slice(&(code.as_ptr() as usize as u64).to_le_bytes());
+        b.extend_from_slice(&(code.len() as u64).to_le_bytes());
+        b
+    }
+
+    /// (mesh, amplification) as the stream parser and `console_mesh_programs` find them, by pointer.
+    fn classify(list: &[(u32, &[u8])]) -> (Option<*const u8>, Option<*const u8>) {
+        let mut buf = Vec::new();
+        for &(ty, code) in list {
+            buf.extend_from_slice(&shader_subobject(ty, code));
+        }
+        let subs = stream_subobjects(&buf).expect("a stream");
+        let (m, a) = console_mesh_programs(&subs);
+        (m.map(|b| b.as_ptr()), a.map(|b| b.as_ptr()))
+    }
+
+    #[test]
+    fn mesh_streams_are_found_by_kind_not_by_slot() {
+        use crate::gpu::xbox::tests::{fssm, sample, CODE};
+        let mesh = sample(13, &[fssm(&CODE, &[(7, 6)])]);
+        let amp = sample(14, &[fssm(&CODE, &[(7, 6)])]);
+        assert_eq!(crate::gpu::xbox::parse(&mesh).unwrap().stage, "MS");
+        assert_eq!(crate::gpu::xbox::parse(&amp).unwrap().stage, "AS");
+        let (m, a) = (mesh.as_ptr(), amp.as_ptr());
+        // the console's form: the mesh program in subobject 24 (the PC's AS slot), no 25
+        assert_eq!(classify(&[(24, &mesh)]), (Some(m), None));
+        // the PC's form, and both in the console's numbering
+        assert_eq!(classify(&[(25, &mesh)]), (Some(m), None));
+        assert_eq!(classify(&[(24, &mesh), (25, &amp)]), (Some(m), Some(a)));
+        assert_eq!(classify(&[(25, &amp), (24, &mesh)]), (Some(m), Some(a)));
+        // a PC shader in either slot is not a console mesh program
+        let pc: &[u8] = b"DXBC a PC shader, not a console container";
+        assert_eq!(classify(&[(24, pc)]), (None, None));
+        assert_eq!(classify(&[(25, pc)]), (None, None));
     }
 }
