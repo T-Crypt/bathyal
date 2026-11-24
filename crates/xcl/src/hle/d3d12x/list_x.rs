@@ -46,7 +46,6 @@ const PC_RESOLVE_QUERY_DATA: usize = 54;
 const PC_SET_PREDICATION: usize = 55;
 const PC_OM_SET_DEPTH_BOUNDS: usize = 62;
 const PC_WRITE_BUFFER_IMMEDIATE: usize = 66;
-const PC_QUEUE_EXECUTE_COMMAND_LISTS: usize = 10;
 
 /// Write64BitValueBottomOfPipeX flags 1 / 2, Write64BitValueTopOfPipeX flags 4 / 8: the value
 /// written is a GPU / system timestamp
@@ -56,6 +55,7 @@ const TOP_TIMESTAMPS: u32 = 0xC;
 const MAX_FILL: u64 = 256 << 20;
 /// Bounded spin in `wait_until_satisfied` (tests and `KickoffX`'s helper); submissions to a
 /// queue are never waited on the title's thread (see `queue_gate`).
+#[cfg(test)]
 const WAIT_TIMEOUT: Duration = Duration::from_secs(2);
 /// Cap on tracked per-list written UMA ranges (for same-list write-then-wait detection).
 const MAX_WRITTEN_RANGES: usize = 256;
@@ -213,6 +213,7 @@ impl PendingWait {
         writer_done && compare_u64(self.comparison, cur & self.mask, self.value).unwrap_or(false)
     }
 
+    #[cfg(test)]
     unsafe fn wait_until_satisfied(&self, timeout: Duration) -> bool {
         if self.is_satisfied() {
             return true;

@@ -4632,8 +4632,6 @@ const QUEUE_FIRST: usize = 14;
 /// A title's call of queue slot `slot` (arguments as integers; Signal / Wait / SignalX /
 /// PresentX / GetTimestampFrequency / GetClockCalibration / GetDesc all fit).
 unsafe fn queue_dispatch(slot: usize, this: *mut c_void, a1: usize, a2: usize, a3: usize, a4: usize) -> usize {
-    const PC_SIGNAL: usize = 14;
-    const PC_WAIT: usize = 15;
     const PC_TIMESTAMP_FREQUENCY: usize = 16;
     const PC_CLOCK_CALIBRATION: usize = 17;
     const PC_GET_DESC: usize = 18;
