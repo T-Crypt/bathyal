@@ -21,6 +21,8 @@ struct Fence {
     cell: Option<&'static Cell>,
     /// the highest value a queue was told to signal
     signalled: u64,
+    /// SetEventOnCompletion waits that have not completed yet (for the pending-work report)
+    waits: Vec<(u64, crate::pending::Ticket)>,
 }
 
 /// (fences are never freed: XCL holds a reference to each)
@@ -48,11 +50,13 @@ unsafe fn borrowed<R>(fence: usize, f: impl FnOnce(&ID3D12Fence) -> R) -> Option
 }
 
 fn refresh() {
-    let g = FENCES.lock().unwrap_or_else(|e| e.into_inner());
-    for (&p, f) in g.iter().flatten() {
+    let mut g = FENCES.lock().unwrap_or_else(|e| e.into_inner());
+    for (&p, f) in g.iter_mut().flatten() {
         if let Some(c) = f.cell {
             if let Some(v) = unsafe { borrowed(p, |f| f.GetCompletedValue()) } {
                 c.0.store(v, Ordering::Release);
+                // finished waits drop their tickets (the pending-work report forgets them)
+                f.waits.retain(|(w, _)| *w > v);
             }
         }
     }
@@ -61,6 +65,18 @@ fn refresh() {
 unsafe fn arm(fence: usize, value: u64) {
     if let Some(Err(e)) = borrowed(fence, |f| f.SetEventOnCompletion(value, HANDLE(event() as *mut c_void))) {
         crate::xlog_warn!("D3D12.X: fence {fence:#x}: SetEventOnCompletion({value:#x}): {e}");
+        return;
+    }
+    if !crate::pending::enabled() {
+        return;
+    }
+    let t = crate::pending::begin(crate::pending::Kind::TitleWait, crate::pending::Meta { size: value, index: 1, ..Default::default() });
+    let mut g = FENCES.lock().unwrap_or_else(|e| e.into_inner());
+    let f = g.get_or_insert_with(HashMap::new).entry(fence).or_default();
+    if f.waits.iter().any(|w| w.0 == value) {
+        t.finish();
+    } else {
+        f.waits.push((value, t));
     }
 }
 

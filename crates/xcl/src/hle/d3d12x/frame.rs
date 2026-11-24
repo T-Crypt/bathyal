@@ -333,7 +333,14 @@ pub unsafe extern "system" fn wait_frame_event_x(_this: *mut std::ffi::c_void, t
     };
     let mut hs = vec![internal as HANDLE];
     hs.extend(extra);
+    let ticket = crate::pending::enabled().then(|| {
+        crate::pending::begin(
+            crate::pending::Kind::TitleWait,
+            crate::pending::Meta { size: ty as u64, index: 0, extra: timeout_ms, ..Default::default() },
+        )
+    });
     let r = WaitForMultipleObjects(hs.len() as u32, hs.as_ptr(), (flags & WAIT_ALL != 0) as i32, timeout_ms);
+    drop(ticket);
     ACTIVITY[0].fetch_add(1, Ordering::Relaxed);
     if r == WAIT_TIMEOUT {
         ACTIVITY[1].fetch_add(1, Ordering::Relaxed);

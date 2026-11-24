@@ -3795,11 +3795,19 @@ static BIG_COMPILES: Slots = Slots { n: Mutex::new(0), cv: std::sync::Condvar::n
 /// ~1.5 GB; the title loading next to it must not run out – no minute's grace as for DXC).
 fn wait_for_commit() {
     use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    // shown by the pending-work report while this thread waits for GPU memory to come back
+    let mut ticket: Option<crate::pending::Ticket> = None;
     loop {
         let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
         m.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
         if unsafe { GlobalMemoryStatusEx(&mut m) } == 0 || m.ullAvailPageFile >= 3 << 30 {
             return;
+        }
+        if ticket.is_none() && crate::pending::enabled() {
+            ticket = Some(crate::pending::begin(
+                crate::pending::Kind::TitleWait,
+                crate::pending::Meta { size: (3u64 << 30).saturating_sub(m.ullAvailPageFile), index: 2, ..Default::default() },
+            ));
         }
         std::thread::sleep(std::time::Duration::from_millis(200));
     }

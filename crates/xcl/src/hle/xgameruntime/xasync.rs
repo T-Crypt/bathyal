@@ -127,6 +127,31 @@ fn active_map() -> &'static Mutex<HashMap<usize, Arc<State>>> {
     ACTIVE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// Outstanding blocks for the pending-work report, keyed by block address (the ACTIVE map's
+/// key: a block is in it while its op is begun and not completed).
+static PENDING_BLOCKS: Mutex<Option<HashMap<usize, crate::pending::Ticket>>> = Mutex::new(None);
+
+fn note_begin(b: *mut XAsyncBlock, identity: usize) {
+    if !crate::pending::enabled() || b.is_null() {
+        return;
+    }
+    let t = crate::pending::begin(crate::pending::Kind::XAsync, crate::pending::Meta { size: identity as u64, ..Default::default() });
+    let mut g = PENDING_BLOCKS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(old) = g.get_or_insert_with(HashMap::new).insert(b as usize, t) {
+        old.finish();
+    }
+}
+
+fn note_done(b: *mut XAsyncBlock) {
+    if b.is_null() {
+        return;
+    }
+    let mut g = PENDING_BLOCKS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(t) = g.as_mut().and_then(|m| m.remove(&(b as usize))) {
+        t.finish();
+    }
+}
+
 #[derive(Clone, Copy)]
 struct BlockHeader {
     status: HRESULT,
@@ -232,11 +257,17 @@ pub unsafe extern "system" fn XAsyncBegin(
     _identity_name: *const u8,
     provider: usize,
 ) -> HRESULT {
+    note_begin(b, identity as usize);
     if let Some((o, f)) = pc(7) {
         let f: unsafe extern "system" fn(usize, *mut XAsyncBlock, *mut c_void, *const c_void, *const u8, usize) -> HRESULT = std::mem::transmute(f);
-        return f(o, b, context, identity, _identity_name, provider);
+        let hr = f(o, b, context, identity, _identity_name, provider);
+        if hr < 0 {
+            note_done(b);
+        }
+        return hr;
     }
     if b.is_null() || provider == 0 {
+        note_done(b);
         return E_INVALIDARG;
     }
     let s = Arc::new(State {
@@ -279,12 +310,17 @@ pub unsafe extern "system" fn XAsyncSchedule(b: *mut XAsyncBlock, delay_ms: u32)
 pub unsafe extern "system" fn XAsyncComplete(b: *mut XAsyncBlock, result: HRESULT, required: usize) {
     if let Some((o, f)) = pc(10) {
         let f: unsafe extern "system" fn(usize, *mut XAsyncBlock, HRESULT, usize) = std::mem::transmute(f);
-        return f(o, b, result, required);
+        let r = f(o, b, result, required);
+        if result != E_PENDING {
+            note_done(b);
+        }
+        return r;
     }
     // E_PENDING is not a completion: the provider still has work to do (libHttpClient).
     if result == E_PENDING {
         return;
     }
+    note_done(b);
     let Lookup::Active(s) = lookup(b) else { return };
     // Atomically claim completion while keeping `is_done() == false` until `OP_CLEANUP` and
     // `write_header` finish, so waiters/pollers cannot destroy `b` or race on `FLAG_CONSUMED`.

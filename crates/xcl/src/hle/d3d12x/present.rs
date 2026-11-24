@@ -69,10 +69,9 @@ unsafe fn present_x_frame(queue: *mut c_void, plane_count: u32, planes: *const u
         let now = std::time::Instant::now();
         if let Some(t) = LAST.lock().unwrap().replace(now) {
             crate::xlog_info!("D3D12.X: {frames} frames presented, {:.1} fps over the last 300", 300.0 / (now - t).as_secs_f64());
+            // one line every 300 frames, printed even at zero so a run's log can be filtered
             let (gated, longest, timeouts) = super::queue_gate::report();
-            if gated > 0 || timeouts > 0 {
-                crate::xlog_info!("D3D12.X: queue gate over the last 300 frames: {gated} held submissions, longest hold {longest} ms, {timeouts} timeout(s)");
-            }
+            crate::xlog_info!("D3D12.X: gate: held {gated}, longest {longest} ms, timeouts {timeouts}");
         }
         // what this run drew with, for the next run to build during load
         super::pso_disk::flush_drawn();

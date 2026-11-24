@@ -45,6 +45,7 @@ use windows_sys::Win32::Foundation::{CloseHandle, DuplicateHandle, DUPLICATE_SAM
 use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT};
 use windows_sys::Win32::System::Threading::{CreateEventW, GetCurrentProcess, ResetEvent, SetEvent};
 
+use crate::pending::{self, Meta, Ticket};
 use crate::util::{HRESULT, S_OK};
 
 const DLL: &str = "xcrdapi.dll";
@@ -641,8 +642,13 @@ unsafe extern "system" fn file_get_id(p: *mut c_void) -> u32 {
 // ---------------------------------------------------------------------------------------
 
 struct StatusInner {
+    id: u32,
     slots: Box<[AtomicI32]>,
 }
+
+/// status-array and queue ids in the pending-work report (small, unique per object)
+static NEXT_STATUS_ID: AtomicU32 = AtomicU32::new(1);
+static NEXT_QUEUE_ID: AtomicU32 = AtomicU32::new(1);
 
 fn status_vtbl() -> &'static [usize] {
     static V: OnceLock<&'static [usize]> = OnceLock::new();
@@ -663,7 +669,7 @@ unsafe extern "system" fn factory_create_status_array(_p: *mut c_void, capacity:
     if capacity == 0 || capacity > 1 << 20 {
         return E_INVALIDARG;
     }
-    let inner = Arc::new(StatusInner { slots: (0..capacity).map(|_| AtomicI32::new(E_PENDING)).collect() });
+    let inner = Arc::new(StatusInner { id: NEXT_STATUS_ID.fetch_add(1, Ordering::Relaxed), slots: (0..capacity).map(|_| AtomicI32::new(E_PENDING)).collect() });
     let o = new_object(status_vtbl(), inner);
     let hr = status_qi(o, riid, out);
     status_release(o);
@@ -1043,6 +1049,8 @@ enum Entry {
         file: Option<Arc<FileInner>>,
         dest_pages: Option<Vec<usize>>,
         src_pages: Option<Vec<usize>>,
+        /// the pending-work report forgets this entry when the ticket drops
+        ticket: Ticket,
     },
     /// refused at enqueue: reported in queue order by the worker
     Refused {
@@ -1059,9 +1067,9 @@ enum Entry {
         req: Request,
         dest_pages: Option<Vec<usize>>,
     },
-    Status(Arc<StatusInner>, u32),
+    Status(Arc<StatusInner>, u32, Ticket),
     /// a fence (one reference held) and the value it gets
-    Signal(FenceRef, u64),
+    Signal(FenceRef, u64, Ticket),
     #[cfg(test)]
     /// Test-only barrier to hold the worker deterministically while testing submitted-batch cancellation.
     Gate(Arc<std::sync::Barrier>),
@@ -1086,6 +1094,7 @@ struct FirstError {
 }
 
 struct QueueInner {
+    id: u32,
     desc: [u8; 0x18],
     source_memory: bool,
     capacity: usize,
@@ -1200,7 +1209,7 @@ impl QueueInner {
     fn run_batch(&self, batch: Vec<Entry>) {
         for e in batch {
             if self.closed.load(Ordering::Acquire) {
-                if let Entry::Status(s, i) = e {
+                if let Entry::Status(s, i, _ticket) = e {
                     if let Some(slot) = s.slots.get(i as usize) {
                         slot.store(E_QUEUE_CLOSED, Ordering::Release);
                     }
@@ -1208,7 +1217,7 @@ impl QueueInner {
                 continue;
             }
             match e {
-                Entry::Request { seq, req, file, dest_pages, src_pages } => {
+                Entry::Request { seq, req, file, dest_pages, src_pages, ticket: _ticket } => {
                     if self.is_cancelled(seq, req.tag) {
                         // Cancelled requests are skipped without affecting status or error record.
                         continue;
@@ -1247,12 +1256,12 @@ impl QueueInner {
                     self.fail(hr, req, file.as_deref());
                     self.note_failure(hr);
                 }
-                Entry::Status(s, i) => {
+                Entry::Status(s, i, _ticket) => {
                     if let Some(slot) = s.slots.get(i as usize) {
                         slot.store(self.take_failure(), Ordering::Release);
                     }
                 }
-                Entry::Signal(fence, value) => unsafe {
+                Entry::Signal(fence, value, _ticket) => unsafe {
                     fence.signal(value);
                 },
                 #[cfg(test)]
@@ -1279,7 +1288,7 @@ impl QueueInner {
             if self.closed.load(Ordering::Acquire) {
                 return;
             }
-            if let Entry::Status(ref s, i) = e {
+            if let Entry::Status(ref s, i, _) = e {
                 if let Some(slot) = s.slots.get(i as usize) {
                     slot.store(E_PENDING, Ordering::Release);
                 }
@@ -1301,7 +1310,20 @@ impl QueueInner {
             }
             let seq = p.next_seq;
             p.next_seq += 1;
-            p.entries.push(Entry::Request { seq, req, file, dest_pages, src_pages });
+            let ticket = if pending::enabled() {
+                pending::begin(
+                    pending::Kind::DStorageRequest,
+                    Meta {
+                        size: req.destination_size as u64,
+                        index: self.id,
+                        mode: req.bcpack() as u32,
+                        extra: if req.memory_source() { 1 } else { 0 },
+                    },
+                )
+            } else {
+                Ticket::NONE
+            };
+            p.entries.push(Entry::Request { seq, req, file, dest_pages, src_pages, ticket });
             p.entries.len()
         };
         if n >= (self.capacity / 2).max(1) {
@@ -1382,6 +1404,7 @@ unsafe extern "system" fn factory_create_queue(_p: *mut c_void, desc: *const u8,
         return E_ABORT;
     }
     let inner = Arc::new(QueueInner {
+        id: NEXT_QUEUE_ID.fetch_add(1, Ordering::Relaxed),
         desc: raw,
         source_memory: source == 1,
         capacity,
@@ -1515,7 +1538,12 @@ unsafe extern "system" fn queue_enqueue_status(p: *mut c_void, array: *mut c_voi
         return;
     }
     let s = Arc::clone(inner::<StatusInner>(array));
-    q.enqueue(Entry::Status(s, index));
+    let ticket = if pending::enabled() {
+        pending::begin(pending::Kind::DStorageStatus, Meta { size: index as u64, index: s.id, ..Default::default() })
+    } else {
+        Ticket::NONE
+    };
+    q.enqueue(Entry::Status(s, index, ticket));
 }
 
 unsafe extern "system" fn queue_enqueue_signal(p: *mut c_void, fence: *mut c_void, value: u64) {
@@ -1529,7 +1557,12 @@ unsafe extern "system" fn queue_enqueue_signal(p: *mut c_void, fence: *mut c_voi
     }
     let add: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*vt.add(1));
     add(fence);
-    q.enqueue(Entry::Signal(FenceRef(fence as usize), value));
+    let ticket = if pending::enabled() {
+        pending::begin(pending::Kind::DStorageSignal, Meta { size: value, index: q.id, ..Default::default() })
+    } else {
+        Ticket::NONE
+    };
+    q.enqueue(Entry::Signal(FenceRef(fence as usize), value, ticket));
 }
 
 unsafe extern "system" fn queue_submit(p: *mut c_void) {
@@ -1574,7 +1607,7 @@ unsafe extern "system" fn queue_close(p: *mut c_void) {
         }
     };
     for e in drained {
-        if let Entry::Status(s, i) = e {
+        if let Entry::Status(s, i, _ticket) = e {
             if let Some(slot) = s.slots.get(i as usize) {
                 slot.store(E_QUEUE_CLOSED, Ordering::Release);
             }
