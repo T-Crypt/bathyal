@@ -1620,6 +1620,7 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
     }
 
     let q_raw = queue as *mut c_void;
+    super::lifetime::poll();
     super::title_textures::refresh(q_raw);
     if !waits.is_empty() {
         wait_all(&waits);
