@@ -95,7 +95,8 @@ A **gamepad is recommended**: console games are made for one, and their menus an
   `XCL_PLAYSTATION_PAD=0` turns this off.
 - **Keyboard and mouse** work too, as a gamepad: WASD the left stick, the mouse the right stick, mouse
   buttons the triggers, the wheel the bumpers, Enter / Space A, Escape / Backspace B, arrows the D-pad,
-  E / Q Y / X, Shift / Ctrl the stick clicks, Tab View, P Menu. `keyboard_mouse` and `mouse_sensitivity` in
+  E / Q Y / X, Shift / Ctrl the stick clicks, Tab View, P Menu, Page Up / Page Down the right stick up / down
+  (to scroll a menu's long text). `keyboard_mouse` and `mouse_sensitivity` in
   the game's `xcl.toml` turn it off or change the mouse speed. A gamepad and the keyboard / mouse can be
   used together.
 
@@ -139,9 +140,9 @@ bathyal shaders D:\data\shaders.rpf --top 50   # pack statistics; --recomp / --c
 bathyal rpf D:\data\shaders.rpf --extract NAME --out folder
 ```
 
-- **Without a command line** (bathyal.exe opened from Explorer) Bathyal shows a small menu: *Choose a
-  game…* (pick its exe or `MicrosoftGame.config`) or *Run again* (the last one). On an error the
-  window stays open until Enter.
+- **Without a command line** (bathyal.exe opened from Explorer) Bathyal shows a small menu: *Add a
+  game folder…* (pick the folder of the game's unpacked files), *Choose a game…* (pick its exe or
+  `MicrosoftGame.config`) or *Run again* (the last one). On an error the window stays open until Enter.
 - Bathyal works on **unpacked** game files you own; it contains nothing for decrypting or
   circumventing DRM.
 - **The game folder is never modified** – writes go to the overlay.

@@ -1043,11 +1043,15 @@ unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>, title: Option<&ID3D12C
                 break;
             }
             let (r, (dev, va, tex, states)) = todo.next().unwrap();
-            // Read once: hash and detile from the same snapshot (#504 TOCTOU / double-read).
-            let mem = read_committed(va, tex.size() as usize);
-            let h = content_hash(&mem);
+            // Read once, where the bytes are when they are readable (#504 TOCTOU / double-read;
+            // #602: no copy for a whole readable range): hash and detile from that snapshot.
+            let mem: Arc<std::borrow::Cow<'static, [u8]>> = Arc::new(title_bytes(va, tex.size() as usize));
+            let h = content_hash(&mem[..]);
             let res_key = r.as_raw() as usize;
-            // The same bytes as at this texture's last *successful* upload: nothing to do.
+            // The same bytes as at this texture's last *successful* upload: nothing to do. The
+            // write watch is per page and a title writes next to its textures (and rewrites what
+            // it wrote): a retail title's video planes and UI targets went up again for every
+            // submit, ~25 MB a presented frame where ~3 MB had changed, and the submits waited.
             if unchanged_skip() && last_upload_matches(res_key, h) {
                 let n = UNCHANGED.fetch_add(1, Ordering::Relaxed) + 1;
                 if n == 1 || (n.is_power_of_two() && n >= 1024) {
@@ -1057,7 +1061,7 @@ unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>, title: Option<&ID3D12C
             }
             device = dev;
             bytes += tex.size() as usize;
-            picked.push((r, va, Arc::new(mem), tex, states, res_key, h));
+            picked.push((r, va, mem, tex, states, res_key, h));
         }
         let subs = subresources_of_all(&picked, bytes);
         let mut batch = Vec::with_capacity(picked.len());
@@ -1356,7 +1360,7 @@ const PARALLEL_BYTES: usize = 1 << 20;
 /// `upload_all` already read: on several threads when the batch is big. They were read and
 /// detiled one after another in the title's own submit – most of a retail game's render thread
 /// while it streamed textures the CPU writes.
-unsafe fn subresources_of_all(picked: &[(ID3D12Resource, usize, Arc<Vec<u8>>, Arc<xg::Texture>, Vec<D3D12_RESOURCE_STATES>, usize, u64)], bytes: usize) -> Vec<Vec<Subresource>> {
+unsafe fn subresources_of_all(picked: &[(ID3D12Resource, usize, Arc<std::borrow::Cow<'static, [u8]>>, Arc<xg::Texture>, Vec<D3D12_RESOURCE_STATES>, usize, u64)], bytes: usize) -> Vec<Vec<Subresource>> {
     let items: Vec<(&[u8], &xg::Texture)> = picked.iter().map(|(_, _, mem, tex, ..)| (&mem[..], &**tex)).collect();
     let threads = if bytes < PARALLEL_BYTES { 1 } else { std::thread::available_parallelism().map_or(1, |n| n.get() / 2).clamp(1, 8) };
     detile_on(&items, threads)
@@ -1400,9 +1404,19 @@ fn detile_on(items: &[(&[u8], &xg::Texture)], threads: usize) -> Vec<Vec<Subreso
     out
 }
 
+/// The title's bytes at `at`: where they are when all of them are readable (a copy first cost
+/// as much as the detile of a video frame), else read page run by page run.
+unsafe fn title_bytes(at: usize, len: usize) -> std::borrow::Cow<'static, [u8]> {
+    if crate::gpu::shader::readable(at, len) {
+        std::borrow::Cow::Borrowed(std::slice::from_raw_parts(at as *const u8, len))
+    } else {
+        std::borrow::Cow::Owned(read_committed(at, len))
+    }
+}
+
 /// Every subresource (D3D12 order) of a texture from the title's memory at `va`.
 unsafe fn subresources(va: usize, tex: &xg::Texture) -> Vec<Subresource> {
-    let mem = read_committed(va, tex.size() as usize);
+    let mem = title_bytes(va, tex.size() as usize);
     subresources_from(&mem, tex)
 }
 
@@ -1845,6 +1859,28 @@ mod tests {
         let out = watch_ranges(&regions, wanted);
         assert!(out.iter().any(|&(lo, n)| lo <= written && written + 0x1000 <= lo + n), "the page between the ranges is walked");
         assert_eq!(out.len(), 1, "the gap is under WATCH_GAP: one scan");
+    /// The title's bytes are used where they are when all of them are readable, and read with the
+    /// pages that are not committed as zeros otherwise – the same bytes either way.
+    #[test]
+    fn title_bytes_are_used_in_place_when_all_are_readable() {
+        use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE};
+        unsafe {
+            let base = VirtualAlloc(std::ptr::null(), 3 << 12, MEM_RESERVE, PAGE_READWRITE) as usize;
+            assert_ne!(base, 0);
+            for page in [0usize, 2] {
+                VirtualAlloc((base + (page << 12)) as *const c_void, 1 << 12, MEM_COMMIT, PAGE_READWRITE);
+                std::ptr::write_bytes((base + (page << 12)) as *mut u8, 0xA0 + page as u8, 1 << 12);
+            }
+            let whole = title_bytes(base, 1 << 12);
+            assert!(matches!(whole, std::borrow::Cow::Borrowed(_)), "a committed page is not copied");
+            assert_eq!(whole.as_ptr() as usize, base);
+            assert!(whole.iter().all(|&b| b == 0xA0));
+            let holed = title_bytes(base, 3 << 12);
+            assert!(matches!(holed, std::borrow::Cow::Owned(_)), "a range with a reserved page is read");
+            assert_eq!(&holed[..], &read_committed(base, 3 << 12)[..]);
+            assert!(holed[..1 << 12].iter().all(|&b| b == 0xA0) && holed[1 << 12..2 << 12].iter().all(|&b| b == 0) && holed[2 << 12..].iter().all(|&b| b == 0xA2));
+            VirtualFree(base as *mut c_void, 0, MEM_RELEASE);
+        }
     }
 
     /// Only the wanted parts of the watched regions are scanned, merged, one region each.

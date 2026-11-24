@@ -287,11 +287,19 @@ unsafe fn check_uma_import(device: &ID3D12Device, u: &crate::gpu::uma::Uma, bufs
         readback.Unmap(0, None);
         Ok(got)
     };
-    let got = run();
+    let got = match run() {
+        Ok(got) => got,
+        Err(e) => {
+            // The copy may still be running: what it uses stays (a few KiB, once). Released under
+            // the GPU, vkd3d-proton frees it at once and the GPU faults (RADV: page faults, then a
+            // ring timeout) – a slow first use of the imported window is enough to get here.
+            std::mem::forget((queue, alloc, list, fence, readback));
+            return Err(e);
+        }
+    };
     for &(_, _, p, _) in &probes {
         u.free(p);
     }
-    let got = got?;
     let wrong: Vec<String> =
         probes.iter().filter(|&&(_, i, _, c)| got[i] != c).map(|&(k, i, _, c)| format!("window {k}: wrote {c:#x}, the GPU read {:#x}", got[i])).collect();
     if !wrong.is_empty() {
@@ -6329,7 +6337,7 @@ mod typeless_uav_view_tests {
 
     /// A resource the PC holds typeless (an sRGB texture with UAVs, a depth buffer) gets a typed
     /// UAV desc: the sRGB one's UNORM for shaders that write values. An R9G9B9E5 target the PC
-    /// holds as half floats keeps the title's view format as its UAV.
+    /// holds as R11G11B10_FLOAT keeps that format as its UAV.
     #[test]
     fn typeless_resources_get_typed_uav_descs() {
         // sRGB typeless: a named sRGB view becomes UNORM, keeping its mip
@@ -6343,9 +6351,9 @@ mod typeless_uav_view_tests {
         assert_eq!((v.Format.0, v.ViewDimension.0), (28, D3D12_UAV_DIMENSION_TEXTURE2DARRAY.0));
         assert_eq!(unsafe { v.Anonymous.Texture2DArray }.ArraySize, 3);
 
-        // an R9G9B9E5 target the PC holds as half floats: the console's view is half floats too
-        assert_eq!(pc_uav_desc(&rd(10, 1), Some(&uav(67, 0))).map(|v| v.Format.0), Some(10));
-        assert!(pc_uav_desc(&rd(10, 1), None).is_none(), "the half floats are the resource's own format");
+        // an R9G9B9E5 target the PC holds as R11G11B10_FLOAT: the console's view is that too
+        assert_eq!(pc_uav_desc(&rd(26, 1), Some(&uav(67, 0))).map(|v| v.Format.0), Some(26));
+        assert!(pc_uav_desc(&rd(26, 1), None).is_none(), "R11G11B10_FLOAT is the resource's own format");
 
         // a resource that is its own typed format is left as the title made it
         assert!(pc_uav_desc(&rd(28, 1), Some(&uav(28, 0))).is_none());
@@ -6366,7 +6374,7 @@ mod typeless_uav_view_tests {
         // the same for an RTV and, with no description, a view of the console's own format
         let r = default_rtv(&rd(27, 1)).expect("the sRGB texture's own RTV");
         assert_eq!((r.Format.0, r.ViewDimension.0), (29, D3D12_RTV_DIMENSION_TEXTURE2D.0));
-        assert!(default_rtv(&rd(10, 1)).is_none(), "the half floats are the resource's own format");
+        assert!(default_rtv(&rd(26, 1)).is_none(), "R11G11B10_FLOAT is the resource's own format");
         assert!(default_rtv(&rd(28, 1)).is_none());
         assert!(default_rtv(&rd(44, 1)).is_none(), "a depth buffer's views name it");
     }
