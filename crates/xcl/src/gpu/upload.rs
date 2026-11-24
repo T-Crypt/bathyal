@@ -340,6 +340,7 @@ mod tests {
 #[cfg(test)]
 mod gpu_tests {
     use super::*;
+    use windows::core::Interface;
     use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
 
     /// The heap D3D12 offers here: OPTIONS16's word, then a real heap, a CPU write, and a
