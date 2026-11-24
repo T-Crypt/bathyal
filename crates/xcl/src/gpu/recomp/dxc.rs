@@ -536,22 +536,50 @@ pub fn compile(src: &str, entry: &str, profile: &str, extra: &[&str]) -> Result<
     r?
 }
 
+/// Arguments of every compile besides `-E` / `-T` / `-HV`: the reflection data (`RDAT`) is
+/// dropped – nothing in XCL reads the DXIL reflection, and the blob is exactly what the driver's
+/// compiler reads at pipeline creation, so every byte less is time there and in the disk cache.
+const STRIP_ARGS: &[&str] = &["-Qstrip_reflect"];
+
+/// Source size from which the optimiser gets `-O1`, and from which it gets `-O0`.
+const O1_FROM: usize = 256 << 10;
+const O0_FROM: usize = 8 << 20;
+
+/// The optimisation level for a source of `len` bytes: `-O1` from [`O1_FROM`], `-O0` from
+/// [`O0_FROM`], else None (DXC's own default, `-O3`). An `-O` the caller passed wins; so does
+/// `XCL_DXC_OPT=0|1|2|3` (or `default` for none).
+///
+/// DXC's optimiser was superlinear on translated programs full of short-circuit `?:` / `&&` /
+/// `if` per instruction (a 1589-instruction console CS: ~6 min and > 30 GB at -O3). With
+/// branch-free emission (select / and / or) it is fast: that shader 0.3 s, a 15 720-instruction
+/// one 6 s (585 KB DXIL vs 1.6 MB at -O0, which the driver could not compile). -O0 only as a
+/// safety net for enormous sources. -O1 gives the same DXIL size at a quarter less time (a
+/// retail game's 4.8 MB HLSL of a 19 600-instruction CS: 13.5 s instead of 17.7 at -O3; -O0
+/// 10.6 s, but twice the DXIL), and its cost grows with the program, so it starts at 256 KB: a
+/// retail compute program's translation is 250 KB to a few MB, and the precompile's whole rate
+/// is this time (the biggest compute programs were measured at ~20 s each in DXC).
+fn opt_level(len: usize, extra: &[&str]) -> Option<&'static str> {
+    if extra.iter().any(|a| a.starts_with("-O")) {
+        return None;
+    }
+    match std::env::var("XCL_DXC_OPT").ok().as_deref() {
+        Some("0") => Some("-O0"),
+        Some("1") => Some("-O1"),
+        Some("2") => Some("-O2"),
+        Some("3") => Some("-O3"),
+        Some("default") => None,
+        _ if len > O0_FROM => Some("-O0"),
+        _ if len > O1_FROM => Some("-O1"),
+        _ => None,
+    }
+}
+
 fn compile_here(src: &str, entry: &str, profile: &str, extra: &[&str]) -> Result<Vec<u8>, String> {
     let c = compiler()?;
     let mut args: Vec<Vec<u16>> = ["-E", entry, "-T", profile, "-HV", "2021"].iter().map(|a| crate::util::wide(a)).collect();
-    // DXC's optimiser was superlinear on translated programs full of short-circuit `?:` /
-    // `&&` / `if` per instruction (a 1589-instruction console CS: ~6 min and > 30 GB at -O3).
-    // With branch-free emission (select / and / or) it is fast: that shader 0.3 s, a
-    // 15 720-instruction one 6 s (585 KB DXIL vs 1.6 MB at -O0, which the driver could not
-    // compile). -O0 only as a safety net for enormous sources.
-    // -O1 from 1 MB on: the same DXIL size at a quarter less time (a retail game's 4.8 MB HLSL of
-    // a 19 600-instruction CS: 13.5 s instead of 17.7 at -O3; -O0 10.6 s, but twice the DXIL)
-    if !extra.iter().any(|a| a.starts_with("-O")) {
-        if src.len() > 8 * 1024 * 1024 {
-            args.push(crate::util::wide("-O0"));
-        } else if src.len() > 1024 * 1024 {
-            args.push(crate::util::wide("-O1"));
-        }
+    args.extend(STRIP_ARGS.iter().map(|a| crate::util::wide(a)));
+    if let Some(level) = opt_level(src.len(), extra) {
+        args.push(crate::util::wide(level));
     }
     args.extend(extra.iter().map(|a| crate::util::wide(a)));
     let ptrs: Vec<PCWSTR> = args.iter().map(|a| PCWSTR(a.as_ptr())).collect();
@@ -619,7 +647,16 @@ fn cache_key_for_toolchain(src: &str, entry: &str, profile: &str, toolchain: &st
 }
 
 fn cache_key(src: &str, entry: &str, profile: &str) -> u64 {
-    cache_key_for_toolchain(src, entry, profile, toolchain_identity())
+    // The optimisation level and the dropped reflection are part of the DXIL, so they are part
+    // of the key: a cache made with other arguments would hide a change to either.
+    let mut toolchain = toolchain_identity().to_string();
+    toolchain.push('\u{1}');
+    toolchain.push_str(&STRIP_ARGS.join(","));
+    if let Some(level) = opt_level(src.len(), &[]) {
+        toolchain.push('\u{1}');
+        toolchain.push_str(level);
+    }
+    cache_key_for_toolchain(src, entry, profile, &toolchain)
 }
 
 /// Folder of the DXIL cache: `XCL_DXIL_CACHE`, else `%LOCALAPPDATA%\xcl\dxil`.
@@ -955,15 +992,6 @@ pub fn in_cached_only() -> bool {
     CACHED_ONLY.with(|c| c.get())
 }
 
-/// The cached-only attempt found work that must not run on the title's thread: a shader
-/// that is not compiled yet, or the driver's compile of a pipeline. `cached_only`'s
-/// second return becomes true.
-pub fn defer_to_worker() {
-    if CACHED_ONLY.with(|c| c.get()) {
-        MISSED.with(|m| m.set(true));
-    }
-}
-
 pub fn compile_cached(src: &str, entry: &str, profile: &str) -> Result<(Vec<u8>, bool), String> {
     compile_cached_in(&cache_dir(), src, entry, profile)
 }
@@ -1082,13 +1110,6 @@ mod cache_tests {
 
         let (r, missed) = cached_only(|| request(|| panic!("a cached-only miss must not compile")));
         assert!(r.is_err() && missed);
-        let (n, missed) = cached_only(|| {
-            defer_to_worker();
-            7
-        });
-        assert_eq!(n, 7);
-        assert!(missed);
-        assert!(!cached_only(|| 1).1);
         assert_eq!(
             counters.snapshot(),
             CacheStats {
@@ -1404,5 +1425,30 @@ mod cache_tests {
             release_tx.send(()).unwrap();
             second_rx.recv_timeout(Duration::from_secs(2)).unwrap();
         });
+    }
+}
+
+#[cfg(test)]
+mod opt_tests {
+    use super::*;
+
+    /// The optimiser level follows the source size: everything above 256 KB of translated HLSL
+    /// gets `-O1` (same DXIL, a quarter less time), everything above 8 MB `-O0`.
+    #[test]
+    fn the_optimisation_level_follows_the_source_size() {
+        if std::env::var_os("XCL_DXC_OPT").is_some() {
+            return;
+        }
+        assert_eq!(opt_level(64 << 10, &[]), None);
+        assert_eq!(opt_level(O1_FROM, &[]), None, "the threshold itself is still -O3");
+        assert_eq!(opt_level(O1_FROM + 1, &[]), Some("-O1"));
+        assert_eq!(opt_level(O0_FROM, &[]), Some("-O1"));
+        assert_eq!(opt_level(O0_FROM + 1, &[]), Some("-O0"));
+    }
+
+    /// An `-O` the caller passed is not doubled (some tools compile with their own level).
+    #[test]
+    fn a_level_from_the_caller_wins() {
+        assert_eq!(opt_level(O0_FROM + 1, &["-O2"]), None);
     }
 }

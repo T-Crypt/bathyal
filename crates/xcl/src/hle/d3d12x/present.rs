@@ -78,6 +78,10 @@ unsafe fn present_x_frame(queue: *mut c_void, plane_count: u32, planes: *const u
                 crate::xlog_info!("D3D12.X: queue gate over the last 300 frames: {gated} held submissions, longest hold {longest} ms, {timeouts} timeout(s)");
             }
         }
+        // pipelines built from a saved driver blob, against pipelines the driver compiled:
+        // every built pipeline is one or the other, so a second, warm run shows 0 misses
+        let (hits, misses) = super::pso_disk::counts();
+        crate::xlog_info!("D3D12.X: pipeline cache: {hits} hits, {misses} misses");
     }
     super::real::stop_if_device_removed();
     if !PRESENTX.swap(true, Ordering::Relaxed) {

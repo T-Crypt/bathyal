@@ -427,6 +427,14 @@ static DEVICE: AtomicUsize = AtomicUsize::new(0);
 /// The backend device runs on a software adapter (WARP or the Basic Render Driver).
 static SOFTWARE_ADAPTER: AtomicBool = AtomicBool::new(false);
 
+/// The device adapter's DXGI vendor id (0x10DE NVIDIA, 0x1002 AMD, 0x8086 Intel): 0 before
+/// `init` and for WARP. `pso_async` reads it to size its worker pool.
+static ADAPTER_VENDOR: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+pub fn adapter_vendor() -> u32 {
+    ADAPTER_VENDOR.load(Ordering::Relaxed)
+}
+
 pub fn device_raw() -> *mut c_void {
     DEVICE.load(Ordering::Acquire) as *mut c_void
 }
@@ -540,6 +548,7 @@ pub fn init() -> Result<String, String> {
                     device = Some(dev);
                     name = format!("{} ({} MiB VRAM)", crate::gpu::adapter::name(&desc), desc.DedicatedVideoMemory >> 20);
                     SOFTWARE_ADAPTER.store(crate::gpu::adapter::software(&desc), Ordering::Relaxed);
+                    ADAPTER_VENDOR.store(desc.VendorId, Ordering::Relaxed);
                     break;
                 }
             }
@@ -3386,6 +3395,7 @@ unsafe fn finish_pso_cached(this: *mut c_void, f: PsoFn, desc: *mut c_void, grap
         let hr = finish_pso(this, f, desc, riid, ppv);
         if hr >= 0 {
             note_driver_cache(false);
+            super::pso_disk::note_lookup(true);
             return hr;
         }
         if (hr as u32) & 0xFFFF_0000 == 0x887A_0000 {
@@ -3405,6 +3415,7 @@ unsafe fn finish_pso_cached(this: *mut c_void, f: PsoFn, desc: *mut c_void, grap
         return E_INVALIDARG;
     }
     let _guard = super::pso_async::uncached_compile();
+    super::pso_disk::note_lookup(false);
     if graphics {
         let g = &*(desc as *const D3D12_GRAPHICS_PIPELINE_STATE_DESC);
         let n = (g.NumRenderTargets as usize).min(8);
@@ -3419,6 +3430,56 @@ unsafe fn finish_pso_cached(this: *mut c_void, f: PsoFn, desc: *mut c_void, grap
         crate::xlog_info!("D3D12.X: driver compile {key:016x} compute");
     }
     let hr = finish_pso(this, f, desc, riid, ppv);
+    if (hr as u32) & 0xFFFF_0000 == 0x887A_0000 {
+        note_device_removed();
+    }
+    if hr >= 0 && !ppv.is_null() && !(*ppv).is_null() {
+        if let Some(blob) = driver_blob(*ppv) {
+            super::pso_disk::store(key, &blob);
+            note_driver_cache(true);
+        }
+    }
+    hr
+}
+
+/// `finish_pso` for a pipeline state stream (`CreatePipelineState` with subobjects, the form
+/// a console mesh or geometry program is built in), with the driver blob `pso_disk` keeps
+/// under its `stream_key`: the blob goes in a CACHED_PSO subobject when one is saved, and the
+/// driver's blob is saved after a compile.
+unsafe fn finish_stream_cached(this: *mut c_void, f: PsoFn, stream: &[u8], key: u64, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+    // the stream plus a CACHED_PSO subobject (type 19: 4-byte type, 4 of padding, then
+    // D3D12_CACHED_PIPELINE_STATE { pCachedBlob, CachedBlobSizeInBytes })
+    const CACHED_PSO: u32 = 19;
+    let build = |blob: &[u8]| {
+        let mut v = Vec::with_capacity(stream.len() + 24);
+        v.extend_from_slice(stream);
+        v.extend_from_slice(&CACHED_PSO.to_le_bytes());
+        v.extend_from_slice(&[0u8; 4]);
+        let ptr = if blob.is_empty() { 0usize } else { blob.as_ptr() as usize };
+        v.extend_from_slice(&(ptr as u64).to_le_bytes());
+        v.extend_from_slice(&(blob.len() as u64).to_le_bytes());
+        v
+    };
+    let call = |v: &[u8]| {
+        let desc: [usize; 2] = [v.len(), v.as_ptr() as usize];
+        finish_pso(this, f, desc.as_ptr() as *const c_void, riid, ppv)
+    };
+    if let Some(blob) = super::pso_disk::load(key) {
+        let hr = call(&build(&blob));
+        if hr >= 0 {
+            note_driver_cache(false);
+            super::pso_disk::note_lookup(true);
+            return hr;
+        }
+        if (hr as u32) & 0xFFFF_0000 == 0x887A_0000 {
+            note_device_removed();
+            return hr;
+        }
+        super::pso_disk::forget(key);
+    }
+    let _guard = super::pso_async::uncached_compile();
+    super::pso_disk::note_lookup(false);
+    let hr = call(&build(&[]));
     if (hr as u32) & 0xFFFF_0000 == 0x887A_0000 {
         note_device_removed();
     }
@@ -4361,13 +4422,13 @@ fn two_pass_ps(ps: Option<&[u8]>, split_wave64: bool) -> Result<(Option<Vec<u8>>
 }
 
 /// Create the mesh pipeline (`stream`, RS and shaders already in it) and the compute pass;
-/// the title gets the mesh pipeline state.
+/// the title gets the mesh pipeline state. `stream_key` is `pso_disk::stream_key` of that
+/// stream, so both halves come from the disk cache when it has them.
 #[allow(clippy::too_many_arguments)]
-unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu::recomp::pso::TwoPass, mesh_rs: *mut c_void, kind: &'static str, fetch: Option<Result<GsFetch, String>>, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, stream_key: u64, tp: crate::gpu::recomp::pso::TwoPass, mesh_rs: *mut c_void, kind: &'static str, fetch: Option<Result<GsFetch, String>>, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
     let Some(rs) = abi_rs_for(this, &tp.samplers) else { return E_INVALIDARG };
     let fs: PsoFn = std::mem::transmute(orig_fn(this, slot_of(this, "CreatePipelineState")));
-    let desc: [usize; 2] = [stream.0.len(), stream.0.as_ptr() as usize];
-    let hr = finish_pso(this, fs, desc.as_ptr() as *const c_void, riid, ppv);
+    let hr = finish_stream_cached(this, fs, &stream.0, stream_key, riid, ppv);
     if hr < 0 {
         note_translation_error(format!("the driver rejected the mesh pipeline from the console {kind} ({hr:#x})"));
         return E_INVALIDARG;
@@ -4510,7 +4571,7 @@ unsafe fn translated_mesh_stream_once(this: *mut c_void, desc: *const c_void, ri
             out.raw(*ty, payload, palign == 8);
         }
     }
-    Some(finish_two_pass(this, &out, tp, rs, "MS", None, riid, ppv))
+    Some(finish_two_pass(this, &out, super::pso_disk::stream_key(&out.0, &ps_samplers), tp, rs, "MS", None, riid, ppv))
 }
 
 /// A graphics PSO with a console VS + GS: the GS pipeline in two passes, as a mesh pipeline
@@ -4586,7 +4647,7 @@ unsafe fn translated_gs_pso(this: *mut c_void, d: &D3D12_GRAPHICS_PIPELINE_STATE
     if let Err(e) = &fetch {
         note_translation_error(format!("VS+GS vertex fetch: {e}"));
     }
-    finish_two_pass(this, &out, tp, rs, "GS", Some(fetch), riid, ppv)
+    finish_two_pass(this, &out, super::pso_disk::stream_key(&out.0, &ps_samplers), tp, rs, "GS", Some(fetch), riid, ppv)
 }
 
 /// Rewrite a pipeline state stream with stand-in shaders. None if not possible.

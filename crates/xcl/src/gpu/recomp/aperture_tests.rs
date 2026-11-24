@@ -615,6 +615,103 @@ fn e2_window_compile_time() {
     }
 }
 
+/// How the driver's pipeline compiler scales with concurrent creator threads (#156): the
+/// same kind of large synthetic compute program as E2, one window, built by 1, 2, 4 and 8
+/// threads, each program carrying a fresh random constant so the driver's own cache cannot
+/// answer. Prints wall time, the sum of the per-pipeline times, the speedup and each
+/// program's median, which is the number the pipeline worker pool is sized from. Run alone:
+/// `cargo test --release -p xcl --lib nv_parallel_driver_compile -- --ignored --nocapture`
+/// (`XCL_NV_THREADS=1,2,4,8`, `XCL_NV_JOBS=8`, `XCL_NV_BLOCKS=400`).
+#[test]
+#[ignore]
+fn nv_parallel_driver_compile() {
+    use crate::gpu::rdna2::encode;
+    let Some((dev, name)) = device() else { return };
+    if super::dxc::location().is_err() {
+        return;
+    }
+    let num = |k: &str, d: usize| std::env::var(k).ok().and_then(|v| v.trim().parse().ok()).unwrap_or(d);
+    let thread_counts: Vec<usize> = std::env::var("XCL_NV_THREADS")
+        .unwrap_or_else(|_| "1,2,4,8".into())
+        .split(',')
+        .filter_map(|v| v.trim().parse().ok())
+        .collect();
+    let jobs = num("XCL_NV_JOBS", 8);
+    let blocks = num("XCL_NV_BLOCKS", 400);
+    let program = |salt: u32| -> Vec<u8> {
+        let mut v = Vec::new();
+        let mut e = |n: &str, enc: &str, f: &[(&str, u64)], l: Option<u32>| v.extend(encode(n, enc, f, l).unwrap_or_else(|x| panic!("{n}: {x}")));
+        e("S_MOV_B32", "ENC_SOP1", &[("SDST", 30), ("SSRC0", 255)], Some(salt));
+        for i in 0..blocks as u64 {
+            e("S_LOAD_DWORDX4", "ENC_SMEM", &[("SDATA", 8), ("SBASE", 2), ("OFFSET", (i * 16) & 0xFFFF)], None);
+            e("BUFFER_LOAD_DWORD", "ENC_MUBUF", &[("VDATA", 1), ("VADDR", 0), ("SRSRC", 2), ("SOFFSET", 128), ("IDXEN", 1)], None);
+            e("GLOBAL_LOAD_DWORD", "ENC_FLAT_GLBL", &[("VDST", 6), ("ADDR", 4), ("SADDR", 0x7D), ("OFFSET", (i * 4) & 0x7FF)], None);
+            for k in 0..12u64 {
+                e("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 2), ("SRC0", 256 + 1 + (k & 1) * 5), ("VSRC1", 2)], None);
+                e("V_MUL_LO_U16", "ENC_VOP3", &[("VDST", 3), ("SRC0", 256 + 2), ("SRC1", 30)], None);
+            }
+            e("BUFFER_STORE_DWORD", "ENC_MUBUF", &[("VDATA", 2), ("VADDR", 0), ("SRSRC", 2), ("SOFFSET", 128), ("IDXEN", 1)], None);
+        }
+        e("S_ENDPGM", "ENC_SOPP", &[], None);
+        v
+    };
+    let rs = super::pso::abi_root_signature(&dev, false).unwrap();
+    let cs = super::CsInterface { threads: [64, 1, 1], user_sgprs: 4, ..Default::default() };
+    let mut seed = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos() as u32;
+    println!("{name}: {jobs} programs per thread count, {blocks} blocks ({} instructions)", 1 + blocks * 28);
+    for threads in thread_counts {
+        // DXC is not what is timed: the programs are compiled before the clock starts
+        let mut programs = Vec::new();
+        for _ in 0..jobs {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let t = super::translate(&program(seed), &super::Options { mode: super::Mode::Compute(cs.clone()), mem_windows: 1, split_wave64: super::runner::split_wave64(), ..Default::default() }).unwrap();
+            programs.push(super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap());
+        }
+        let dxil: usize = programs.iter().map(Vec::len).sum();
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let per: std::sync::Mutex<Vec<f64>> = Default::default();
+        let keep: std::sync::Mutex<Vec<usize>> = Default::default();
+        // the device and the root signature as the raw addresses the workers use (a COM
+        // wrapper is not shared across threads in this crate)
+        let dev_raw: usize = unsafe { std::mem::transmute_copy(&dev) };
+        let rs_ptr: usize = unsafe { std::mem::transmute_copy(&rs) };
+        let t0 = std::time::Instant::now();
+        std::thread::scope(|s| {
+            for _ in 0..threads {
+                s.spawn(|| {
+                    let raw = dev_raw as *mut std::ffi::c_void;
+                    let dev = unsafe { ID3D12Device::from_raw_borrowed(&raw) }.unwrap();
+                    loop {
+                        let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let Some(dxil) = programs.get(i) else { break };
+                        let t = std::time::Instant::now();
+                        let pso = unsafe { dev.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC { pRootSignature: transmute_copy(&rs_ptr), CS: D3D12_SHADER_BYTECODE { pShaderBytecode: dxil.as_ptr() as _, BytecodeLength: dxil.len() }, ..Default::default() }) };
+                        // a failure is a result too (the driver refuses some shapes): count it
+                        let pso = match pso {
+                            Ok(p) => p,
+                            Err(e) => panic!("CreateComputePipelineState: {e}"),
+                        };
+                        per.lock().unwrap().push(t.elapsed().as_secs_f64());
+                        // keep the pipeline for the length of the run (the process ends after)
+                        keep.lock().unwrap().push(pso.into_raw() as usize);
+                    }
+                });
+            }
+        });
+        let wall = t0.elapsed().as_secs_f64();
+        let mut v = per.into_inner().unwrap();
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let sum: f64 = v.iter().sum();
+        println!(
+            "{threads:>2} thread(s): {jobs} programs, DXIL {:.1} MB, wall {wall:6.2} s, sum {sum:6.2} s, speedup {:.2}, median {:6.2} s, max {:6.2} s",
+            dxil as f64 / 1048576.0,
+            sum / wall,
+            v[v.len() / 2],
+            v[v.len() - 1]
+        );
+    }
+}
+
 /// Experiment E1b, run alone (it turns on the debug layer for the process):
 /// `cargo test --release -p xcl --lib e1b_raw_views_under_debug_layer -- --ignored --nocapture`.
 /// (1) a raw view of 4 GiB - 64 KiB over a 4 GiB reserved window (the heap-window form; one

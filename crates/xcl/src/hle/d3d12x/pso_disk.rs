@@ -31,6 +31,26 @@ fn memory() -> &'static Mutex<std::collections::HashMap<u64, std::sync::Arc<Vec<
     M.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
 }
 
+/// Blobs a pipeline's build took instead of the driver's compile, and builds that had to
+/// compile (every built pipeline is one or the other; the log line reads them every 300
+/// frames).
+static HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static MISSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// (pipelines built from a saved blob, pipelines the driver had to compile)
+pub fn counts() -> (u64, u64) {
+    (HITS.load(std::sync::atomic::Ordering::Relaxed), MISSES.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// A pipeline build is about to try `key`: its blob was found (`hit`) or not.
+pub fn note_lookup(hit: bool) {
+    if hit {
+        HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    } else {
+        MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 fn path_for(dir: &Path, key: u64) -> PathBuf {
     dir.join(format!("{key:016x}.blob"))
 }
@@ -257,6 +277,46 @@ pub fn compute_key(d: &D3D12_COMPUTE_PIPELINE_STATE_DESC, samplers: &[([u32; 4],
     h
 }
 
+/// Identity of a pipeline state stream (`CreatePipelineState` with subobjects, the form XCL
+/// builds mesh pipelines in). Two things in such a stream are not the pipeline: the root
+/// signature (an object pointer, different every run – `samplers` stands in for it, as in
+/// [`graphics_key`]) and shader subobjects, which are a pointer and a length (the code they
+/// point at is mixed instead). A CACHED_PSO subobject is skipped. `buf` must hold whole
+/// subobjects, as XCL's `StreamOut` writes them.
+pub fn stream_key(buf: &[u8], samplers: &[([u32; 4], bool)]) -> u64 {
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    mix(&mut h, b"str1");
+    let mut off = 0usize;
+    while off + 8 <= buf.len() {
+        let ty = u32::from_le_bytes(buf[off..off + 4].try_into().unwrap());
+        let Some((psize, palign)) = super::null::subobject_payload(ty) else { break };
+        let poff = if palign == 8 { 8 } else { 4 };
+        let Some(payload) = buf.get(off + poff..off + poff + psize) else { break };
+        match ty {
+            // the root signature object: `samplers` identifies it
+            0 | 19 => {}
+            // shaders (VS PS DS HS GS CS AS MS: 1..=6, 24, 25): the code, not the pointer
+            1..=6 | 24 | 25 if psize >= 16 => {
+                let p = u64::from_le_bytes(payload[0..8].try_into().unwrap()) as usize;
+                let n = u64::from_le_bytes(payload[8..16].try_into().unwrap()) as usize;
+                mix_shader(&mut h, &D3D12_SHADER_BYTECODE { pShaderBytecode: p as *const _, BytecodeLength: n });
+            }
+            // an input layout's elements are behind a pointer too
+            12 if psize >= 16 => {
+                let p = u64::from_le_bytes(payload[0..8].try_into().unwrap()) as *const D3D12_INPUT_ELEMENT_DESC;
+                mix_input(&mut h, &D3D12_INPUT_LAYOUT_DESC { pInputElementDescs: p, NumElements: u32::from_le_bytes(payload[8..12].try_into().unwrap()) });
+            }
+            _ => {
+                mix_u32(&mut h, ty);
+                mix(&mut h, payload);
+            }
+        }
+        off += (poff + psize + 7) & !7;
+    }
+    mix_samplers(&mut h, samplers);
+    h
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -289,5 +349,54 @@ mod tests {
         let read = std::fs::read(&file).unwrap();
         assert_eq!(payload(&read), Some(blob.as_slice()));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A stream's key is the pipeline, not this run's pointers: the root signature object may
+    /// differ (different address) and the shader code may live at another address, and both
+    /// leave the key alone. Other code, or other samplers, change it.
+    #[test]
+    fn a_stream_key_leaves_out_this_runs_pointers() {
+        let code_a = [9u8; 32];
+        // the same code at another address
+        let code_a_again = [9u8; 32];
+        let code_b = [8u8; 32];
+        let stream = |rs: usize, code: &[u8]| -> Vec<u8> {
+            let mut v = Vec::new();
+            // ROOT_SIGNATURE (type 0): 4-byte header, pointer payload at 8
+            v.extend_from_slice(&0u32.to_le_bytes());
+            v.extend_from_slice(&[0u8; 4]);
+            v.extend_from_slice(&(rs as u64).to_le_bytes());
+            // CS (type 2): 4-byte type, 4 of padding, then D3D12_SHADER_BYTECODE
+            v.extend_from_slice(&2u32.to_le_bytes());
+            v.extend_from_slice(&[0u8; 4]);
+            v.extend_from_slice(&(code.as_ptr() as u64).to_le_bytes());
+            v.extend_from_slice(&(code.len() as u64).to_le_bytes());
+            // SAMPLE_MASK (type 9): 4-byte header, 4-byte payload
+            v.extend_from_slice(&9u32.to_le_bytes());
+            v.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+            v
+        };
+        let (a, b) = (stream(0x1000, &code_a), stream(0x2000, &code_a_again));
+        assert_eq!(stream_key(&a, &[]), stream_key(&b, &[]), "pointers are not the pipeline");
+        assert_ne!(stream_key(&a, &[]), stream_key(&stream(0x1000, &code_b), &[]), "the code is");
+        assert_ne!(stream_key(&a, &[]), stream_key(&a, &[([1, 2, 3, 4], false)]), "the samplers are");
+        assert_ne!(stream_key(&a, &[]), stream_key(&a[..a.len() - 4], &[]), "the state is");
+    }
+
+    /// Every finished build is a hit or a miss: the blobs a build takes are counted, and a
+    /// stored blob comes back.
+    #[test]
+    fn a_build_from_a_stored_blob_counts_as_a_hit() {
+        let key = 0x7410_0000_0000_0001u64;
+        super::forget(key);
+        let (h0, m0) = counts();
+        assert!(load(key).is_none());
+        note_lookup(false);
+        store(key, b"a driver blob");
+        assert_eq!(load(key).as_deref(), Some(&b"a driver blob"[..]));
+        note_lookup(true);
+        super::forget(key);
+        let (h1, m1) = counts();
+        assert!(h1 > h0 && m1 > m0, "hit {h0}->{h1}, miss {m0}->{m1}");
     }
 }
