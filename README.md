@@ -7,7 +7,8 @@ the `XCL_*` settings and the `%LOCALAPPDATA%\XCL` data folder keep XCL's names s
 cleanly and existing caches stay valid.
 
 This repository holds code only: no game files, shaders, assets, keys or logs from any game, and no
-decryption or DRM workarounds. Bring your own legally obtained, unpacked game files.
+decryption or DRM workarounds. Bring your own legally obtained, unpacked game files. See
+[`LEGAL.md`](LEGAL.md) for what the project accepts and how to report material that should not be here.
 
 
 Bathyal runs Xbox Series X|S (GDK) game files on a Windows PC **without CPU emulation**: the game's

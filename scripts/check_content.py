@@ -11,6 +11,7 @@ Checks, on added or modified files only:
   - new HTTP/TLS/telemetry crates in Cargo.lock (the code must not go online).
 """
 import argparse
+import codecs
 import os
 import re
 import subprocess
@@ -35,8 +36,9 @@ MAGIC = [
     (b"7z\xbc\xaf\x27\x1c", "7-Zip archive"),
     (b"Rar!", "RAR archive"),
 ]
+# The title names are stored ROT13-encoded so that this repository names no commercial title itself.
 TITLE_NAMES = re.compile(
-    r"grand\s+theft\s+auto|\bgta\s*(?:v|vi|5|6|online)\b|rockstar\s+games|\bcyberleek\b|game_scarlett_master",
+    codecs.decode(r"tenaq\f+gursg\f+nhgb|\otgn\f*(?:i|iv|5|6|bayvar)\o|ebpxfgne\f+tnzrf|\oploreyrrx\o|tnzr_fpneyrgg_znfgre", "rot13"),
     re.IGNORECASE)
 NETWORK_CRATES = {
     "reqwest", "ureq", "hyper", "curl", "curl-sys", "isahc", "attohttpc", "surf", "native-tls", "rustls",

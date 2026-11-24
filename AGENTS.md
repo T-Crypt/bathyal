@@ -46,21 +46,21 @@ git merge xcl/main                                     # on a branch; keep our R
 The program is `bathyal.exe`. The crate, module paths, `XCL_*` settings and the `%LOCALAPPDATA%\XCL` data
 folder keep XCL's names so these merges stay clean; rename them only together with upstream.
 
-## Notes carried over from Leonida
+## Notes carried over from another port engine
 
-Leonida (a C++ port engine for the same console, D3D12.X on Vulkan) met these issues on a newer retail title.
+Another port engine for the same console (C++, D3D12.X on Vulkan) met these issues on a newer retail title.
 XCL already covers most of them: AMD-only CPU instructions such as CLZERO, B5G5R5A1 UAVs, A8 targets,
 AcpHal's negative-HRESULT asserts, XErrorReport, the TLS index 0 handover and wave64 lane-mask SGPR pairs.
 Still worth checking here:
 
-- **R9G9B9E5_SHAREDEXP UAV textures.** PC drivers give that format no typed storage. Leonida stores such a
+- **R9G9B9E5_SHAREDEXP UAV textures.** PC drivers give that format no typed storage. That engine stores such a
   texture as a mutable R32_UINT image and lets shaders write the packed bits; SRVs and RTVs keep the shared
   exponent format. B5G5R5A1 is handled the same way, as R16_UINT.
 - **sRGB UAV textures.** The title asks for UAVs on sRGB textures (2048x2048 seen), which PC D3D12 refuses.
-  Leonida drops the UAV flag from the console description when the format has no UAV support, and gives
+  That engine drops the UAV flag from the console description when the format has no UAV support, and gives
   UAV views the matching UNORM format.
 - **GetResourceAllocationInfo with unsupported formats.** The title asks for layouts of formats the PC rejects;
-  an error there ended in an int3 in Leonida. Answer with the layout of a same-size stand-in format.
+  an error there ended in an int3 in that engine. Answer with the layout of a same-size stand-in format.
 - **NVIDIA (32-lane subgroups).** Measured on an RTX 4090: wave64 cross-half operations (readlane, permlane,
   DPP or shuffles across lanes 31/32, wave-wide reductions) are the known fidelity gap in vertex and pixel
   shaders. See `docs/wave64-on-wave32.md`.
