@@ -528,19 +528,32 @@ pub fn init() -> Result<String, String> {
         // `XCL_DRED=1`: auto-breadcrumbs with context strings and page-fault data, logged on
         // a device removal by `log_device_removed`; no debug layer needed. Opt-in: with it
         // XDefiant stalled in its first seconds twice.
-        if std::env::var("XCL_DRED").is_ok_and(|v| v != "0" && !v.is_empty()) {
+        // `XCL_DRED=pf`: only page-fault data (no auto-breadcrumbs, no context strings) – the
+        // cheap half, for a run that must not pay for a breadcrumb on every call.
+        // Anything else, including absent, `0` and empty: off.
+        let dred = super::dred::level(std::env::var("XCL_DRED").ok().as_deref());
+        if dred != super::dred::Level::Off {
+            let full = dred == super::dred::Level::Full;
             match crate::gpu::agility::configuration_interface::<ID3D12DeviceRemovedExtendedDataSettings1>(
                 &CLSID_D3D12DeviceRemovedExtendedData,
             ) {
                 Ok(d) => {
-                    d.SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+                    if full {
+                        d.SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+                    }
                     d.SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
-                    d.SetBreadcrumbContextEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
-                    crate::xlog_info!("D3D12: DRED on: auto-breadcrumbs with context strings, page-fault data");
+                    if full {
+                        d.SetBreadcrumbContextEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+                        crate::xlog_info!("D3D12: DRED on: auto-breadcrumbs with context strings, page-fault data");
+                    } else {
+                        crate::xlog_info!("D3D12: DRED on: page-fault data only (XCL_DRED=pf)");
+                    }
                 }
                 Err(e) => match crate::gpu::agility::configuration_interface::<ID3D12DeviceRemovedExtendedDataSettings>(&CLSID_D3D12DeviceRemovedExtendedData) {
                     Ok(d) => {
-                        d.SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+                        if full {
+                            d.SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+                        }
                         d.SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
                         crate::xlog_warn!("D3D12: DRED without breadcrumb context strings ({e})");
                     }
@@ -1730,13 +1743,15 @@ unsafe extern "system" fn res_release(this: *mut c_void) -> u32 {
         if let Some(m) = TITLE_ADDRESS.lock().unwrap().as_mut() {
             m.remove(&(this as usize));
         }
-        super::sparse::forget_buffer(this as usize);
-        super::vram::forget(this as usize);
-        super::title_textures::forget(this as usize);
+        // D3D12 runs this under its own internal lock: these only queue, they never take our
+        // mutexes (another thread may hold one inside a D3D12 call waiting for that lock).
+        super::sparse::forget_buffer_deferred(this as usize);
+        super::vram::forget_deferred(this as usize);
+        super::title_textures::forget_deferred(this as usize);
         let gone = UMA_BUFFERS.lock().unwrap().as_mut().and_then(|m| m.remove(&(this as usize)));
         if let (Some((p, _, true)), Some(u)) = (gone, crate::gpu::uma::get()) {
             if u.is_sparse(p) {
-                super::sparse::free(p);
+                super::sparse::free_deferred(p);
             } else {
                 u.free(p);
             }

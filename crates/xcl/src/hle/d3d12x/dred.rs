@@ -4,6 +4,10 @@
 //! one that completed. Printing all of them is too much for a log: a window of three ops
 //! before and after the last completed one names the operation that hung. This module keeps
 //! that formatting pure so it is tested without a device.
+//!
+//! `XCL_DRED` picks the level: absent, `0` or empty leaves DRED off; `pf` turns on page-fault
+//! data only (no auto-breadcrumbs, no context strings); any other value turns on the full set,
+//! auto-breadcrumbs with context strings plus page-fault data.
 
 /// The name of a D3D12_AUTO_BREADCRUMB_OP value (D3D12 headers, 0..=48); an unknown value is
 /// printed as its number.
@@ -85,9 +89,43 @@ pub fn breadcrumb_window(ops: &[i32], last: u32) -> String {
     s
 }
 
+/// What `XCL_DRED` turns on.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Level {
+    /// Absent, `0` or empty: DRED off.
+    Off,
+    /// `pf`: page-fault data only (what the GPU faulted on and in which allocation). No
+    /// auto-breadcrumbs and no context strings, so D3D12 takes its internal lock on fewer calls.
+    PageFaults,
+    /// Any other value (`1` and the like): the full set – auto-breadcrumbs with the title's
+    /// context strings, plus page-fault data.
+    Full,
+}
+
+/// The level `XCL_DRED` names.
+pub fn level(v: Option<&str>) -> Level {
+    match v.map(str::trim) {
+        None | Some("" | "0") => Level::Off,
+        Some("pf") => Level::PageFaults,
+        Some(_) => Level::Full,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `XCL_DRED`: off by default and on `0`, `pf` is page faults only, anything else the full set.
+    #[test]
+    fn the_dred_level_is_pf_or_full_or_off() {
+        assert_eq!(level(None), Level::Off);
+        assert_eq!(level(Some("")), Level::Off);
+        assert_eq!(level(Some("0")), Level::Off);
+        assert_eq!(level(Some("pf")), Level::PageFaults);
+        assert_eq!(level(Some(" pf ")), Level::PageFaults);
+        assert_eq!(level(Some("1")), Level::Full);
+        assert_eq!(level(Some("yes")), Level::Full);
+    }
 
     #[test]
     fn breadcrumb_window_shows_three_each_side() {
