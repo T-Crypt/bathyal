@@ -58,6 +58,7 @@ pub mod fetch;
 pub mod mesh_dispatch;
 pub mod mesh_wave;
 pub mod partial_waves;
+pub mod partition;
 pub mod x64_masks;
 pub mod pso;
 pub mod reductions;

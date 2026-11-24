@@ -81,7 +81,9 @@ impl Cfg {
     }
 
     /// The immediate post-dominator of each block (Cooper, Harvey and Kennedy's iteration on the
-    /// reversed graph, with one exit node after every block that ends the program).
+    /// reversed graph, with one exit node after every block that ends the program). A successor
+    /// from which no path ends the program counts as the exit: the branch to it does not pass
+    /// through the other side's blocks.
     pub fn post_dominators(&self) -> Vec<PostDom> {
         let nb = self.start.len();
         let exit = nb;
@@ -140,6 +142,7 @@ impl Cfg {
             for &v in post.iter().rev().filter(|&&v| v != exit) {
                 let mut new = usize::MAX;
                 for p in rpred(v) {
+                    let p = if seen[p] { p } else { exit };
                     if idom[p] == usize::MAX {
                         continue;
                     }
@@ -184,7 +187,19 @@ impl Cfg {
                     }
                     match ipdom[run] {
                         PostDom::Block(next) => run = next,
-                        PostDom::Exit | PostDom::None => break,
+                        PostDom::Exit => break,
+                        PostDom::None => {
+                            // nothing after it ends the program either: every block from here on
+                            // runs only on this side
+                            let mut todo = self.succ[run].clone();
+                            while let Some(b) = todo.pop() {
+                                if !cd[b].contains(&a) {
+                                    cd[b].push(a);
+                                    todo.extend(self.succ[b].iter().copied());
+                                }
+                            }
+                            break;
+                        }
                     }
                 }
             }
@@ -276,6 +291,39 @@ mod tests {
         let g = Cfg::new(&p).unwrap();
         assert_eq!(g.start, vec![0, 1, 3]);
         assert_eq!(g.post_dominators(), vec![PostDom::None, PostDom::None, PostDom::Exit]);
+    }
+
+    #[test]
+    fn a_branch_into_a_loop_with_no_way_out_decides_both_sides() {
+        // 0 cmp, 1 scc0 → 4; 2 add, 3 s_branch → 2 (never ends); 4 s_endpgm
+        let p = program(&[
+            CMP,
+            ("S_CBRANCH_SCC0", "ENC_SOPP", &[("SIMM16", 2)], None),
+            ("S_ADD_U32", "ENC_SOP2", &[("SDST", 0), ("SSRC0", 0), ("SSRC1", 129)], None),
+            ("S_BRANCH", "ENC_SOPP", &[("SIMM16", 0xFFFE)], None),
+        ]);
+        let g = Cfg::new(&p).unwrap();
+        assert_eq!(g.start, vec![0, 2, 4]);
+        let pd = g.post_dominators();
+        assert_eq!(pd, vec![PostDom::Exit, PostDom::None, PostDom::Exit]);
+        assert_eq!(g.control_dependence(&pd), vec![vec![], vec![0], vec![0]]);
+    }
+
+    #[test]
+    fn every_block_of_a_side_with_no_way_out_depends_on_the_branch() {
+        // 0 cmp, 1 scc0 → 5; 2 mov; 3 add, 4 s_branch → 3 (never ends); 5 s_endpgm
+        let p = program(&[
+            CMP,
+            ("S_CBRANCH_SCC0", "ENC_SOPP", &[("SIMM16", 3)], None),
+            MOV2,
+            ("S_ADD_U32", "ENC_SOP2", &[("SDST", 0), ("SSRC0", 0), ("SSRC1", 129)], None),
+            ("S_BRANCH", "ENC_SOPP", &[("SIMM16", 0xFFFE)], None),
+        ]);
+        let g = Cfg::new(&p).unwrap();
+        assert_eq!(g.start, vec![0, 2, 3, 5]);
+        let pd = g.post_dominators();
+        assert_eq!(pd, vec![PostDom::Exit, PostDom::None, PostDom::None, PostDom::Exit]);
+        assert_eq!(g.control_dependence(&pd), vec![vec![], vec![0], vec![0], vec![0]]);
     }
 
     #[test]
