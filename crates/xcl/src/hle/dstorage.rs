@@ -1840,7 +1840,8 @@ unsafe extern "system" fn queue_get_error_event(p: *mut c_void) -> HANDLE {
 
 /// DSTORAGE_ERROR_RECORD (0x290): failure count u32 @0, then the first failure: HRESULT @8,
 /// command type @0xC (none: 0xFFFFFFFF), the request's options @0x10, destination @0x18 and
-/// size @0x20, its file name @0x24 (0x104 UTF-16) or memory source @0x238
+/// size @0x20, its file name @0x24 (0x104 UTF-16) and file offset @0x230 or memory source @0x238,
+/// source size @0x240, cancellation tag @0x248 (name @0x250 not kept)
 unsafe extern "system" fn queue_retrieve_error_record(p: *mut c_void, out: *mut u8) {
     if out.is_null() {
         return;
@@ -1863,7 +1864,10 @@ unsafe extern "system" fn queue_retrieve_error_record(p: *mut c_void, out: *mut 
                     for (i, c) in f.file.iter().take(0x103).enumerate() {
                         rec[0x24 + 2 * i..0x26 + 2 * i].copy_from_slice(&c.to_le_bytes());
                     }
+                    rec[0x230..0x238].copy_from_slice(&f.request.offset.to_le_bytes());
                 }
+                rec[0x240..0x244].copy_from_slice(&f.request.source_size.to_le_bytes());
+                rec[0x248..0x250].copy_from_slice(&f.request.tag.to_le_bytes());
             }
             None => rec[0xC..0x10].copy_from_slice(&NO_COMMAND.to_le_bytes()),
         }
@@ -2409,6 +2413,57 @@ mod tests {
             queue_close(q);
             queue_release(q);
             status_release(s);
+        }
+    }
+
+    /// The first failure carries the request's file offset, source size and cancellation tag
+    /// (DSTORAGE_ERROR_FIRST_FAILURE @0x230 / 0x240 / 0x248), not only its destination and file.
+    #[test]
+    fn error_record_has_the_failed_requests_offset_source_size_and_tag() {
+        unsafe {
+            let path = std::env::temp_dir().join(format!("xcl-dstorage-error-record-{}.bin", std::process::id()));
+            std::fs::write(&path, [0u8; 8]).unwrap();
+            let wide: Vec<u16> = path.to_str().unwrap().encode_utf16().chain(Some(0)).collect();
+            let mut f = std::ptr::null_mut();
+            assert_eq!(DStorageGetFactory(&IID_FACTORY, &mut f), S_OK);
+            let vt = *(f as *const *const usize);
+            let create_queue: unsafe extern "system" fn(*mut c_void, *const u8, *const GUID, *mut *mut c_void) -> HRESULT = std::mem::transmute(*vt.add(3));
+            let open_file: unsafe extern "system" fn(*mut c_void, *const u16, *const GUID, *mut *mut c_void) -> HRESULT = std::mem::transmute(*vt.add(4));
+            let create_status: unsafe extern "system" fn(*mut c_void, u32, *const u8, *const GUID, *mut *mut c_void) -> HRESULT = std::mem::transmute(*vt.add(5));
+            let mut desc = [0u8; 0x18];
+            desc[8..10].copy_from_slice(&8u16.to_le_bytes());
+            desc[10] = 2;
+            let mut q = std::ptr::null_mut();
+            assert_eq!(create_queue(f, desc.as_ptr(), &IID_QUEUE, &mut q), S_OK);
+            let mut file = std::ptr::null_mut();
+            assert_eq!(open_file(f, wide.as_ptr(), &IID_FILE, &mut file), S_OK);
+            let mut s = std::ptr::null_mut();
+            assert_eq!(create_status(f, 1, std::ptr::null(), &IID_STATUS_ARRAY, &mut s), S_OK);
+
+            // 16 bytes at 0x100 of an 8-byte file
+            let mut dst = [0u8; 16];
+            queue_enqueue_request(q, request_ex(0, dst.as_mut_ptr() as u64, 0, 16, file as u64, 0x100, 16, 0, 0xABCD).as_ptr());
+            queue_enqueue_status(q, s, 0);
+            queue_submit(q);
+            let start = std::time::Instant::now();
+            while !status_is_complete(s, 0) && start.elapsed().as_secs() < 5 {
+                std::thread::yield_now();
+            }
+            assert_ne!(status_get_hresult(s, 0), S_OK);
+
+            let mut rec = [0u8; ERROR_RECORD_BYTES];
+            queue_retrieve_error_record(q, rec.as_mut_ptr());
+            assert_eq!(u32::from_le_bytes(rec[0..4].try_into().unwrap()), 1);
+            assert_eq!(u32::from_le_bytes(rec[0x20..0x24].try_into().unwrap()), 16);
+            assert_eq!(u64::from_le_bytes(rec[0x230..0x238].try_into().unwrap()), 0x100, "FileOffset");
+            assert_eq!(u32::from_le_bytes(rec[0x240..0x244].try_into().unwrap()), 16, "SourceSize");
+            assert_eq!(u64::from_le_bytes(rec[0x248..0x250].try_into().unwrap()), 0xABCD, "CancellationTag");
+
+            queue_close(q);
+            queue_release(q);
+            status_release(s);
+            file_release(file);
+            let _ = std::fs::remove_file(&path);
         }
     }
 
