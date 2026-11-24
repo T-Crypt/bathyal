@@ -276,7 +276,7 @@ unsafe fn commit_sparse(a: usize, n: usize, p: u32) -> *mut c_void {
 
 /// `size` bytes of the title's GPU memory in the coherent window, when it has room for them and
 /// for what XCL keeps there (`XCL_COHERENT_HEAPS=0` turns the window off).
-unsafe fn coherent_graphics(size: usize, t: u32, p: u32) -> Option<*mut c_void> {
+unsafe fn coherent_graphics(size: usize, t: u32) -> Option<*mut c_void> {
     if size > crate::gpu::uma::MAX_SIZE || std::env::var("XCL_COHERENT_HEAPS").is_ok_and(|v| v == "0") {
         return None;
     }
@@ -313,7 +313,7 @@ pub unsafe extern "system" fn VirtualAlloc(addr: *const c_void, size: usize, t: 
     // its gigabytes of pages walked by the write-watch at every submit (measured: a fraction of
     // the frame rate). Sparse video memory stays the fallback when the window has no room.
     if addr.is_null() && t & 0x1000 != 0 && large {
-        if let Some(q) = coherent_graphics(size, t, p) {
+        if let Some(q) = coherent_graphics(size, t) {
             trace_mem("VirtualAlloc (large pages, coherent window)", 0, size, t as u64, p, q as usize);
             return q;
         }
@@ -382,7 +382,7 @@ pub unsafe extern "system" fn VirtualAlloc(addr: *const c_void, size: usize, t: 
     // read zeros, in the sparse windows video memory would have doubled them). The window is as
     // large as what the title asked for last time (`uma::coherent_hint`).
     if addr.is_null() && t & 0x1000 != 0 && p & PAGE_GRAPHICS_ANY != 0 {
-        if let Some(q) = coherent_graphics(size, t, p) {
+        if let Some(q) = coherent_graphics(size, t) {
             trace_mem("VirtualAlloc (graphics, coherent window)", 0, size, t as u64, p, q as usize);
             return q as *mut c_void;
         }
