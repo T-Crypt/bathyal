@@ -112,7 +112,7 @@ unsafe extern "system-unwind" fn unhandled_filter(info: *const EXCEPTION_POINTER
         crate::memstat::log();
         crate::report::write_final(Some(msg));
         // the other threads now: a title crash handler (Breakpad) can keep the process for
-        // minutes before it ends (the retail title's watchdog: what was its silent thread doing?)
+        // minutes before it ends (a title's watchdog: what was its silent thread doing?)
         static DUMPED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         if !DUMPED.swap(true, Ordering::AcqRel) {
             dump_threads();

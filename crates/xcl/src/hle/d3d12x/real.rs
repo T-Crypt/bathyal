@@ -898,7 +898,7 @@ fn console_extensions(kind: Kind) -> Option<usize> {
 ///   passes a D3D12_COMPUTE_PIPELINE_STATE_DESC, NULL, NULL, riid, ppv); PC #62 = CreateStateObject.
 /// * device #76: `CreateCommittedResource` (heap properties, flags, desc, state, clear value,
 ///   riid, ppv) as on PC #27 (PC #76 = CreateCommittedResource3); the console resource desc
-///   carries more after the 52 PC bytes (amd_fidelityfx_upscaler_xbox.dll writes 3 at +52).
+///   carries more after the 52 PC bytes (the console FSR 4 upscaler writes 3 at +52).
 /// * descriptor heap #9 / #10: the heap start handles come back in rax on the console.
 /// * resource #11 GetGPUVirtualAddress: console buffers live in unified memory; their console
 ///   address (= CPU address, low 32 bits = offset in `mem`) is what console code gets.
@@ -4364,10 +4364,9 @@ unsafe fn translated_mesh_stream_once(this: *mut c_void, desc: *const c_void, ri
     let subs = stream_subobjects(std::slice::from_raw_parts(base as *const u8, size))?;
     let as_slot = subs.iter().find(|s| s.0 == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS.0 as u32).and_then(|s| payload_shader(s.1));
     let ms_slot = subs.iter().find(|s| s.0 == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS.0 as u32).and_then(|s| payload_shader(s.1));
-    // A console MS container in the AS slot and no MS subobject (a retail game's minimap
-    // pipelines): refused. Translated as the mesh shader they are, the title rendered nothing
-    // from then on (a black screen every run); refused, it goes on to its menus. What it
-    // expects of them is not known yet.
+    // A console MS container in the AS slot and no MS subobject: refused. Translated as the
+    // mesh shader they are, a title can render nothing from then on; refused, it can carry on.
+    // What a title expects of them is not known yet.
     if let (None, Some(a)) = (ms_slot, as_slot) {
         if is_console(a) && crate::gpu::xbox::parse(a).is_some_and(|sh| sh.stage == "MS") {
             note_translation_error(format!("mesh pipeline with its MS {:016x} in the AS slot – refused", crate::gpu::shader::fnv64(a)));

@@ -1,7 +1,7 @@
 //! `xcl shaders <file|folder> [--top N] [--json] [--recomp] [--compile N]` – statistics over
 //! a shader corpus: formats, stages, FSSM variants and the RDNA2 instruction histogram that
-//! sets the recompiler's priorities. Inputs: a single blob, a folder (e.g. `<data>\shaders\`)
-//! or an RPF9 shader pack (records found by scanning, see `gpu::pack`). `--recomp`
+//! sets the recompiler's priorities. Inputs: a single blob or a folder (e.g. `<data>\shaders\`).
+//! `--recomp`
 //! translates every program to HLSL (kernel mode) and reports what is still missing;
 //! `--compile N` also compiles N of the complete translations with DXC.
 
@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
-use crate::gpu::{dxbc, pack, rdna2, recomp, shader, xbox};
+use crate::gpu::{dxbc, rdna2, recomp, shader, xbox};
 
 /// `--iface`: how console programs connect to their DXBC signatures (hypothesis checks for
 /// the VS/PS interface of the recompiler).
@@ -585,22 +585,19 @@ impl Agg {
 }
 
 enum Input {
-    Pack { data: Vec<u8>, records: Vec<pack::Record> },
     Files(Vec<PathBuf>),
 }
 
 impl Input {
     fn len(&self) -> usize {
         match self {
-            Input::Pack { records, .. } => records.len(),
             Input::Files(f) => f.len(),
         }
     }
 
-    /// (name, blob); blob is None when a record does not inflate
+    /// (name, blob); blob is None when the file cannot be read
     fn get(&self, i: usize) -> (String, Option<Vec<u8>>) {
         match self {
-            Input::Pack { data, records } => (format!("{} @{:#x}", records[i].name, records[i].offset), pack::inflate(data, &records[i])),
             Input::Files(f) => (f[i].display().to_string(), std::fs::read(&f[i]).ok()),
         }
     }
@@ -702,15 +699,9 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
                 return 2;
             }
         };
-        if data.starts_with(pack::RPF9_MAGIC) {
-            let records = pack::scan(&data, 0x40);
-            let what = format!("RPF9 package {:.1} MB, {} shader records", data.len() as f64 / 1048576.0, records.len());
-            (Input::Pack { data, records }, what)
-        } else {
-            let mut a = Agg { recomp_on, keep: compile, iface_on, ..Default::default() };
-            a.add(&path.display().to_string(), &data);
-            return print(path, "single file", a, top, json, t0, compile);
-        }
+        let mut a = Agg { recomp_on, keep: compile, iface_on, ..Default::default() };
+        a.add(&path.display().to_string(), &data);
+        return print(path, "single file", a, top, json, t0, compile);
     };
     if args.iter().any(|a| a == "--precompile") {
         let only = args.iter().position(|a| a == "--only").and_then(|i| args.get(i + 1)).map(|s| s.to_ascii_lowercase());
@@ -738,13 +729,13 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
 /// mesh pass-through, which the runtime builds for its pixel shader.
 /// `--pipelines`: each compute program's pipeline made on the GPU as a title's would be (XCL's
 /// ABI root signature with its static samplers): the driver keeps what it compiled in its own
-/// cache, which the title then finds – a retail game's 1 MB-DXIL programs kept its loading
+/// cache, which the title then finds – a game's 1 MB-DXIL programs can keep its loading
 /// waiting for the driver's compiler for minutes. Nothing runs on the GPU.
 ///
 /// The driver's compiles run on threads of their own (`drain`), fed by `BiggestFirst`. The
 /// translating threads used to make each pipeline themselves: with four driver slots taken by
 /// programs of several minutes each, every one of them waited for a slot and translation
-/// stopped (a retail pack sat at 22 800 / 26 503 for many minutes); and in file order the
+/// stopped (a large corpus sat at 22 800 programs for many minutes); and in file order the
 /// biggest program could come last and run alone.
 /// Each driver thread takes the biggest program whose compile fits in the memory that is free
 /// (`driver_fits`): the biggest ones start first, and while they fill the memory the threads
@@ -1545,23 +1536,6 @@ mod tests {
         assert_eq!(order.len(), 3);
         let cov = coverage(&a, &order, &[1, 3]);
         assert_eq!(cov, vec![(1, 0), (3, 2)]);
-    }
-
-    /// Real data check (skipped unless XCL_SAMPLE_RPF points at an RPF9 shader pack).
-    #[test]
-    fn retail_pack_sample() {
-        let Ok(p) = std::env::var("XCL_SAMPLE_RPF") else {
-            println!("XCL_SAMPLE_RPF not set – skipping");
-            return;
-        };
-        let data = std::fs::read(&p).unwrap();
-        let mut records = pack::scan(&data, 0x40);
-        records.truncate(300);
-        let agg = analyze(&Input::Pack { data, records }, false, 0, false);
-        assert_eq!(agg.inflate_errors, 0);
-        assert_eq!(agg.by_kind.get("xbox-native"), Some(&agg.total), "{:?}", agg.by_kind);
-        assert_eq!(agg.failed_count, 0, "{:?}", agg.failed);
-        assert_eq!(agg.insts.undecoded, 0);
     }
 }
 

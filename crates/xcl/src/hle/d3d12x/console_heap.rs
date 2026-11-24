@@ -2,7 +2,7 @@
 //!
 //! On the console a descriptor is GPU-readable memory: 32 bytes per CBV/SRV/UAV slot (T# /
 //! V#), 16 per sampler (S#), and a descriptor table in a root argument is a 32-bit GPU address
-//! (shaders load it with the high half 0 – amd_fidelityfx_upscaler_xbox.dll, HANDOFF "FSR4").
+//! (shaders load it with the high half 0 – the console FSR 4 upscaler, HANDOFF "FSR4").
 //! XCL gives console code heaps whose slots live in unified memory (so the table addresses
 //! console code computes from the heap start work as they are in the recompiler's `mem`
 //! model) and keeps PC descriptors beside each: view slot k → an SRV and, next to it, a UAV;

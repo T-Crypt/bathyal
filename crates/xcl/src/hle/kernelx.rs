@@ -259,8 +259,8 @@ pub mod mirrors {
 const MEM_64K_PAGES: u32 = 0x2040_0000;
 /// MEM_LARGE_PAGES: the console's 2 MiB pages of title memory (alone, or in MEM_64K_PAGES)
 const MEM_LARGE_PAGES_X: u32 = 0x2000_0000;
-/// a protection bit of the console's title memory the GPU uses (a newer retail title's index and vertex data:
-/// 0x22004; its 2.2 GB block of other data: 0x2404)
+/// a protection bit of the console's title memory the GPU uses (index and vertex data: 0x22004;
+/// other data: 0x2404)
 const PAGE_GPU_X: u32 = 0x2_0000;
 
 /// Commit `[a, a + n)` of a sparse window (the title's reservations there) and give it video
@@ -287,7 +287,7 @@ pub unsafe extern "system" fn VirtualAlloc(addr: *const c_void, size: usize, t: 
         return q;
     }
     // the title's own reservations of 64 KiB or large pages: in a sparse window, so the GPU sees
-    // them (a newer retail title keeps index and vertex data in a 1.2 GB VirtualAlloc of large pages; outside
+    // them (a title can keep index and vertex data in a large-page VirtualAlloc; outside
     // the windows the GPU faulted on it – a driver timeout)
     let large = t & MEM_64K_PAGES != MEM_64K_PAGES && t & MEM_LARGE_PAGES_X != 0 && p & PAGE_GPU_X != 0;
     if addr.is_null() && t & 0x2000 != 0 && (t & MEM_64K_PAGES == MEM_64K_PAGES || large) {

@@ -38,7 +38,7 @@
 1 = "GameInputCreate"
 
 [ordinals."xaudio2_9.dll"]
-# Export ordinals of Windows' xaudio2_9.dll (Bink2Scarlett.dll imports #1); assumed the same on the console.
+# Export ordinals of Windows' xaudio2_9.dll (the console Bink 2 library imports #1); assumed the same on the console.
 1 = "XAudio2Create"
 2 = "CreateAudioReverb"
 3 = "CreateAudioVolumeMeter"

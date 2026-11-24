@@ -29,15 +29,11 @@ Usage:
   bathyal disasm <file> [--offset N] [--length N] [--all] [--hex] [--fssm FILE]
       Disassembler for console GPU code (RDNA2) – e.g. for shaders saved in <data>\\shaders\\.
       Console containers (XDAT/XBCH/FSSM) are unpacked; --fssm saves the unpacked FSSM.
-  bathyal shaders <file | folder | package.rpf> [--top N] [--json] [--recomp] [--compile N]
+  bathyal shaders <file | folder> [--top N] [--json] [--recomp] [--compile N]
       Shader corpus statistics: formats, stages, RDNA2 instruction histogram (priorities
-      for the recompiler). RPF9 packages are scanned for shader records.
+      for the recompiler).
       --recomp: translates every RDNA2 program → HLSL and shows what is missing;
       --compile N: additionally compiles N complete translations with DXC.
-  bathyal rpf <package.rpf> [--top N] [--find NAME] [--extract NAME --out DIR]
-      Lists or extracts readable inline records. Archives larger than 1 GB use a
-      bounded-memory header probe; --probe requests it explicitly and --full overrides it.
-      Use --probe only for header summaries, without --find, --extract, --out or --full.
   bathyal --version
 ";
 
@@ -65,7 +61,6 @@ fn main() {
         }
         Some("disasm") if args.len() >= 2 => xcl::disasm::run(&PathBuf::from(&args[1]), &args[2..]),
         Some("shaders") if args.len() >= 2 => xcl::shaders::run(&PathBuf::from(&args[1]), &args[2..]),
-        Some("rpf") if args.len() >= 2 => xcl::rpf::run(&PathBuf::from(&args[1]), &args[2..]),
         Some("--version") | Some("-V") => {
             println!("bathyal {} (XCL fork)", env!("CARGO_PKG_VERSION"));
             0

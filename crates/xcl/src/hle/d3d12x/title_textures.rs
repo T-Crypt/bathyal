@@ -460,7 +460,7 @@ fn watch_pool() -> &'static WatchPool {
 /// Whether this submit reads the write-watch. By default every submit does: a page the CPU wrote
 /// between two submits (descriptors, buffers in sparse windows) must reach video memory before the
 /// second one. GetWriteWatch walks every watched page, though (gigabytes of mapped sparse tiles on a
-/// newer retail title: about 15 ms a call, several submits a frame), so `XCL_WATCH_PER_FRAME=1`
+/// some titles: about 15 ms a call, several submits a frame), so `XCL_WATCH_PER_FRAME=1`
 /// reads it only at the first submit after a present: faster, but a write made between two submits
 /// of one frame reaches video memory one frame late.
 fn scan_this_submit() -> bool {
