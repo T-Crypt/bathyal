@@ -5451,7 +5451,7 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
     super::list_x::execute_with_waits(&mapped, |chunk| {
         super::lifetime::submit(this as usize, chunk);
         if std::env::var_os("XCL_LIFETIME_TRACE").is_some() {
-            eprintln!("q_execute: submit chunk {:x?}", chunk);
+            eprintln!("q_execute: submit chunk {:x?} slot {} f {:x} pc10 {:x}", chunk, slot_of(this, "ExecuteCommandLists"), f as usize, orig_fn(this, 10));
         }
         f(this, chunk.len() as u32, chunk.as_ptr());
         super::list_x::readback_sparse_writes(this, chunk);
