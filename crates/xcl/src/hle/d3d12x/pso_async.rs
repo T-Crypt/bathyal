@@ -33,6 +33,8 @@ struct Pending {
     orphan: std::sync::atomic::AtomicBool,
     /// its shaders are in the prewarm record (marked once)
     noted: std::sync::atomic::AtomicBool,
+    /// it was seen still building and marked in the record (once)
+    stall_noted: std::sync::atomic::AtomicBool,
     /// one of the title's threads waits for it: its build does not stand back for the title
     demand: Mutex<Demand>,
     /// where it goes in the worker queue: 0 before 1 before 2 before 3
@@ -277,6 +279,7 @@ fn submit_as(standin: usize, compute: bool, job: Job, send: bool, rank: u8) {
         timed_out: Default::default(),
         orphan: Default::default(),
         noted: Default::default(),
+        stall_noted: Default::default(),
         demand: Default::default(),
         rank,
     });
@@ -440,7 +443,9 @@ fn resolve_within(pso: usize, limit: Option<Duration>, epoch: u64, budget: &Mute
     }
     if !finished {
         // drawn with its stand-in: the next run builds it before the other recorded pipelines
-        super::pso_disk::note_stalled(pso);
+        if !p.stall_noted.swap(true, Ordering::Relaxed) {
+            super::pso_disk::note_stalled(pso);
+        }
         static N: AtomicUsize = AtomicUsize::new(0);
         let n = N.fetch_add(1, Ordering::Relaxed);
         if n < 16 || n.is_power_of_two() {
@@ -560,7 +565,9 @@ fn resolve_compute_within(pso: usize, limit: Option<std::time::Duration>, budget
         budget.consume(elapsed.max(rem_budget));
         if rem_budget >= limit / 2 && !p.timed_out.swap(true, Ordering::AcqRel) {
             // skipped this run: the next one builds it before the other recorded pipelines
-            super::pso_disk::note_stalled(pso);
+            if !p.stall_noted.swap(true, Ordering::Relaxed) {
+                super::pso_disk::note_stalled(pso);
+            }
             static LOGGED: AtomicUsize = AtomicUsize::new(0);
             if LOGGED.fetch_add(1, Ordering::Relaxed) < 16 {
                 crate::xlog_warn!(
@@ -796,6 +803,7 @@ mod tests {
             timed_out: Default::default(),
             orphan: Default::default(),
             noted: Default::default(),
+            stall_noted: Default::default(),
             demand: Default::default(),
             rank,
         })
