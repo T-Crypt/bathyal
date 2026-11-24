@@ -3640,7 +3640,7 @@ static PSO_MAX_US: AtomicU64 = AtomicU64::new(0);
 static PSO_OVER_50MS: AtomicU64 = AtomicU64::new(0);
 static PSO_REPEATS: AtomicU64 = AtomicU64::new(0);
 /// The `pso_disk` keys created so far this run: a key seen again is a repeat.
-static PSO_KEYS: Mutex<HashSet<u64>> = Mutex::new(HashSet::new());
+static PSO_KEYS: Mutex<Option<HashSet<u64>>> = Mutex::new(None);
 
 /// The one line written every 2000 pipeline creations.
 fn pso_stats_line(calls: u64, total_us: u64, max_us: u64, over_50ms: u64, repeats: u64) -> String {
@@ -3670,7 +3670,7 @@ fn note_pso_time(elapsed: std::time::Duration) {
 /// (from `finish_two_pass`) counts one key per driver pipeline.
 fn note_pso_key(key: u64) {
     let mut seen = PSO_KEYS.lock().unwrap_or_else(|e| e.into_inner());
-    if !seen.insert(key) {
+    if !seen.get_or_insert_with(HashSet::new).insert(key) {
         PSO_REPEATS.fetch_add(1, Ordering::Relaxed);
     }
 }
