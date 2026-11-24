@@ -200,6 +200,7 @@ pub fn console_to_dxil_in(blob: &[u8], stage: Stage, sampler_base: u32, split_wa
 /// translation parameters; translator sources and the DXC toolchain identify compatible builds.
 /// `XCL_TRANSLATED_CACHE=0` turns it off.
 mod translated {
+    use super::Stage;
     use super::{CacheStage, Compiled};
     use std::path::{Path, PathBuf};
     use std::sync::OnceLock;

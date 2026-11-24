@@ -1320,7 +1320,7 @@ fn run_in_region(dxil: &[u8], state: &KernelState, arena: &Arena) -> Result<Kern
     }
     unsafe {
         let dev = &gpu.dev;
-        let dev3: ID3D12Device3 = dev.cast().map_err(e)?;
+        let dev3: ID3D12Device3 = dev.cast().map_err(|x| format!("{x}"))?;
         let mut bufs: Vec<ID3D12Resource> = Vec::new();
         for &(base, size) in &arena.windows {
         let heap: ID3D12Heap = dev3.OpenExistingHeapFromAddress(base as *const std::ffi::c_void).map_err(|x| format!("OpenExistingHeapFromAddress: {x}"))?;
