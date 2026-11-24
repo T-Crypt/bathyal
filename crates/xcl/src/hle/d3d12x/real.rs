@@ -5280,7 +5280,7 @@ mod deferred_pso_tests {
         let desc = desc.as_ptr() as *const c_void;
         assert!(unsafe { stream_is_console_mesh(desc) }, "a console MS with no AS is the deferred kind");
         let standin = 0x7600_0001usize;
-        let mut ppv: usize = standin;
+        let mut ppv: *mut c_void = standin as *mut c_void;
         BUILDS.lock().unwrap().clear();
         let t = Instant::now();
         let owned = unsafe { deferred_stream_copy_for_test(desc) }.expect("the description is copied");
@@ -5326,7 +5326,7 @@ mod deferred_pso_tests {
         // the copy still reads what the build needs
         let (size, base) = unsafe { (*(owned.ptr() as *const usize), *((owned.ptr() as usize + 8) as *const usize)) };
         let subs = stream_subobjects(unsafe { std::slice::from_raw_parts(base as *const u8, size) }).expect("parses");
-        let copied_ms = subs.iter().find(|s| s.0 == 24).and_then(|s| payload_shader(s.1)).expect("MS copied");
+        let copied_ms = subs.iter().find(|s| s.0 == 24).and_then(|s| unsafe { payload_shader(s.1) }).expect("MS copied");
         assert_eq!(copied_ms, ms.as_slice(), "the copy is independent of the title's shader memory");
         assert_ne!(copied_ms.as_ptr() as usize, ms.as_ptr() as usize, "not the title's pointer");
         let (n, p) = subs.iter().find(|s| s.0 == 12).map(|s| (u32::from_le_bytes(s.1[0..4].try_into().unwrap()) as usize, u64::from_le_bytes(s.1[8..16].try_into().unwrap()) as usize)).expect("input layout copied");
