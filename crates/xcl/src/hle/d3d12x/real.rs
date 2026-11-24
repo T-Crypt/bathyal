@@ -696,7 +696,7 @@ fn kind_of(ext: usize) -> Option<Kind> {
 /// recorded command list can reference (`lifetime::note`). None: not such an object.
 pub(super) unsafe fn free_fn(handle: usize) -> Option<super::lifetime::FreeFn> {
     // a console CPU handle or a title address may be named where a resource is expected
-    if handle == 0 || !crate::gpu::shader::readable(handle, 8) {
+    if handle == 0 || !handle.is_multiple_of(8) || !crate::gpu::shader::readable(handle, 8) {
         return None;
     }
     let ext = vt(handle as *mut c_void) as usize;
