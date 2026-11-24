@@ -7,7 +7,7 @@
 //! For titles under bring-up: a crash reporter otherwise uploads a memory dump of the process
 //! on every crash.
 //!
-//! The title's imports are not the only way out: a retail game's crash reporter reached the
+//! The title's imports are not the only way out: a title's crash reporter reached the
 //! system's WinHTTP another way and uploaded a 21.5 MB minidump with `XCL_NETWORK=0` (#305).
 //! So the same refusals are also hooked into the system's own winhttp / wininet / ws2_32
 //! (`install_system_hooks`): whatever finds those functions – an import, GetProcAddress, a DLL

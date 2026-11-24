@@ -16,7 +16,7 @@
 //! commands, xapu commands with their structures and the start of the Opus input, the caller in the
 //! title, the rate per kind of command).
 //!
-//! # The decoder's commands as a retail game sends them (observed with `XCL_TRACE_APU=1`)
+//! # The decoder's commands as a title sends them (observed with `XCL_TRACE_APU=1`)
 //!
 //! Every command starts with the 24-byte `XApuCommand` (`kind`, `stream`, `sequence`, `options`,
 //! `context` u64); the title builds it on its stack and sets only the fields it uses (`kind` and

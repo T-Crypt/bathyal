@@ -30,7 +30,7 @@
 //! above are from the public format notes of bcpack-decoder
 //! (https://github.com/Tim0219800/bcpack-decoder, `docs/SPEC.md`) and bcpack-rs
 //! (https://github.com/Ahmet-Dedeler/bcpack-rs, `docs/BCPACK_SPEC.md`), both MIT, which report
-//! them as checked against retail streams; no code was taken from either.
+//! them as checked against real streams; no code was taken from either.
 
 use super::rans_tables::FREQ;
 use super::Error;
