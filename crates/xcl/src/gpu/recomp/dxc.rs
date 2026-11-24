@@ -370,7 +370,16 @@ struct Job {
     profile: String,
     extra: Vec<String>,
     reply: std::sync::mpsc::Sender<Result<Vec<u8>, String>>,
+    /// one of the title's threads waits for it
+    wanted: Wanted,
 }
+
+/// Whether one of the title's threads waits for a compile (asked again while it is held back).
+pub type Wanted = Box<dyn Fn() -> bool + Send>;
+
+/// Compiles the title waits for that go on at once however little commit is left (each takes
+/// 0.1 – 0.7 GB).
+const WANTED_AT_ONCE: usize = 6;
 
 /// Compile threads (DXC workers, and the PSO workers of `pso_async` that feed them): every core
 /// but one, `XCL_DXC_THREADS` to choose. Memory is what `wait_for_memory` watches: a retail
@@ -468,13 +477,13 @@ fn may_start(avail: Option<u64>, running: usize, waited: std::time::Duration, es
 /// `ESCAPE_AFTER` goes in regardless, one per interval. Each compile used to wait the minute
 /// while commit was short: with XDefiant's own 10 GB committed, 4 GB were left, and its last
 /// cold-cache shaders came a few a minute.
-pub fn wait_for_memory() -> MemorySlot {
-    admit(&GATE, available_commit)
+pub fn wait_for_memory(wanted: &Wanted) -> MemorySlot {
+    admit(&GATE, available_commit, wanted)
 }
 
 /// `wait_for_memory` through `gate`, with the available commit from `commit` (read again for
 /// every decision; a test gives it a fixed one).
-fn admit(gate: &'static Gate, commit: impl Fn() -> Option<u64>) -> MemorySlot {
+fn admit(gate: &'static Gate, commit: impl Fn() -> Option<u64>, wanted: &Wanted) -> MemorySlot {
     use std::sync::atomic::Ordering;
     let start = std::time::Instant::now();
     let mut last_escape = gate.last_escape.lock().unwrap_or_else(|e| e.into_inner());
@@ -485,7 +494,9 @@ fn admit(gate: &'static Gate, commit: impl Fn() -> Option<u64>) -> MemorySlot {
         let running = gate.running.load(Ordering::Acquire);
         // the count goes up only from the value the decision saw: workers deciding at the same
         // moment cannot all go in on one reading of the commit
-        if may_start(avail, running, waited, escape_free) && gate.running.compare_exchange(running, running + 1, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+        // a compile one of the title's threads waits for goes on at once, up to `WANTED_AT_ONCE`
+        let wanted_now = running < WANTED_AT_ONCE && wanted();
+        if (may_start(avail, running, waited, escape_free) || wanted_now) && gate.running.compare_exchange(running, running + 1, Ordering::AcqRel, Ordering::Acquire).is_ok() {
             let plenty = avail.is_none_or(|a| a >= commit_floor() + COMMIT_PER_COMPILE * running as u64);
             if !plenty && running != 0 {
                 *last_escape = Some(std::time::Instant::now());
@@ -511,7 +522,7 @@ fn pool() -> &'static std::sync::Mutex<std::sync::mpsc::Sender<Job>> {
                     Ok(j) => j,
                     Err(_) => return,
                 };
-                let _slot = wait_for_memory();
+                let _slot = wait_for_memory(&job.wanted);
                 let extra: Vec<&str> = job.extra.iter().map(|s| s.as_str()).collect();
                 let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| compile_here(&job.src, &job.entry, &job.profile, &extra)))
                     .unwrap_or_else(|_| Err("DXC: panic in the compile thread".into()));
@@ -525,7 +536,7 @@ fn pool() -> &'static std::sync::Mutex<std::sync::mpsc::Sender<Job>> {
 /// Compile HLSL to signed DXIL. `profile` e.g. "cs_6_6"; `extra` are dxc arguments.
 pub fn compile(src: &str, entry: &str, profile: &str, extra: &[&str]) -> Result<Vec<u8>, String> {
     let (reply, rx) = std::sync::mpsc::channel();
-    let job = Job { src: src.into(), entry: entry.into(), profile: profile.into(), extra: extra.iter().map(|s| s.to_string()).collect(), reply };
+    let job = Job { src: src.into(), entry: entry.into(), profile: profile.into(), extra: extra.iter().map(|s| s.to_string()).collect(), reply, wanted: crate::hle::d3d12x::pso_async::wanted_here() };
     pool().lock().unwrap().send(job).map_err(|_| "DXC: no compile threads".to_string())?;
     rx.recv().map_err(|_| "DXC: the compile thread exited".to_string())?
 }
@@ -1060,7 +1071,7 @@ mod gate_tests {
             for _ in 0..32 {
                 s.spawn(|| {
                     for _ in 0..5 {
-                        let _slot = wait_for_memory();
+                        let _slot = wait_for_memory(&Box::new(|| false));
                         std::thread::sleep(Duration::from_millis(1));
                     }
                     done.fetch_add(1, Ordering::SeqCst);

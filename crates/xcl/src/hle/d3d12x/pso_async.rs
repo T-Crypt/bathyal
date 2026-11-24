@@ -66,6 +66,17 @@ pub(super) fn build_is_wanted() -> bool {
     BUILDING.with(|b| b.borrow().as_ref().is_some_and(|p| p.demand.lock().unwrap().wanted))
 }
 
+/// Whether one of the title's threads waits for what this thread is doing, to be asked later and
+/// from another thread: a worker's build as `build_is_wanted`; a thread that is not XCL's is the
+/// title's own.
+pub fn wanted_here() -> crate::gpu::recomp::dxc::Wanted {
+    if let Some(p) = BUILDING.with(|b| b.borrow().clone()) {
+        return Box::new(move || p.demand.lock().unwrap().wanted);
+    }
+    let own = crate::state::boot().is_some() && !std::thread::current().name().is_some_and(|n| n.starts_with("xcl-"));
+    Box::new(move || own)
+}
+
 /// A worker's build of `p`.
 fn build(p: &Arc<Pending>, job: Job) {
     BUILDING.with(|b| *b.borrow_mut() = Some(p.clone()));
