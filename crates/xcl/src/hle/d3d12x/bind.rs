@@ -272,7 +272,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
         // doesn't match the currently set Pipeline State Object"; a retail title's world then
         // hung the GPU, 0x887a0006). Skipped, like a draw or dispatch of such a pipeline.
         if super::pso_async::is_pending(with(this, |s| s.pso)) {
-            count(DRAWS_SKIPPED);
+            count(if gfx { DRAWS_SKIPPED } else { DISPATCHES_SKIPPED });
             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             if N.fetch_add(1, Ordering::Relaxed) < 4 {
                 crate::xlog_warn!("D3D12.X: ExecuteIndirect with a pipeline that is still being built skipped");
@@ -284,7 +284,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
         if let (Some(list), Some(r)) = (ID3D12GraphicsCommandList::from_raw_borrowed(&this), ID3D12RootSignature::from_raw_borrowed(&rs)) {
             list.SetGraphicsRootSignature(r);
         }
-        return pc(this, sig, max, args, args_off, count_buf, count_off);
+        return pc(this, sig, max, args, args_off_pc, count_buf, count_off_pc);
     }
     if ROOT_SIGNATURES.lock().unwrap().as_ref().is_some_and(|s| s.contains(&sig)) {
         static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -1145,23 +1145,9 @@ unsafe fn abi_views(this: *mut c_void, real: usize, gfx: bool, res: Option<u64>,
         None => vec![table_at as u32, (table_at >> 32) as u32],
     };
     io.resize(crate::gpu::recomp::KERNEL_SGPRS, 0);
-    io[crate::gpu::recomp::IO_UMA_BASE_HI] = (u.base() >> 32) as u32;
-    let io_at = copy(&io.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<u8>>())?;
-    let res_at = copy(&[0u8; 256])?;
-    let va = |p: usize| super::real::uma_va_of(p).unwrap_or(first);
-    let rs = super::real::pso_root_signature(real).or_else(|| super::real::abi_rs_cached().map(|p| p as usize)).ok_or("no XCL ABI root signature")?;
-    let rs = rs as *mut c_void;
-    let rs = ID3D12RootSignature::from_raw_borrowed(&rs).ok_or("root signature")?;
-    let views = [va(io_at), va(res_at)].into_iter().chain((0..4).map(|k| windows.get(k).copied().unwrap_or(first)));
-    if gfx {
-        list.SetGraphicsRootSignature(rs);
-        for (k, v) in views.enumerate() {
-            list.SetGraphicsRootUnorderedAccessView(k as u32, v);
-        }
-    } else {
-        list.SetComputeRootSignature(rs);
-        for (k, v) in views.enumerate() {
-            list.SetComputeRootUnorderedAccessView(k as u32, v);
+    for &(k, v) in io_patch {
+        if let Some(w) = io.get_mut(k) {
+            *w = v;
         }
     }
     let io_at = copy(&io.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<u8>>())?;
@@ -1454,6 +1440,62 @@ mod tests {
         assert!(cpu_rect_expansion(with_gs));
     }
 
+    /// `expand_rect` on vertices of position (x, y, 0, 1), texture coordinate (u, v) and a packed
+    /// colour: the six vertices' positions and texture coordinates, and whether every vertex kept
+    /// the position's z and w and the colour.
+    fn expanded(corners: [[f32; 2]; 3], uv: impl Fn([f32; 2]) -> [f32; 2]) -> (Vec<([f32; 2], [f32; 2])>, bool) {
+        const STRIDE: usize = 28;
+        let mut v = Vec::new();
+        for p in corners {
+            let t = uv(p);
+            for f in [p[0], p[1], 0.0, 1.0, t[0], t[1]] {
+                v.extend_from_slice(&f.to_le_bytes());
+            }
+            v.extend_from_slice(&0xFF33_6699u32.to_le_bytes());
+        }
+        let mut out = vec![0u8; 6 * STRIDE];
+        expand_rect(&v, STRIDE, &mut out);
+        let f = |b: &[u8], w: usize| f32::from_le_bytes(b[w * 4..][..4].try_into().unwrap());
+        let kept = out.chunks_exact(STRIDE).all(|b| f(b, 2) == 0.0 && f(b, 3) == 1.0 && b[24..] == 0xFF33_6699u32.to_le_bytes());
+        (out.chunks_exact(STRIDE).map(|b| ([f(b, 0), f(b, 1)], [f(b, 4), f(b, 5)])).collect(), kept)
+    }
+
+    /// A rect list's rect on the CPU, for each vertex its corner can be: (x1,y1) (x1,y2) (x2,y1)
+    /// – v0, as Mesa's r600 and radeonsi blits send it –, (x1,y1) (x1,y2) (x2,y2) – v1, as
+    /// xf86-video-ati's r600 EXA does –, and v2. The two triangles are the rect's halves along
+    /// one diagonal, wind as v0 v1 v2 does and start with v0; the fourth corner continues the
+    /// texture coordinate. Synthetic: the rect is the expectation, not a measurement of hardware.
+    #[test]
+    fn rects_expanded_on_the_cpu_have_the_corner_opposite_their_own() {
+        let (x1, x2, y1, y2) = (16.0f32, 48.0, 8.0, 24.0);
+        let uv = |[x, y]: [f32; 2]| [(x - x1) / (x2 - x1), (y - y1) / (y2 - y1)];
+        let area = |t: &[([f32; 2], [f32; 2])]| (t[1].0[0] - t[0].0[0]) * (t[2].0[1] - t[0].0[1]) - (t[2].0[0] - t[0].0[0]) * (t[1].0[1] - t[0].0[1]);
+        for (name, corners) in [
+            ("corner v0", [[x1, y1], [x1, y2], [x2, y1]]),
+            ("corner v1", [[x1, y1], [x1, y2], [x2, y2]]),
+            ("corner v1, the other way round", [[x1, y2], [x1, y1], [x2, y1]]),
+            ("corner v2", [[x1, y2], [x2, y1], [x1, y1]]),
+        ] {
+            let (v, kept) = expanded(corners, uv);
+            let pos: Vec<[f32; 2]> = v.iter().map(|p| p.0).collect();
+            assert!(kept, "{name}: z, w and the colour are kept");
+            for corner in [[x1, y1], [x1, y2], [x2, y1], [x2, y2]] {
+                assert!(pos.contains(&corner), "{name}: no vertex at {corner:?} in {pos:?}");
+            }
+            assert!(v.iter().all(|&(p, t)| t == uv(p)), "{name}: texture coordinates {v:?}");
+            // each triangle is half the rect, in the winding of the title's three vertices
+            let first = area(&[(corners[0], [0.0; 2]), (corners[1], [0.0; 2]), (corners[2], [0.0; 2])]);
+            assert_eq!(first.abs(), (x2 - x1) * (y2 - y1));
+            assert_eq!([area(&v[..3]), area(&v[3..])], [first, first], "{name}: {pos:?}");
+            // … on either side of a diagonal, and both start with v0
+            assert_eq!(pos[..3].iter().filter(|p| pos[3..].contains(p)).count(), 2, "{name}: {pos:?}");
+            assert_eq!([pos[0], pos[3]], [corners[0], corners[0]], "{name}: {pos:?}");
+        }
+        // not three corners of a screen-aligned rect: as before, v0 + v2 − v1
+        let (v, _) = expanded([[0.0, 0.0], [8.0, 2.0], [10.0, 9.0]], |p| p);
+        assert_eq!(v.iter().map(|p| p.0).collect::<Vec<_>>(), [[0.0, 0.0], [8.0, 2.0], [10.0, 9.0], [0.0, 0.0], [10.0, 9.0], [2.0, 7.0]]);
+    }
+
     /// An ExecuteIndirect whose bound pipeline is still being built is skipped (its stand-in
     /// with XCL's ABI root signature on the list is the debug layer's 953 and a hung GPU);
     /// a built or failed one goes to the PC call. The gate `execute_indirect` uses.
@@ -1461,9 +1503,9 @@ mod tests {
     fn execute_indirect_with_a_pipeline_still_building_is_skipped() {
         let (building, built, failed) = (0x7E57_6001usize, 0x7E57_6002usize, 0x7E57_6003usize);
         // lazy submits: no worker starts them, so the states stay under the test's control
-        pso_async::submit_lazy(building, false, Box::new(|| 0x1234), 0);
-        pso_async::submit_lazy(built, false, Box::new(|| 0x1235), 0);
-        pso_async::submit_lazy(failed, false, Box::new(|| 0), 0);
+        pso_async::submit_lazy(building, false, Box::new(|| 0x1234));
+        pso_async::submit_lazy(built, false, Box::new(|| 0x1235));
+        pso_async::submit_lazy(failed, false, Box::new(|| 0));
         assert!(pso_async::is_pending(building));
         assert_eq!(pso_async::resolve_wait(built), 0x1235);
         assert_eq!(pso_async::resolve_wait(failed), failed);
