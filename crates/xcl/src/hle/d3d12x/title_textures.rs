@@ -1181,6 +1181,32 @@ fn watch_ranges(regions: &[(usize, usize)], mut wanted: Vec<(usize, usize)>) -> 
     out
 }
 
+/// Copy `[start, end)` into `dst` (which must be pre-zeroed and at least `end - start` bytes),
+/// leaving any page that is concurrently unmapped or made unreadable as zero instead of faulting.
+unsafe fn copy_readable_range(start: usize, end: usize, dst: *mut u8) {
+    use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    const PAGE: usize = 0x1000;
+    let proc = GetCurrentProcess();
+    let mut cur = start;
+    while cur < end {
+        let mut read = 0usize;
+        let want = end - cur;
+        let ok = ReadProcessMemory(proc, cur as *const c_void, dst.add(cur - start) as *mut c_void, want, &mut read);
+        if ok != 0 {
+            break;
+        }
+        // A page at `cur + read` became unreadable between VirtualQuery and ReadProcessMemory
+        // (e.g. a streaming thread unmapped physical pages): skip that page (stays zero) and
+        // continue with the remainder of the range.
+        let next = ((cur.saturating_add(read)) & !(PAGE - 1)).saturating_add(PAGE);
+        if next <= cur {
+            break;
+        }
+        cur = next;
+    }
+}
+
 /// `len` bytes at `at`: the committed, readable pages copied, the rest zero (a streaming pool
 /// has only some of its pages mapped).
 unsafe fn read_committed(at: usize, len: usize) -> Vec<u8> {
@@ -1192,16 +1218,20 @@ unsafe fn read_committed(at: usize, len: usize) -> Vec<u8> {
         std::ptr::copy_nonoverlapping(at as *const u8, out.as_mut_ptr(), len);
         return out;
     }
+    let limit = at.saturating_add(len);
     let mut p = at;
-    while p < at + len {
+    while p < limit {
         let mut m: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
         if VirtualQuery(p as *const c_void, &mut m, std::mem::size_of_val(&m)) == 0 {
             break;
         }
-        let end = (m.BaseAddress as usize + m.RegionSize).min(at + len);
+        let end = (m.BaseAddress as usize).saturating_add(m.RegionSize).min(limit);
+        if end <= p {
+            break;
+        }
         let readable = m.State == MEM_COMMIT && m.Protect & 0xEE != 0 && m.Protect & 0x100 == 0; // R / RW / WC / X-R…, no guard
         if readable {
-            std::ptr::copy_nonoverlapping(p as *const u8, out.as_mut_ptr().add(p - at), end - p);
+            copy_readable_range(p, end, out.as_mut_ptr().add(p - at));
         }
         p = end;
     }
@@ -1996,6 +2026,54 @@ mod tests {
                 drop(res);
             }
             uma.free(base);
+        }
+    }
+
+    #[test]
+    fn read_committed_skips_unmapped_holes_and_survives_concurrent_decommit() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_DECOMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE};
+        const PAGES: usize = 32;
+        const PAGE: usize = 0x1000;
+        const SIZE: usize = PAGES * PAGE;
+        unsafe {
+            let base = VirtualAlloc(std::ptr::null(), SIZE, MEM_RESERVE, PAGE_READWRITE) as usize;
+            assert!(base != 0);
+            // Commit first and last 4 pages, leave the middle reserved (unmapped hole).
+            assert!(!VirtualAlloc(base as *mut c_void, 4 * PAGE, MEM_COMMIT, PAGE_READWRITE).is_null());
+            assert!(!VirtualAlloc((base + (PAGES - 4) * PAGE) as *mut c_void, 4 * PAGE, MEM_COMMIT, PAGE_READWRITE).is_null());
+            std::slice::from_raw_parts_mut(base as *mut u8, 4 * PAGE).fill(0x5A);
+            std::slice::from_raw_parts_mut((base + (PAGES - 4) * PAGE) as *mut u8, 4 * PAGE).fill(0xA5);
+
+            // Non-page-aligned start/end crossing committed -> hole -> committed.
+            let got = read_committed(base + 123, SIZE - 246);
+            assert!(got[..4 * PAGE - 123].iter().all(|&b| b == 0x5A));
+            assert!(got[4 * PAGE - 123..(PAGES - 4) * PAGE - 123].iter().all(|&b| b == 0));
+            assert!(got[(PAGES - 4) * PAGE - 123..].iter().all(|&b| b == 0xA5));
+
+            // Stress the TOCTOU window: one thread toggles commit/decommit on middle pages while
+            // read_committed reads the whole span. Previously this faulted with 0xC0000005.
+            let stop = Arc::new(AtomicBool::new(false));
+            let stop_w = Arc::clone(&stop);
+            let mutator = std::thread::spawn(move || {
+                let mid = (base + 4 * PAGE) as *mut c_void;
+                let mid_len = (PAGES - 8) * PAGE;
+                while !stop_w.load(Ordering::Relaxed) {
+                    if !VirtualAlloc(mid, mid_len, MEM_COMMIT, PAGE_READWRITE).is_null() {
+                        std::ptr::write_bytes(mid as *mut u8, 0x3C, mid_len);
+                        VirtualFree(mid, mid_len, MEM_DECOMMIT);
+                    }
+                }
+            });
+            for _ in 0..400 {
+                let buf = read_committed(base, SIZE);
+                assert_eq!(buf.len(), SIZE);
+                assert!(buf[..4 * PAGE].iter().all(|&b| b == 0x5A));
+                assert!(buf[(PAGES - 4) * PAGE..].iter().all(|&b| b == 0xA5));
+            }
+            stop.store(true, Ordering::Relaxed);
+            mutator.join().unwrap();
+            VirtualFree(base as *mut c_void, 0, MEM_RELEASE);
         }
     }
 }
