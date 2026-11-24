@@ -21,6 +21,10 @@
 //!   SAME queue the value alone is enough: the earlier work is already ahead in the queue, and a
 //!   later write cannot be waited for without a deadlock.
 //!
+//! A value a shader or UAV wrote into a sparse window has no record: XCL reads the window back
+//! to its CPU view after the writer queue's submission, and the gate reads the address again on
+//! each check (and whenever a submission completes), so the wait opens once that work is done.
+//!
 //! A held submission is submitted anyway after `XCL_WAIT_TIMEOUT_MS` (default 10000) with one
 //! log line, so the title is never stuck for good.
 

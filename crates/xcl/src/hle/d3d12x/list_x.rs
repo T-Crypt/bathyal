@@ -641,7 +641,7 @@ struct QueueInfo {
 
 static LISTS: Mutex<Option<HashMap<usize, ListState>>> = Mutex::new(None);
 static LIVE_QUEUES: Mutex<Vec<QueueInfo>> = Mutex::new(Vec::new());
-/// Number of lists with at least one pending `Wait32/64BitValueX` (fast-path guard for ExecuteCommandLists).
+/// Number of lists with at least one pending `Wait32/64BitValueX` (bookkeeping; the queue gate reads them per submission).
 static PENDING_WAIT_LISTS: AtomicUsize = AtomicUsize::new(0);
 /// Number of lists with recorded sparse-window memory writes (fast-path guard for post-execute readback).
 static SPARSE_WRITE_LISTS: AtomicUsize = AtomicUsize::new(0);
