@@ -28,6 +28,28 @@ fn ready() -> Option<ID3D12Device> {
 }
 
 fn buffer(dev: &ID3D12Device, heap: D3D12_HEAP_TYPE, state: D3D12_RESOURCE_STATES) -> ID3D12Resource {
+    if std::env::var_os("XCL_TEST_ORIG").is_some() {
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: BYTES,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_UNKNOWN,
+            SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            ..Default::default()
+        };
+        let mut r: *mut c_void = std::ptr::null_mut();
+        let iid = windows::Win32::Graphics::Direct3D12::ID3D12Resource::IID;
+        unsafe {
+            type F = unsafe extern "system" fn(*mut c_void, *const D3D12_HEAP_PROPERTIES, D3D12_HEAP_FLAGS, *const D3D12_RESOURCE_DESC, D3D12_RESOURCE_STATES, *const D3D12_CLEAR_VALUE, *const windows::core::GUID, *mut *mut c_void) -> i32;
+            let f: F = std::mem::transmute(real::orig_fn(dev.as_raw() as *mut c_void, 27));
+            let hp = D3D12_HEAP_PROPERTIES { Type: heap, ..Default::default() };
+            assert!(f(dev.as_raw() as *mut c_void, &hp, D3D12_HEAP_FLAG_NONE, &desc, state, std::ptr::null(), &iid, &mut r) >= 0, "orig CreateCommittedResource");
+            ID3D12Resource::from_raw(r)
+        }
+    } else {
     let desc = D3D12_RESOURCE_DESC {
         Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
         Width: BYTES,
@@ -45,6 +67,7 @@ fn buffer(dev: &ID3D12Device, heap: D3D12_HEAP_TYPE, state: D3D12_RESOURCE_STATE
             .expect("CreateCommittedResource");
     }
     r.unwrap()
+    }
 }
 
 /// The title's `Release` of an adopted object: slot 2 of its vtable.
