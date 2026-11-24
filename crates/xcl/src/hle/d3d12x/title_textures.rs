@@ -1556,19 +1556,20 @@ mod tests {
             let base = VirtualAlloc(std::ptr::null(), PAGES * PAGE, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE) as usize;
             assert!(base != 0);
             let mut buf = vec![std::ptr::null_mut::<c_void>(); 64];
+            let ranges = [(base, PAGES * PAGE)];
             let (mut dirty, mut page) = (Vec::new(), 0u32);
-            take_written(base, PAGES * PAGE, &mut buf, &mut dirty, &mut page);
+            watch_into(&ranges, &mut buf, &mut dirty, &mut page);
             for written in [(0..PAGES).filter(|i| i % 7 != 3).collect::<Vec<_>>(), (0..128).map(|i| i * 5).collect()] {
                 let want: Vec<usize> = written.iter().map(|i| base + i * PAGE).collect();
                 for &a in &want {
                     (a as *mut u8).write_volatile(1);
                 }
                 dirty.clear();
-                take_written(base, PAGES * PAGE, &mut buf, &mut dirty, &mut page);
+                watch_into(&ranges, &mut buf, &mut dirty, &mut page);
                 assert_eq!(page as usize, PAGE);
                 assert_eq!(dirty, want, "{} pages written", want.len());
                 dirty.clear();
-                take_written(base, PAGES * PAGE, &mut buf, &mut dirty, &mut page);
+                watch_into(&ranges, &mut buf, &mut dirty, &mut page);
                 assert!(dirty.is_empty(), "the look reset what it reported");
             }
             VirtualFree(base as *mut c_void, 0, MEM_RELEASE);

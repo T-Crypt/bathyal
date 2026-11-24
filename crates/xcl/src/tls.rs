@@ -724,7 +724,7 @@ mod tests {
             let b = unsafe { tls_block_of(current_teb(), idx) };
             !b.is_null() && unsafe { std::slice::from_raw_parts(b, 0x100) } == [&template[..], &[0; 0x100 - 48]].concat()
         });
-        let idx = unsafe { install("unit-running", template.as_ptr() as usize, 48, 0x100, std::ptr::null_mut(), &dir).unwrap() };
+        let idx = unsafe { install("unit-running", template.as_ptr() as usize, 48, 0x100, 0, std::ptr::null_mut(), &dir).unwrap() };
         go.send(idx).unwrap();
         assert!(running.join().unwrap());
     }
@@ -741,7 +741,7 @@ mod tests {
             .map(|_| std::thread::spawn(|| while !STOP.load(Ordering::Relaxed) { std::thread::spawn(|| ()).join().unwrap(); }))
             .collect();
         for _ in 0..200 {
-            unsafe { install("churn", template.as_ptr() as usize, 16, 16, std::ptr::null_mut(), &dir).unwrap() };
+            unsafe { install("churn", template.as_ptr() as usize, 16, 16, 0, std::ptr::null_mut(), &dir).unwrap() };
         }
         STOP.store(true, Ordering::Relaxed);
         churn.into_iter().for_each(|t| t.join().unwrap());
