@@ -68,7 +68,7 @@ pub fn settings_from_env() -> Option<Settings> {
 // samples
 // ---------------------------------------------------------------------------------------
 
-#[derive(Clone, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct ThreadCount {
     pub samples: u64,
     /// samples whose RIP was inside a waiting `ntdll` function
@@ -416,7 +416,7 @@ fn ntdll_exports() -> Vec<(u32, String)> {
     use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
     let mut out = Vec::new();
     unsafe {
-        let base = GetModuleHandleW(w!("ntdll.dll")) as usize;
+        let base = GetModuleHandleW(windows_sys::w!("ntdll.dll")) as usize;
         if base == 0 {
             return out;
         }
