@@ -7,6 +7,8 @@
 //! (`resolve_for_draw`), then draws nothing until it is built; a compute pipeline is waited
 //! for at its first bind (a skipped dispatch would corrupt what it computes).
 //! `XCL_ASYNC_PSO=0` builds every pipeline in the call, as before.
+//! `XCL_PSO_NEVER_SKIP=1` waits for a compute build with no time limit instead of ever
+//! dispatching its stand-in; a build that failed is still skipped (see [`decide`]).
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -33,6 +35,8 @@ struct Pending {
     orphan: std::sync::atomic::AtomicBool,
     /// its shaders are in the prewarm record (marked once)
     noted: std::sync::atomic::AtomicBool,
+    /// the unconditional wait (`XCL_PSO_NEVER_SKIP=1`) was logged for it
+    wait_logged: std::sync::atomic::AtomicBool,
     /// one of the title's threads waits for it: its build does not stand back for the title
     demand: Mutex<Demand>,
 }
@@ -220,6 +224,7 @@ fn submit_as(standin: usize, compute: bool, job: Job, send: bool) {
         timed_out: Default::default(),
         orphan: Default::default(),
         noted: Default::default(),
+        wait_logged: Default::default(),
         demand: Default::default(),
     });
     PENDING.lock().unwrap().get_or_insert_with(HashMap::new).insert(standin, p.clone());
@@ -447,16 +452,63 @@ pub fn reset_frame_budget() {
     FRAME_BUDGET.reset();
 }
 
+/// `XCL_PSO_NEVER_SKIP=1`: a compute pipeline whose build is still going is waited for with no
+/// time limit, so no dispatch or ExecuteIndirect runs its stand-in. Off by default.
+pub fn never_skip() -> bool {
+    static N: OnceLock<bool> = OnceLock::new();
+    *N.get_or_init(|| std::env::var("XCL_PSO_NEVER_SKIP").is_ok_and(|v| v.trim() == "1"))
+}
+
+/// What a bind, dispatch or ExecuteIndirect does about a pipeline that is not ready.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PipelineWait {
+    /// the real pipeline is there: use it
+    Ready,
+    /// still building and `XCL_PSO_NEVER_SKIP=1`: wait for the build with no time limit
+    WaitForBuild,
+    /// still building, flag off: the bounded wait as before
+    BoundedWait,
+    /// the build is over and produced nothing: use the stand-in, as today
+    Failed,
+}
+
+/// The decision for a pipeline whose state is `(real, done)`. `real != 0` means built; a build
+/// that failed sets `done` without a `real` pipeline, so a failed build is told apart from one
+/// still building by `done`, not by `real`: waiting only ever ends when the build ends, and a
+/// failure ends it too.
+pub(crate) fn decide(real: usize, done: bool, never_skip: bool) -> PipelineWait {
+    if real != 0 {
+        PipelineWait::Ready
+    } else if done {
+        PipelineWait::Failed
+    } else if never_skip {
+        PipelineWait::WaitForBuild
+    } else {
+        PipelineWait::BoundedWait
+    }
+}
+
 /// Bounded wait for a compute pipeline: always builds on `xcl-pso-compute-*` workers (never
 /// stalling the title's thread inside DXC/driver), waits at most the remaining per-frame `budget`
 /// up to `limit`, and returns the stand-in immediately once timed out or once the frame budget is
 /// exhausted until the worker finishes.
 fn resolve_compute_within(pso: usize, limit: Option<std::time::Duration>, budget: &FrameBudget) -> usize {
+    resolve_compute_decided(pso, limit, budget, never_skip())
+}
+
+fn resolve_compute_decided(pso: usize, limit: Option<std::time::Duration>, budget: &FrameBudget, never_skip: bool) -> usize {
+    let Some(p) = entry(pso) else { return pso };
+    let (real_now, done_now) = (p.real.load(Ordering::Acquire), *p.done.lock().unwrap());
+    match decide(real_now, done_now, never_skip) {
+        PipelineWait::Ready => return real_now,
+        PipelineWait::Failed => return pso,
+        PipelineWait::WaitForBuild => return wait_for_build(&p, pso),
+        PipelineWait::BoundedWait => {}
+    }
     let Some(limit) = limit else {
         return resolve_wait(pso);
     };
-    let Some(p) = entry(pso) else { return pso };
-    if let r @ 1.. = p.real.load(Ordering::Acquire) {
+    if let r @ 1.. = real_now {
         return r;
     }
     if !enqueue(&p) {
@@ -511,6 +563,39 @@ fn resolve_compute_within(pso: usize, limit: Option<std::time::Duration>, budget
     }
 }
 
+/// Wait for a compute build to end, with no time limit (`XCL_PSO_NEVER_SKIP=1`). The wait ends
+/// on success or failure alike; a failed build gives the stand-in back, as today. Logged once
+/// per pipeline, with the wait at the end.
+fn wait_for_build(p: &Arc<Pending>, pso: usize) -> usize {
+    if let r @ 1.. = p.real.load(Ordering::Acquire) {
+        return r;
+    }
+    if !enqueue(p) {
+        // no worker pool to build it: an unbounded wait could never end
+        return pso;
+    }
+    p.want();
+    let started = Instant::now();
+    let mut done = p.done.lock().unwrap();
+    while !*done {
+        done = p.cv.wait(done).unwrap();
+    }
+    let real = p.real.load(Ordering::Acquire);
+    drop(done);
+    if !p.wait_logged.swap(true, Ordering::Relaxed) {
+        let ms = started.elapsed().as_millis();
+        if real == 0 {
+            crate::xlog_warn!("D3D12.X: compute pipeline {pso:#x} build failed after {ms} ms (XCL_PSO_NEVER_SKIP=1) – stand-in used, as before");
+        } else {
+            crate::xlog_info!("D3D12.X: compute pipeline {pso:#x} waited {ms} ms for its build (XCL_PSO_NEVER_SKIP=1)");
+        }
+    }
+    match real {
+        0 => pso,
+        r => r,
+    }
+}
+
 /// Resolve a compute pipeline with `XCL_COMPUTE_PSO_WAIT_MS` per-frame bounding.
 pub fn resolve_compute(pso: usize) -> usize {
     resolve_compute_within(pso, compute_wait_timeout(), &FRAME_BUDGET)
@@ -530,7 +615,8 @@ pub fn resolve_for_bind(pso: usize) -> usize {
     }
 }
 
-/// For `ExecuteIndirect`: compute pipelines use bounded waits, graphics pipelines keep `resolve_wait`.
+/// For `ExecuteIndirect` (and `Dispatch`): compute pipelines use bounded waits, or an unbounded
+/// one under `XCL_PSO_NEVER_SKIP=1`; graphics pipelines keep `resolve_wait`.
 pub fn resolve_for_indirect(pso: usize) -> usize {
     match entry(pso) {
         Some(p) if p.compute => resolve_compute(pso),
@@ -711,6 +797,50 @@ mod tests {
 
     fn budget() -> Mutex<DrawWait> {
         Mutex::new(DrawWait { epoch: 0, spent: Duration::ZERO })
+    }
+
+    /// The decision behind `XCL_PSO_NEVER_SKIP`: ready, still building with and without the
+    /// flag, and a failed build (`done`, no pipeline), which is still skipped under the flag.
+    #[test]
+    fn the_never_skip_decision_separates_building_from_failed() {
+        // ready
+        assert_eq!(decide(0x900, true, false), PipelineWait::Ready);
+        assert_eq!(decide(0x900, true, true), PipelineWait::Ready);
+        // still building, flag off: the bounded wait as before
+        assert_eq!(decide(0, false, false), PipelineWait::BoundedWait);
+        // still building, flag on: wait with no time limit
+        assert_eq!(decide(0, false, true), PipelineWait::WaitForBuild);
+        // failed (the build ended with no pipeline): skipped either way
+        assert_eq!(decide(0, true, false), PipelineWait::Failed);
+        assert_eq!(decide(0, true, true), PipelineWait::Failed);
+    }
+
+    /// With the flag, the unbounded wait outlives a short `limit` and returns the real pipeline
+    /// once the worker finishes. A failed build ends the wait at once and still gives the
+    /// stand-in, so a broken program cannot block the title.
+    #[test]
+    fn never_skip_waits_through_the_limit_and_still_gives_up_on_a_failure() {
+        let (standin, real) = (0x7600_0001usize, 0x7600_0002usize);
+        submit_lazy(
+            standin,
+            true,
+            Box::new(move || {
+                std::thread::sleep(Duration::from_millis(120));
+                real
+            }),
+        );
+        let t = Instant::now();
+        assert_eq!(resolve_compute_decided(standin, Some(Duration::from_millis(1)), &FrameBudget::new(), true), real);
+        assert!(t.elapsed() >= Duration::from_millis(100), "waited {:?} past a 1 ms limit", t.elapsed());
+        assert_eq!(released(standin), real);
+
+        let failed = 0x7600_0003usize;
+        submit_lazy(failed, true, Box::new(|| 0));
+        let t = Instant::now();
+        assert_eq!(resolve_compute_decided(failed, Some(Duration::from_millis(1)), &FrameBudget::new(), true), failed);
+        assert!(t.elapsed() < Duration::from_secs(5), "a failed build must not block the title");
+        assert!(!is_pending_compute(failed));
+        let _ = released(failed);
     }
 
     /// A graphics build that does not finish (an NVIDIA driver compile of minutes, #156) holds a
