@@ -78,7 +78,8 @@ fn complete(p: &Pending, real: usize) {
         BUILT.fetch_add(1, Ordering::Relaxed);
     }
     let orphan = {
-        let mut done = p.done.lock().unwrap();
+        let start = std::time::Instant::now();
+    let mut done = p.done.lock().unwrap();
         let orphan = p.orphan.load(Ordering::Acquire);
         if !orphan {
             p.real.store(real, Ordering::Release);

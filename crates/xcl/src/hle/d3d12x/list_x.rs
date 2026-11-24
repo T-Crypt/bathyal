@@ -2820,9 +2820,9 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
         let immediates = std::mem::take(&mut s.immediates);
         let pred_in_state = std::mem::replace(&mut s.pred_in_state, false);
         let pred_buf = s.pred_buf.as_ref().map(|r| r.as_raw() as usize);
-        (s.allocator, q, s.bound_pso, s.depth_bias, s.index_buffer, s.depth_bounds, s.predication, pred_buf, pred_in_state, active_query, waits, (sparse_writes, write64_signals, cpu_writes))
+        (s.allocator, q, s.bound_pso, s.depth_bias, s.index_buffer, s.depth_bounds, s.predication, pred_buf, pred_in_state, active_query, waits, (sparse_writes, write64_signals, cpu_writes, copies, immediates))
     };
-    let (sparse_writes, write64_signals, cpu_writes) = sparse_writes;
+    let (sparse_writes, write64_signals, cpu_writes, copies, immediates) = sparse_writes;
 
     // End any active occlusion query before Close (PC forbids closing with an open query).
     if let Some(((h, i), qty)) = active_query {

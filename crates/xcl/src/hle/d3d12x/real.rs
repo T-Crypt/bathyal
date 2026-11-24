@@ -5915,7 +5915,7 @@ unsafe fn queue_dispatch(slot: usize, this: *mut c_void, a1: usize, a2: usize, a
             if older == 14 {
                 super::list_x::break_cycles_before_title_signal(this as usize, a1, a2 as u64);
             }
-            let f: unsafe extern "system" fn(*mut c_void, usize, usize) -> i32 = std::mem::transmute(pc(if older == 14 { PC_SIGNAL } else { PC_WAIT }));
+            let f: unsafe extern "system" fn(*mut c_void, usize, usize) -> i32 = std::mem::transmute(pc(older));
             let hr = f(this, a1, a2);
             if hr >= 0 {
                 if older == 14 {
