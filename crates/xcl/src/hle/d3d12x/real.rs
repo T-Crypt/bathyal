@@ -5156,8 +5156,6 @@ const QUEUE_FIRST: usize = 14;
 /// A title's call of queue slot `slot` (arguments as integers; Signal / Wait / SignalX /
 /// PresentX / GetTimestampFrequency / GetClockCalibration / GetDesc all fit).
 unsafe fn queue_dispatch(slot: usize, this: *mut c_void, a1: usize, a2: usize, a3: usize, a4: usize) -> usize {
-    const PC_SIGNAL: usize = 14;
-    const PC_WAIT: usize = 15;
     const PC_TIMESTAMP_FREQUENCY: usize = 16;
     const PC_CLOCK_CALIBRATION: usize = 17;
     const PC_GET_DESC: usize = 18;
@@ -5174,11 +5172,13 @@ unsafe fn queue_dispatch(slot: usize, this: *mut c_void, a1: usize, a2: usize, a
     match older {
         // Signal / Wait take a fence: anything else is not one of them
         14 | 15 if is_fence(a1) => {
-            let f: unsafe extern "system" fn(*mut c_void, usize, usize) -> i32 = std::mem::transmute(pc(if older == 14 { PC_SIGNAL } else { PC_WAIT }));
-            let hr = f(this, a1, a2);
-            if older == 14 && hr >= 0 {
-                super::fence_x::note_queue_signal(this as usize, a1, a2 as u64);
-            }
+            // behind a held submission the gate keeps the fence value in order; fence consumers
+            // then never pass on memory the held work has not written yet
+            let hr = if older == 14 {
+                super::queue_gate::gate_signal(this as usize, a1, a2 as u64)
+            } else {
+                super::queue_gate::gate_wait(this as usize, a1, a2 as u64)
+            };
             hr as u32 as usize
         }
         16 => {
@@ -5260,13 +5260,8 @@ queue_slots!(14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30,
 /// nothing left Fortnite's render fences pending: its render thread waited, textures were
 /// never released, and the garbage collector ended the game after 10 s.)
 unsafe extern "system" fn q_signal_x(this: *mut c_void, fence: *mut c_void, value: u64, _flags: u32) -> HRESULT {
-    const PC_SIGNAL: usize = 14;
-    let f: unsafe extern "system" fn(*mut c_void, *mut c_void, u64) -> HRESULT = std::mem::transmute(orig_fn(this, PC_SIGNAL));
-    let hr = f(this, fence, value);
-    if hr >= 0 {
-        super::fence_x::note_queue_signal(this as usize, fence as usize, value);
-    }
-    hr
+    // a held submission keeps the fence value after it, so fence consumers see the true order
+    super::queue_gate::gate_signal(this as usize, fence as usize, value)
 }
 
 /// Fence::Signal (CPU)
@@ -5286,26 +5281,18 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
         stop_if_device_removed();
         return;
     }
-    // objects whose submissions are done are freed, and their descriptor slots nulled, before
-    // the GPU can read a heap this submission binds
-    super::lifetime::poll();
-    // textures in title memory the CPU wrote since: uploaded again first
-    super::title_textures::refresh(this);
+    // the gate's submission path frees due objects and re-uploads changed textures first
     // console-shaped lists run as the PC lists they were translated into
     let mapped: Vec<*mut c_void> = std::slice::from_raw_parts(lists, n as usize)
         .iter()
         .map(|&l| super::console_list::pc_list(l).or_else(|| super::title_list::backing(l)).unwrap_or(l))
         .collect();
     super::list_x::note_queue_for_lists(this as usize, &mapped);
-    super::list_x::execute_with_waits(&mapped, |chunk| {
-        super::lifetime::submit(this as usize, chunk);
-        f(this, chunk.len() as u32, chunk.as_ptr());
-        super::list_x::readback_sparse_writes(this, chunk);
-        super::list_x::cpu_writes_after(this, chunk);
-    });
-    // the next uploads into textures kept in step start from the states these lists leave
-    super::title_textures::submitted(&mapped);
-    super::present::note_execute(this, &mapped);
+    // through the queue's gate: a held `Wait32/64BitValueX` never blocks this thread. The
+    // upload of changed textures, the sparse readback, the bottom-of-pipe work and the present
+    // fallback follow each chunk when it is actually submitted.
+    let _ = f;
+    super::list_x::submit_lists(this as usize, &mapped);
     stop_if_device_removed();
 }
 
