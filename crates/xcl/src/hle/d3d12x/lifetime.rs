@@ -222,6 +222,8 @@ mod tests {
     use super::*;
 
     static FREED: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+    /// The registers are process-wide.
+    static SERIAL: Mutex<()> = Mutex::new(());
 
     unsafe fn record_free(h: usize) {
         FREED.lock().unwrap().push(h);
@@ -246,6 +248,7 @@ mod tests {
     /// An object queued for release is not freed before its fence value is reached.
     #[test]
     fn a_released_object_waits_for_its_fence_value() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         reset();
         track(0x1000);
         note(0x100, 0x1000);
@@ -268,6 +271,7 @@ mod tests {
     /// the list's submission then covers it.
     #[test]
     fn an_open_recording_keeps_a_released_object() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         reset();
         track(0x2000);
         note(0x200, 0x2000);
@@ -286,6 +290,7 @@ mod tests {
     /// A reset list drops its recordings, so a released object it named goes at once.
     #[test]
     fn a_reset_recording_releases_its_hold() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         reset();
         track(0x3000);
         note(0x300, 0x3000);
@@ -297,6 +302,7 @@ mod tests {
     /// Another queue's signal does not complete this queue's submissions.
     #[test]
     fn submission_order_is_per_queue() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         reset();
         track(0x4000);
         note(0x400, 0x4000);
