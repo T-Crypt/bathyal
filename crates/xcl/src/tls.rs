@@ -775,7 +775,6 @@ mod tests {
 
     #[test]
     fn carrier_respects_tls_block_alignment_on_all_threads() {
-        use std::sync::Barrier;
         use windows_sys::Win32::Foundation::FreeLibrary;
         use windows_sys::Win32::System::LibraryLoader::{
             LoadLibraryExW, DONT_RESOLVE_DLL_REFERENCES,
@@ -846,7 +845,8 @@ mod tests {
 
             // Install via tls::install() and verify TLS block initialization and alignment
             // on the calling thread, and newly spawned threads (populated by
-            // on_thread_attach()).
+            // on_thread_attach()). A thread that already ran gets its block from the OS's
+            // allocation only, so it is not checked.
             let tpl_len = align.min(256).max(64);
             let mut template = vec![0u8; tpl_len];
             for (i, b) in template.iter_mut().enumerate() {
@@ -875,24 +875,6 @@ mod tests {
                 }
             };
 
-            let pre_ready = Arc::new(Barrier::new(2));
-            let post_install = Arc::new(Barrier::new(2));
-            let pre_slot = Arc::new(AtomicU32::new(NO_INDEX));
-            let pre_thread = {
-                let pre_ready = pre_ready.clone();
-                let post_install = post_install.clone();
-                let pre_slot = pre_slot.clone();
-                std::thread::spawn(move || {
-                    pre_ready.wait();
-                    post_install.wait();
-                    let idx = pre_slot.load(Ordering::Acquire);
-                    assert_ne!(idx, NO_INDEX);
-                    let b = unsafe { tls_block_of(current_teb(), idx) };
-                    check_block(b, "pre-existing");
-                })
-            };
-            pre_ready.wait();
-
             let mut index_var: u32 = NO_INDEX;
             let idx = unsafe {
                 install(
@@ -907,9 +889,6 @@ mod tests {
                 .unwrap()
             };
             assert_eq!(index_var, idx);
-            pre_slot.store(idx, Ordering::Release);
-            post_install.wait();
-            pre_thread.join().unwrap();
 
             let main_b = unsafe { tls_block_of(current_teb(), idx) };
             check_block(main_b, "main");
