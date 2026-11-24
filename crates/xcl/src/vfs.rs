@@ -963,11 +963,14 @@ mod tests {
                     std::ptr::null_mut(),
                 )
             };
+            // (read at once: the first under_wine() looks up an export ntdll does not have on
+            // Windows, which sets the thread's last error to ERROR_PROC_NOT_FOUND)
+            let err = unsafe { windows_sys::Win32::Foundation::GetLastError() };
             assert_eq!(h, windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE);
             // Windows' own codes are the reference; Wine answers a directory opened with
             // FILE_FLAG_BACKUP_SEMANTICS and TRUNCATE_EXISTING with ERROR_FILE_EXISTS
             if !crate::util::under_wine() {
-                assert_eq!(unsafe { windows_sys::Win32::Foundation::GetLastError() }, expected);
+                assert_eq!(err, expected);
             }
             assert_eq!(v.open_decision("G:\\data", GENERIC_WRITE, TRUNCATE_EXISTING, flags), Decision::Fail(expected));
         }
